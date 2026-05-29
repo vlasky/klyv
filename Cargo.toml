@@ -1,0 +1,13 @@
+[package]
+name = "klyv"
+version = "0.1.0"
+edition = "2024"
+description = "Redis-compatible embedded KV store backed by SQLite"
+license = "MIT"
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+tempfile = "3"
