@@ -1493,3 +1493,131 @@ fn test_incr_non_integer_no_panic() {
     assert!(err.contains("ERR value is not an integer"), "stderr: {err}");
     assert!(!err.contains("panicked"), "stderr: {err}");
 }
+
+// --- Fix 2: LREM enforces WRONGTYPE on a non-list key ---
+
+#[test]
+fn test_wrongtype_lrem_on_string() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    let (_, err, ok) = klyv(&db, &["l-rem", "k", "0", "v"]);
+    assert!(!ok);
+    assert!(err.contains("WRONGTYPE"), "stderr: {err}");
+    // the string value must be left intact
+    let (out, _, _) = klyv(&db, &["get", "k"]);
+    assert_eq!(out.trim(), "v");
+}
+
+#[test]
+fn test_wrongtype_lrem_on_set() {
+    let db = fresh_db();
+    klyv(&db, &["s-add", "k", "a"]);
+    let (_, err, ok) = klyv(&db, &["l-rem", "k", "0", "a"]);
+    assert!(!ok);
+    assert!(err.contains("WRONGTYPE"), "stderr: {err}");
+}
+
+#[test]
+fn test_lrem_on_actual_list_still_works() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "L", "x", "x", "y"]);
+    let (out, _, ok) = klyv(&db, &["l-rem", "L", "0", "x"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(integer) 2");
+    let (out, _, _) = klyv(&db, &["l-len", "L"]);
+    assert_eq!(out.trim(), "(integer) 1");
+}
+
+// --- Fix 3b: LPOP/RPOP treat an expired key as absent and drop its stale rows ---
+
+#[test]
+fn test_lpop_ignores_expired() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "L", "a", "b", "c"]);
+    klyv(&db, &["expire-at", "L", "1"]);
+    let (out, _, ok) = klyv(&db, &["l-pop", "L"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(nil)");
+    // stale rows are physically dropped, so the key is gone entirely
+    let (out, _, _) = klyv(&db, &["type", "L"]);
+    assert_eq!(out.trim(), "none");
+}
+
+#[test]
+fn test_rpop_ignores_expired() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "L", "a", "b", "c"]);
+    klyv(&db, &["expire-at", "L", "1"]);
+    let (out, _, ok) = klyv(&db, &["r-pop", "L"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(nil)");
+    let (out, _, _) = klyv(&db, &["type", "L"]);
+    assert_eq!(out.trim(), "none");
+}
+
+#[test]
+fn test_lpop_reuse_after_expiry() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "L", "old"]);
+    klyv(&db, &["expire-at", "L", "1"]);
+    // popping the expired list clears it (stale rows + stale expiry)
+    klyv(&db, &["l-pop", "L"]);
+    // a fresh push reuses the key with no leftover TTL
+    klyv(&db, &["r-push", "L", "new1", "new2"]);
+    let (out, _, _) = klyv(&db, &["ttl", "L"]);
+    assert_eq!(out.trim(), "(integer) -1");
+    let (out, _, _) = klyv(&db, &["l-pop", "L"]);
+    assert_eq!(out.trim(), "new1");
+}
+
+// --- Fix 1: TTL mutators still behave correctly when wrapped in a transaction ---
+
+#[test]
+fn test_expire_on_missing_key_returns_zero() {
+    let db = fresh_db();
+    let (out, _, ok) = klyv(&db, &["expire", "nope", "100"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(integer) 0");
+}
+
+#[test]
+fn test_expire_on_expired_key_returns_zero() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    klyv(&db, &["expire-at", "k", "1"]);
+    let (out, _, ok) = klyv(&db, &["expire", "k", "100"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(integer) 0");
+}
+
+#[test]
+fn test_expire_then_ttl_roundtrip() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    let (out, _, ok) = klyv(&db, &["expire", "k", "1000"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(integer) 1");
+    let (out, _, _) = klyv(&db, &["ttl", "k"]);
+    let n: i64 = out.trim().trim_start_matches("(integer) ").parse().unwrap();
+    assert!(n > 0 && n <= 1000, "ttl was {n}");
+}
+
+#[test]
+fn test_persist_removes_live_ttl() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    klyv(&db, &["expire", "k", "1000"]);
+    let (out, _, ok) = klyv(&db, &["persist", "k"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(integer) 1");
+    let (out, _, _) = klyv(&db, &["ttl", "k"]);
+    assert_eq!(out.trim(), "(integer) -1");
+}
+
+#[test]
+fn test_expireat_on_missing_key_returns_zero() {
+    let db = fresh_db();
+    let (out, _, ok) = klyv(&db, &["expire-at", "nope", "9999999999"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(integer) 0");
+}
