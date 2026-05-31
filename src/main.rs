@@ -108,11 +108,11 @@ enum Command {
     Rename { key: String, newkey: String },
 
     // TTL commands
-    #[command(about = "Set key expiry in seconds from now")]
+    #[command(about = "Set key expiry in seconds from now", allow_hyphen_values = true)]
     Expire { key: String, seconds: i64 },
-    #[command(about = "Set key expiry in milliseconds from now")]
+    #[command(about = "Set key expiry in milliseconds from now", allow_hyphen_values = true)]
     PExpire { key: String, milliseconds: i64 },
-    #[command(about = "Set key expiry at Unix timestamp (seconds)")]
+    #[command(about = "Set key expiry at Unix timestamp (seconds)", allow_hyphen_values = true)]
     ExpireAt { key: String, timestamp: i64 },
     #[command(about = "Get remaining TTL in seconds (-1=no expiry, -2=key missing)")]
     Ttl { key: String },
@@ -132,6 +132,7 @@ fn open_db(path: &PathBuf) -> rusqlite::Result<Connection> {
     conn.execute_batch("
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=NORMAL;
+        PRAGMA busy_timeout=5000;
 
         CREATE TABLE IF NOT EXISTS strings (
             key TEXT PRIMARY KEY,
@@ -169,10 +170,48 @@ fn open_db(path: &PathBuf) -> rusqlite::Result<Connection> {
 
 fn is_expired(conn: &Connection, key: &str) -> bool {
     conn.query_row(
-        "SELECT 1 FROM expiry WHERE key = ?1 AND expires_at < unixepoch()",
+        "SELECT 1 FROM expiry WHERE key = ?1 AND expires_at <= unixepoch()",
         params![key],
         |_| Ok(()),
     ).is_ok()
+}
+
+fn key_type(conn: &Connection, key: &str) -> Option<&'static str> {
+    if is_expired(conn, key) {
+        return None;
+    }
+    if conn.query_row("SELECT 1 FROM strings WHERE key = ?1", params![key], |_| Ok(())).is_ok() {
+        return Some("string");
+    }
+    if conn.query_row("SELECT 1 FROM list_items WHERE key = ?1 LIMIT 1", params![key], |_| Ok(())).is_ok() {
+        return Some("list");
+    }
+    if conn.query_row("SELECT 1 FROM set_members WHERE key = ?1 LIMIT 1", params![key], |_| Ok(())).is_ok() {
+        return Some("set");
+    }
+    if conn.query_row("SELECT 1 FROM hash_fields WHERE key = ?1 LIMIT 1", params![key], |_| Ok(())).is_ok() {
+        return Some("hash");
+    }
+    None
+}
+
+fn ensure_type(conn: &Connection, key: &str, want: &str) {
+    if let Some(t) = key_type(conn, key) {
+        if t != want {
+            eprintln!("WRONGTYPE Operation against a key holding the wrong kind of value");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn drop_if_expired(conn: &Connection, key: &str) {
+    if is_expired(conn, key) {
+        conn.execute("DELETE FROM strings WHERE key = ?1", params![key]).unwrap();
+        conn.execute("DELETE FROM list_items WHERE key = ?1", params![key]).unwrap();
+        conn.execute("DELETE FROM set_members WHERE key = ?1", params![key]).unwrap();
+        conn.execute("DELETE FROM hash_fields WHERE key = ?1", params![key]).unwrap();
+        conn.execute("DELETE FROM expiry WHERE key = ?1", params![key]).unwrap();
+    }
 }
 
 fn main() {
@@ -186,7 +225,14 @@ fn main() {
         Command::Incr { key } => cmd_incrby(&conn, &key, 1),
         Command::Decr { key } => cmd_incrby(&conn, &key, -1),
         Command::IncrBy { key, amount } => cmd_incrby(&conn, &key, amount),
-        Command::DecrBy { key, amount } => cmd_incrby(&conn, &key, -amount),
+        Command::DecrBy { key, amount } => cmd_incrby(
+            &conn,
+            &key,
+            amount.checked_neg().unwrap_or_else(|| {
+                eprintln!("ERR increment or decrement would overflow");
+                std::process::exit(1);
+            }),
+        ),
         Command::Append { key, value } => cmd_append(&conn, &key, &value),
         Command::Strlen { key } => cmd_strlen(&conn, &key),
         Command::MSet { pairs } => cmd_mset(&conn, &pairs),
@@ -238,10 +284,21 @@ fn main() {
 // --- String commands ---
 
 fn cmd_set(conn: &Connection, key: &str, value: &str) {
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    // SET overwrites any existing key, regardless of its prior type.
+    conn.execute("DELETE FROM list_items WHERE key = ?1", params![key]).unwrap();
+    conn.execute("DELETE FROM set_members WHERE key = ?1", params![key]).unwrap();
+    conn.execute("DELETE FROM hash_fields WHERE key = ?1", params![key]).unwrap();
+    // Drop a stale (already-expired) expiry so the new value isn't hidden.
+    // A live TTL is intentionally preserved (see test_set_overwrites_clears_expiry_not).
+    if is_expired(conn, key) {
+        conn.execute("DELETE FROM expiry WHERE key = ?1", params![key]).unwrap();
+    }
     conn.execute(
         "INSERT OR REPLACE INTO strings (key, value) VALUES (?1, ?2)",
         params![key, value],
     ).unwrap();
+    conn.execute_batch("COMMIT").unwrap();
     println!("OK");
 }
 
@@ -272,24 +329,43 @@ fn cmd_del(conn: &Connection, keys: &[String]) {
 }
 
 fn cmd_incrby(conn: &Connection, key: &str, amount: i64) {
-    let current: Option<String> = if is_expired(conn, key) {
-        None
-    } else {
-        conn.query_row("SELECT value FROM strings WHERE key = ?1", params![key], |row| row.get(0))
-            .ok()
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    ensure_type(conn, key, "string");
+    drop_if_expired(conn, key);
+    let current: Option<String> = conn
+        .query_row("SELECT value FROM strings WHERE key = ?1", params![key], |row| row.get(0))
+        .ok();
+    let val: i64 = match current {
+        Some(s) => match s.parse::<i64>() {
+            Ok(n) => n,
+            Err(_) => {
+                conn.execute_batch("ROLLBACK").unwrap();
+                eprintln!("ERR value is not an integer");
+                std::process::exit(1);
+            }
+        },
+        None => 0,
     };
-    let val: i64 = current
-        .map(|s| s.parse::<i64>().expect("ERR value is not an integer"))
-        .unwrap_or(0);
-    let new_val = val + amount;
+    let new_val = match val.checked_add(amount) {
+        Some(n) => n,
+        None => {
+            conn.execute_batch("ROLLBACK").unwrap();
+            eprintln!("ERR increment or decrement would overflow");
+            std::process::exit(1);
+        }
+    };
     conn.execute(
         "INSERT OR REPLACE INTO strings (key, value) VALUES (?1, ?2)",
         params![key, new_val.to_string()],
     ).unwrap();
+    conn.execute_batch("COMMIT").unwrap();
     println!("(integer) {new_val}");
 }
 
 fn cmd_append(conn: &Connection, key: &str, value: &str) {
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    ensure_type(conn, key, "string");
+    drop_if_expired(conn, key);
     let current: Option<String> = conn
         .query_row("SELECT value FROM strings WHERE key = ?1", params![key], |row| row.get(0))
         .ok();
@@ -302,6 +378,7 @@ fn cmd_append(conn: &Connection, key: &str, value: &str) {
         "INSERT OR REPLACE INTO strings (key, value) VALUES (?1, ?2)",
         params![key, new_val],
     ).unwrap();
+    conn.execute_batch("COMMIT").unwrap();
     println!("(integer) {len}");
 }
 
@@ -322,14 +399,21 @@ fn cmd_mset(conn: &Connection, pairs: &[String]) {
         eprintln!("ERR wrong number of arguments for 'mset' command");
         std::process::exit(1);
     }
-    let tx = conn.unchecked_transaction().unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     for chunk in pairs.chunks(2) {
-        tx.execute(
+        // MSET overwrites each key regardless of its prior type.
+        conn.execute("DELETE FROM list_items WHERE key = ?1", params![chunk[0]]).unwrap();
+        conn.execute("DELETE FROM set_members WHERE key = ?1", params![chunk[0]]).unwrap();
+        conn.execute("DELETE FROM hash_fields WHERE key = ?1", params![chunk[0]]).unwrap();
+        if is_expired(conn, &chunk[0]) {
+            conn.execute("DELETE FROM expiry WHERE key = ?1", params![chunk[0]]).unwrap();
+        }
+        conn.execute(
             "INSERT OR REPLACE INTO strings (key, value) VALUES (?1, ?2)",
             params![chunk[0], chunk[1]],
         ).unwrap();
     }
-    tx.commit().unwrap();
+    conn.execute_batch("COMMIT").unwrap();
     println!("OK");
 }
 
@@ -368,38 +452,46 @@ fn list_max_idx(conn: &Connection, key: &str) -> f64 {
 }
 
 fn cmd_lpush(conn: &Connection, key: &str, values: &[String]) {
-    let tx = conn.unchecked_transaction().unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    ensure_type(conn, key, "list");
+    drop_if_expired(conn, key);
     for value in values {
-        let min = list_min_idx(&tx, key);
-        tx.execute(
+        let empty: bool = conn
+            .query_row("SELECT COUNT(*) FROM list_items WHERE key = ?1", params![key], |row| row.get::<_, i64>(0))
+            .unwrap()
+            == 0;
+        let idx = if empty { 0.0 } else { list_min_idx(conn, key) - 1.0 };
+        conn.execute(
             "INSERT INTO list_items (key, idx, value) VALUES (?1, ?2, ?3)",
-            params![key, min - 1.0, value],
+            params![key, idx, value],
         ).unwrap();
     }
-    let len: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM list_items WHERE key = ?1",
-        params![key],
-        |row| row.get(0),
-    ).unwrap();
-    tx.commit().unwrap();
+    let len: i64 = conn
+        .query_row("SELECT COUNT(*) FROM list_items WHERE key = ?1", params![key], |row| row.get(0))
+        .unwrap();
+    conn.execute_batch("COMMIT").unwrap();
     println!("(integer) {len}");
 }
 
 fn cmd_rpush(conn: &Connection, key: &str, values: &[String]) {
-    let tx = conn.unchecked_transaction().unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    ensure_type(conn, key, "list");
+    drop_if_expired(conn, key);
     for value in values {
-        let max = list_max_idx(&tx, key);
-        tx.execute(
+        let empty: bool = conn
+            .query_row("SELECT COUNT(*) FROM list_items WHERE key = ?1", params![key], |row| row.get::<_, i64>(0))
+            .unwrap()
+            == 0;
+        let idx = if empty { 0.0 } else { list_max_idx(conn, key) + 1.0 };
+        conn.execute(
             "INSERT INTO list_items (key, idx, value) VALUES (?1, ?2, ?3)",
-            params![key, max + 1.0, value],
+            params![key, idx, value],
         ).unwrap();
     }
-    let len: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM list_items WHERE key = ?1",
-        params![key],
-        |row| row.get(0),
-    ).unwrap();
-    tx.commit().unwrap();
+    let len: i64 = conn
+        .query_row("SELECT COUNT(*) FROM list_items WHERE key = ?1", params![key], |row| row.get(0))
+        .unwrap();
+    conn.execute_batch("COMMIT").unwrap();
     println!("(integer) {len}");
 }
 
@@ -408,6 +500,7 @@ fn cmd_lpop(conn: &Connection, key: &str) {
         println!("(nil)");
         return;
     }
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     let result: Option<(i64, String)> = conn
         .query_row(
             "SELECT rowid, value FROM list_items WHERE key = ?1 ORDER BY idx ASC LIMIT 1",
@@ -418,9 +511,13 @@ fn cmd_lpop(conn: &Connection, key: &str) {
     match result {
         Some((rowid, value)) => {
             conn.execute("DELETE FROM list_items WHERE rowid = ?1", params![rowid]).unwrap();
+            conn.execute_batch("COMMIT").unwrap();
             println!("{value}");
         }
-        None => println!("(nil)"),
+        None => {
+            conn.execute_batch("COMMIT").unwrap();
+            println!("(nil)");
+        }
     }
 }
 
@@ -429,6 +526,7 @@ fn cmd_rpop(conn: &Connection, key: &str) {
         println!("(nil)");
         return;
     }
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     let result: Option<(i64, String)> = conn
         .query_row(
             "SELECT rowid, value FROM list_items WHERE key = ?1 ORDER BY idx DESC LIMIT 1",
@@ -439,9 +537,13 @@ fn cmd_rpop(conn: &Connection, key: &str) {
     match result {
         Some((rowid, value)) => {
             conn.execute("DELETE FROM list_items WHERE rowid = ?1", params![rowid]).unwrap();
+            conn.execute_batch("COMMIT").unwrap();
             println!("{value}");
         }
-        None => println!("(nil)"),
+        None => {
+            conn.execute_batch("COMMIT").unwrap();
+            println!("(nil)");
+        }
     }
 }
 
@@ -499,27 +601,33 @@ fn cmd_llen(conn: &Connection, key: &str) {
 
 fn cmd_lrem(conn: &Connection, key: &str, count: i64, value: &str) {
     let (order, limit) = match count.cmp(&0) {
-        std::cmp::Ordering::Greater => ("ASC", count as usize),
-        std::cmp::Ordering::Less => ("DESC", (-count) as usize),
+        std::cmp::Ordering::Greater => ("ASC", count.unsigned_abs() as usize),
+        std::cmp::Ordering::Less => ("DESC", count.unsigned_abs() as usize),
         std::cmp::Ordering::Equal => ("ASC", usize::MAX),
     };
 
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    drop_if_expired(conn, key);
     let sql = format!(
         "SELECT rowid FROM list_items WHERE key = ?1 AND value = ?2 ORDER BY idx {}",
         order
     );
-    let mut stmt = conn.prepare(&sql).unwrap();
-    let rowids: Vec<i64> = stmt
-        .query_map(params![key, value], |row| row.get(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .take(limit)
-        .collect();
+    let rowids: Vec<i64> = {
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let v = stmt
+            .query_map(params![key, value], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .take(limit)
+            .collect();
+        v
+    };
 
     let removed = rowids.len() as i64;
     for rowid in &rowids {
         conn.execute("DELETE FROM list_items WHERE rowid = ?1", params![rowid]).unwrap();
     }
+    conn.execute_batch("COMMIT").unwrap();
     println!("(integer) {removed}");
 }
 
@@ -546,6 +654,9 @@ fn cmd_lpos(conn: &Connection, key: &str, value: &str) {
 // --- Set commands ---
 
 fn cmd_sadd(conn: &Connection, key: &str, members: &[String]) {
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    ensure_type(conn, key, "set");
+    drop_if_expired(conn, key);
     let mut count = 0i64;
     for member in members {
         let inserted = conn.execute(
@@ -554,10 +665,14 @@ fn cmd_sadd(conn: &Connection, key: &str, members: &[String]) {
         ).unwrap();
         count += inserted as i64;
     }
+    conn.execute_batch("COMMIT").unwrap();
     println!("(integer) {count}");
 }
 
 fn cmd_srem(conn: &Connection, key: &str, members: &[String]) {
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    ensure_type(conn, key, "set");
+    drop_if_expired(conn, key);
     let mut count = 0i64;
     for member in members {
         let deleted = conn.execute(
@@ -566,6 +681,7 @@ fn cmd_srem(conn: &Connection, key: &str, members: &[String]) {
         ).unwrap();
         count += deleted as i64;
     }
+    conn.execute_batch("COMMIT").unwrap();
     println!("(integer) {count}");
 }
 
@@ -618,14 +734,19 @@ fn cmd_scard(conn: &Connection, key: &str) {
 }
 
 fn cmd_sunion(conn: &Connection, keys: &[String]) {
-    if keys.is_empty() { return; }
+    // Expired input sets are treated as empty and contribute nothing.
+    let keys: Vec<&String> = keys.iter().filter(|k| !is_expired(conn, k)).collect();
+    if keys.is_empty() {
+        println!("(empty set)");
+        return;
+    }
     let placeholders: Vec<String> = keys.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
     let sql = format!(
         "SELECT DISTINCT member FROM set_members WHERE key IN ({})",
         placeholders.join(", ")
     );
     let mut stmt = conn.prepare(&sql).unwrap();
-    let params: Vec<&dyn rusqlite::ToSql> = keys.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+    let params: Vec<&dyn rusqlite::ToSql> = keys.iter().map(|k| *k as &dyn rusqlite::ToSql).collect();
     let rows: Vec<String> = stmt
         .query_map(params.as_slice(), |row| row.get(0))
         .unwrap()
@@ -641,7 +762,19 @@ fn cmd_sunion(conn: &Connection, keys: &[String]) {
 }
 
 fn cmd_sinter(conn: &Connection, keys: &[String]) {
-    if keys.is_empty() { return; }
+    if keys.is_empty() {
+        println!("(empty set)");
+        return;
+    }
+    // Any expired/missing input set makes the intersection empty.
+    if keys.iter().any(|k| is_expired(conn, k)) {
+        println!("(empty set)");
+        return;
+    }
+    // Dedup keys so repeated args don't break the COUNT(DISTINCT key) test.
+    let mut keys: Vec<&String> = keys.iter().collect();
+    keys.sort();
+    keys.dedup();
     let num_keys = keys.len();
     let placeholders: Vec<String> = keys.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
     let sql = format!(
@@ -650,7 +783,7 @@ fn cmd_sinter(conn: &Connection, keys: &[String]) {
         num_keys + 1
     );
     let mut stmt = conn.prepare(&sql).unwrap();
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = keys.iter().map(|k| Box::new(k.clone()) as Box<dyn rusqlite::ToSql>).collect();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = keys.iter().map(|k| Box::new((*k).clone()) as Box<dyn rusqlite::ToSql>).collect();
     params.push(Box::new(num_keys as i64));
     let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let rows: Vec<String> = stmt
@@ -668,13 +801,25 @@ fn cmd_sinter(conn: &Connection, keys: &[String]) {
 }
 
 fn cmd_sdiff(conn: &Connection, keys: &[String]) {
-    if keys.is_empty() { return; }
+    if keys.is_empty() {
+        println!("(empty set)");
+        return;
+    }
     let first = &keys[0];
+    if is_expired(conn, first) {
+        println!("(empty set)");
+        return;
+    }
     if keys.len() == 1 {
         cmd_smembers(conn, first);
         return;
     }
-    let rest = &keys[1..];
+    // Expired "other" sets subtract nothing, so drop them.
+    let rest: Vec<&String> = keys[1..].iter().filter(|k| !is_expired(conn, k)).collect();
+    if rest.is_empty() {
+        cmd_smembers(conn, first);
+        return;
+    }
     let placeholders: Vec<String> = rest.iter().enumerate().map(|(i, _)| format!("?{}", i + 2)).collect();
     let sql = format!(
         "SELECT member FROM set_members WHERE key = ?1 AND member NOT IN (SELECT member FROM set_members WHERE key IN ({}))",
@@ -682,8 +827,8 @@ fn cmd_sdiff(conn: &Connection, keys: &[String]) {
     );
     let mut stmt = conn.prepare(&sql).unwrap();
     let mut params: Vec<&dyn rusqlite::ToSql> = vec![first as &dyn rusqlite::ToSql];
-    for k in rest {
-        params.push(k as &dyn rusqlite::ToSql);
+    for k in &rest {
+        params.push(*k as &dyn rusqlite::ToSql);
     }
     let rows: Vec<String> = stmt
         .query_map(params.as_slice(), |row| row.get(0))
@@ -706,17 +851,19 @@ fn cmd_hset(conn: &Connection, key: &str, pairs: &[String]) {
         eprintln!("ERR wrong number of arguments for 'hset' command");
         std::process::exit(1);
     }
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    ensure_type(conn, key, "hash");
+    drop_if_expired(conn, key);
     let mut count = 0i64;
-    let tx = conn.unchecked_transaction().unwrap();
     for chunk in pairs.chunks(2) {
-        let existed: bool = tx
+        let existed: bool = conn
             .query_row(
                 "SELECT 1 FROM hash_fields WHERE key = ?1 AND field = ?2",
                 params![key, chunk[0]],
                 |_| Ok(()),
             )
             .is_ok();
-        tx.execute(
+        conn.execute(
             "INSERT OR REPLACE INTO hash_fields (key, field, value) VALUES (?1, ?2, ?3)",
             params![key, chunk[0], chunk[1]],
         ).unwrap();
@@ -724,7 +871,7 @@ fn cmd_hset(conn: &Connection, key: &str, pairs: &[String]) {
             count += 1;
         }
     }
-    tx.commit().unwrap();
+    conn.execute_batch("COMMIT").unwrap();
     println!("(integer) {count}");
 }
 
@@ -747,6 +894,9 @@ fn cmd_hget(conn: &Connection, key: &str, field: &str) {
 }
 
 fn cmd_hdel(conn: &Connection, key: &str, fields: &[String]) {
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    ensure_type(conn, key, "hash");
+    drop_if_expired(conn, key);
     let mut count = 0i64;
     for field in fields {
         let deleted = conn.execute(
@@ -755,6 +905,7 @@ fn cmd_hdel(conn: &Connection, key: &str, fields: &[String]) {
         ).unwrap();
         count += deleted as i64;
     }
+    conn.execute_batch("COMMIT").unwrap();
     println!("(integer) {count}");
 }
 
@@ -835,23 +986,33 @@ fn cmd_hlen(conn: &Connection, key: &str) {
 // --- Key commands ---
 
 fn cmd_keys(conn: &Connection, pattern: Option<&str>) {
-    let like_pattern = pattern
-        .map(|p| p.replace('*', "%").replace('?', "_"))
-        .unwrap_or_else(|| "%".to_string());
+    let pat = pattern.unwrap_or("*");
+    // Translate Redis glob (* and ?) into a SQL LIKE pattern, escaping the
+    // LIKE metacharacters % and _ (and the escape char itself) so they match
+    // literally.
+    let mut like = String::new();
+    for ch in pat.chars() {
+        match ch {
+            '*' => like.push('%'),
+            '?' => like.push('_'),
+            '%' | '_' | '\\' => {
+                like.push('\\');
+                like.push(ch);
+            }
+            c => like.push(c),
+        }
+    }
 
     let mut all_keys: Vec<String> = Vec::new();
-
-    let mut stmt = conn.prepare("SELECT key FROM strings WHERE key LIKE ?1").unwrap();
-    all_keys.extend(stmt.query_map(params![like_pattern], |row| row.get(0)).unwrap().map(|r| r.unwrap()));
-
-    let mut stmt = conn.prepare("SELECT DISTINCT key FROM list_items WHERE key LIKE ?1").unwrap();
-    all_keys.extend(stmt.query_map(params![like_pattern], |row| row.get(0)).unwrap().map(|r| r.unwrap()));
-
-    let mut stmt = conn.prepare("SELECT DISTINCT key FROM set_members WHERE key LIKE ?1").unwrap();
-    all_keys.extend(stmt.query_map(params![like_pattern], |row| row.get(0)).unwrap().map(|r| r.unwrap()));
-
-    let mut stmt = conn.prepare("SELECT DISTINCT key FROM hash_fields WHERE key LIKE ?1").unwrap();
-    all_keys.extend(stmt.query_map(params![like_pattern], |row| row.get(0)).unwrap().map(|r| r.unwrap()));
+    for sql in [
+        "SELECT key FROM strings WHERE key LIKE ?1 ESCAPE '\\'",
+        "SELECT DISTINCT key FROM list_items WHERE key LIKE ?1 ESCAPE '\\'",
+        "SELECT DISTINCT key FROM set_members WHERE key LIKE ?1 ESCAPE '\\'",
+        "SELECT DISTINCT key FROM hash_fields WHERE key LIKE ?1 ESCAPE '\\'",
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        all_keys.extend(stmt.query_map(params![like], |row| row.get(0)).unwrap().map(|r| r.unwrap()));
+    }
 
     all_keys.sort();
     all_keys.dedup();
@@ -880,58 +1041,35 @@ fn cmd_exists(conn: &Connection, key: &str) {
 }
 
 fn cmd_type(conn: &Connection, key: &str) {
-    if is_expired(conn, key) {
-        println!("none");
-        return;
-    }
-    if conn.query_row("SELECT 1 FROM strings WHERE key = ?1", params![key], |_| Ok(())).is_ok() {
-        println!("string");
-    } else if conn.query_row("SELECT 1 FROM list_items WHERE key = ?1 LIMIT 1", params![key], |_| Ok(())).is_ok() {
-        println!("list");
-    } else if conn.query_row("SELECT 1 FROM set_members WHERE key = ?1 LIMIT 1", params![key], |_| Ok(())).is_ok() {
-        println!("set");
-    } else if conn.query_row("SELECT 1 FROM hash_fields WHERE key = ?1 LIMIT 1", params![key], |_| Ok(())).is_ok() {
-        println!("hash");
-    } else {
-        println!("none");
+    match key_type(conn, key) {
+        Some(t) => println!("{t}"),
+        None => println!("none"),
     }
 }
 
 fn cmd_rename(conn: &Connection, key: &str, newkey: &str) {
-    let tx = conn.unchecked_transaction().unwrap();
-
-    let mut found = false;
-
-    if tx.query_row("SELECT 1 FROM strings WHERE key = ?1", params![key], |_| Ok(())).is_ok() {
-        tx.execute("DELETE FROM strings WHERE key = ?1", params![newkey]).unwrap();
-        tx.execute("UPDATE strings SET key = ?2 WHERE key = ?1", params![key, newkey]).unwrap();
-        found = true;
-    }
-    if tx.query_row("SELECT 1 FROM list_items WHERE key = ?1 LIMIT 1", params![key], |_| Ok(())).is_ok() {
-        tx.execute("DELETE FROM list_items WHERE key = ?1", params![newkey]).unwrap();
-        tx.execute("UPDATE list_items SET key = ?2 WHERE key = ?1", params![key, newkey]).unwrap();
-        found = true;
-    }
-    if tx.query_row("SELECT 1 FROM set_members WHERE key = ?1 LIMIT 1", params![key], |_| Ok(())).is_ok() {
-        tx.execute("DELETE FROM set_members WHERE key = ?1", params![newkey]).unwrap();
-        tx.execute("UPDATE set_members SET key = ?2 WHERE key = ?1", params![key, newkey]).unwrap();
-        found = true;
-    }
-    if tx.query_row("SELECT 1 FROM hash_fields WHERE key = ?1 LIMIT 1", params![key], |_| Ok(())).is_ok() {
-        tx.execute("DELETE FROM hash_fields WHERE key = ?1", params![newkey]).unwrap();
-        tx.execute("UPDATE hash_fields SET key = ?2 WHERE key = ?1", params![key, newkey]).unwrap();
-        found = true;
-    }
-
-    if !found {
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    if !key_exists_in_data(conn, key) || is_expired(conn, key) {
+        conn.execute_batch("ROLLBACK").unwrap();
         eprintln!("ERR no such key");
         std::process::exit(1);
     }
-
-    tx.execute("DELETE FROM expiry WHERE key = ?1", params![newkey]).unwrap();
-    tx.execute("UPDATE expiry SET key = ?2 WHERE key = ?1", params![key, newkey]).unwrap();
-
-    tx.commit().unwrap();
+    // Renaming onto itself is a no-op (must not delete the key).
+    if key == newkey {
+        conn.execute_batch("COMMIT").unwrap();
+        println!("OK");
+        return;
+    }
+    // Overwrite the target across every table so no stale rows of another
+    // type survive, then move the source rows. TTL is preserved by moving
+    // the expiry row along with the data.
+    for t in ["strings", "list_items", "set_members", "hash_fields", "expiry"] {
+        conn.execute(&format!("DELETE FROM {t} WHERE key = ?1"), params![newkey]).unwrap();
+    }
+    for t in ["strings", "list_items", "set_members", "hash_fields", "expiry"] {
+        conn.execute(&format!("UPDATE {t} SET key = ?2 WHERE key = ?1"), params![key, newkey]).unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
     println!("OK");
 }
 
@@ -979,7 +1117,8 @@ fn cmd_expire(conn: &Connection, key: &str, seconds: i64) {
 }
 
 fn cmd_pexpire(conn: &Connection, key: &str, milliseconds: i64) {
-    let seconds = (milliseconds + 999) / 1000;
+    // Round up to whole seconds; non-positive TTLs expire immediately.
+    let seconds = if milliseconds <= 0 { 0 } else { milliseconds.saturating_add(999) / 1000 };
     cmd_expire(conn, key, seconds);
 }
 
@@ -1014,6 +1153,10 @@ fn cmd_ttl(conn: &Connection, key: &str) {
 }
 
 fn cmd_persist(conn: &Connection, key: &str) {
+    if !key_exists_in_data(conn, key) || is_expired(conn, key) {
+        println!("(integer) 0");
+        return;
+    }
     let removed = conn.execute("DELETE FROM expiry WHERE key = ?1", params![key]).unwrap();
     println!("(integer) {}", if removed > 0 { 1 } else { 0 });
 }
@@ -1021,14 +1164,15 @@ fn cmd_persist(conn: &Connection, key: &str) {
 fn cmd_purge(conn: &Connection) {
     let expired_keys: Vec<String> = {
         let mut stmt = conn.prepare(
-            "SELECT key FROM expiry WHERE expires_at < unixepoch()"
+            "SELECT key FROM expiry WHERE expires_at <= unixepoch()"
         ).unwrap();
-        stmt.query_map([], |row| row.get(0))
+        let v = stmt
+            .query_map([], |row| row.get(0))
             .unwrap()
             .map(|r| r.unwrap())
-            .collect()
+            .collect();
+        v
     };
-
     let count = expired_keys.len() as i64;
     for key in &expired_keys {
         conn.execute("DELETE FROM strings WHERE key = ?1", params![key]).unwrap();
