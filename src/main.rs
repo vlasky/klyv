@@ -496,11 +496,8 @@ fn cmd_rpush(conn: &Connection, key: &str, values: &[String]) {
 }
 
 fn cmd_lpop(conn: &Connection, key: &str) {
-    if is_expired(conn, key) {
-        println!("(nil)");
-        return;
-    }
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    drop_if_expired(conn, key);
     let result: Option<(i64, String)> = conn
         .query_row(
             "SELECT rowid, value FROM list_items WHERE key = ?1 ORDER BY idx ASC LIMIT 1",
@@ -522,11 +519,8 @@ fn cmd_lpop(conn: &Connection, key: &str) {
 }
 
 fn cmd_rpop(conn: &Connection, key: &str) {
-    if is_expired(conn, key) {
-        println!("(nil)");
-        return;
-    }
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    drop_if_expired(conn, key);
     let result: Option<(i64, String)> = conn
         .query_row(
             "SELECT rowid, value FROM list_items WHERE key = ?1 ORDER BY idx DESC LIMIT 1",
@@ -607,6 +601,7 @@ fn cmd_lrem(conn: &Connection, key: &str, count: i64, value: &str) {
     };
 
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    ensure_type(conn, key, "list");
     drop_if_expired(conn, key);
     let sql = format!(
         "SELECT rowid FROM list_items WHERE key = ?1 AND value = ?2 ORDER BY idx {order}"
@@ -1103,7 +1098,9 @@ fn key_exists_in_data(conn: &Connection, key: &str) -> bool {
 }
 
 fn cmd_expire(conn: &Connection, key: &str, seconds: i64) {
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     if !key_exists_in_data(conn, key) || is_expired(conn, key) {
+        conn.execute_batch("COMMIT").unwrap();
         println!("(integer) 0");
         return;
     }
@@ -1111,6 +1108,7 @@ fn cmd_expire(conn: &Connection, key: &str, seconds: i64) {
         "INSERT OR REPLACE INTO expiry (key, expires_at) VALUES (?1, unixepoch() + ?2)",
         params![key, seconds],
     ).unwrap();
+    conn.execute_batch("COMMIT").unwrap();
     println!("(integer) 1");
 }
 
@@ -1121,7 +1119,9 @@ fn cmd_pexpire(conn: &Connection, key: &str, milliseconds: i64) {
 }
 
 fn cmd_expireat(conn: &Connection, key: &str, timestamp: i64) {
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     if !key_exists_in_data(conn, key) || is_expired(conn, key) {
+        conn.execute_batch("COMMIT").unwrap();
         println!("(integer) 0");
         return;
     }
@@ -1129,6 +1129,7 @@ fn cmd_expireat(conn: &Connection, key: &str, timestamp: i64) {
         "INSERT OR REPLACE INTO expiry (key, expires_at) VALUES (?1, ?2)",
         params![key, timestamp],
     ).unwrap();
+    conn.execute_batch("COMMIT").unwrap();
     println!("(integer) 1");
 }
 
@@ -1151,11 +1152,14 @@ fn cmd_ttl(conn: &Connection, key: &str) {
 }
 
 fn cmd_persist(conn: &Connection, key: &str) {
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     if !key_exists_in_data(conn, key) || is_expired(conn, key) {
+        conn.execute_batch("COMMIT").unwrap();
         println!("(integer) 0");
         return;
     }
     let removed = conn.execute("DELETE FROM expiry WHERE key = ?1", params![key]).unwrap();
+    conn.execute_batch("COMMIT").unwrap();
     println!("(integer) {}", if removed > 0 { 1 } else { 0 });
 }
 
