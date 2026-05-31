@@ -609,18 +609,16 @@ fn cmd_lrem(conn: &Connection, key: &str, count: i64, value: &str) {
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     drop_if_expired(conn, key);
     let sql = format!(
-        "SELECT rowid FROM list_items WHERE key = ?1 AND value = ?2 ORDER BY idx {}",
-        order
+        "SELECT rowid FROM list_items WHERE key = ?1 AND value = ?2 ORDER BY idx {order}"
     );
     let rowids: Vec<i64> = {
         let mut stmt = conn.prepare(&sql).unwrap();
-        let v = stmt
+        stmt
             .query_map(params![key, value], |row| row.get(0))
             .unwrap()
             .map(|r| r.unwrap())
             .take(limit)
-            .collect();
-        v
+            .collect()
     };
 
     let removed = rowids.len() as i64;
@@ -1166,12 +1164,11 @@ fn cmd_purge(conn: &Connection) {
         let mut stmt = conn.prepare(
             "SELECT key FROM expiry WHERE expires_at <= unixepoch()"
         ).unwrap();
-        let v = stmt
+        stmt
             .query_map([], |row| row.get(0))
             .unwrap()
             .map(|r| r.unwrap())
-            .collect();
-        v
+            .collect()
     };
     let count = expired_keys.len() as i64;
     for key in &expired_keys {

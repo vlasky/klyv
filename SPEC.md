@@ -1,6 +1,8 @@
-# klyv Specification v0.1
+# klyv Specification v0.1.1
 
 A Redis-compatible embedded key-value store backed by SQLite. This document specifies the storage format, command semantics, and CLI interface to enable compatible implementations in any language.
+
+> **v0.1.1** clarifies type safety (`WRONGTYPE`), cross-type `SET`/`MSET`/`RENAME` overwrite, expiry-on-write and the `<=` expiry boundary, negative-TTL handling, integer-overflow errors, `KEYS` LIKE escaping, the `idx = 0.0` first-element rule, and `BEGIN IMMEDIATE`/`busy_timeout` atomicity. The on-disk schema is unchanged from v0.1.
 
 ## Overview
 
@@ -15,9 +17,10 @@ On open, the following PRAGMAs are set:
 ```sql
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
+PRAGMA busy_timeout=5000;
 ```
 
-WAL mode enables concurrent readers and improves write performance. `NORMAL` synchronous is safe against corruption from application crashes (though not OS crashes).
+WAL mode enables concurrent readers and improves write performance. `NORMAL` synchronous is safe against corruption from application crashes (though not OS crashes). `busy_timeout` makes a writer wait for a competing lock instead of failing immediately.
 
 ### Schema
 
@@ -58,7 +61,7 @@ CREATE INDEX IF NOT EXISTS idx_expiry_at ON expiry(expires_at);
 
 ### Design Rationale
 
-- **Separate tables per type** rather than a single table with a `type` column. Allows type-specific indexing and constraints. A key can only exist in one table — commands must not create conflicts.
+- **Separate tables per type** rather than a single table with a `type` column. Allows type-specific indexing and constraints. A key can only exist in one table; this invariant is enforced at the command level (see [Type Safety](#type-safety)) rather than by the schema.
 - **`idx REAL` for lists** uses fractional indexing. LPUSH inserts at `MIN(idx) - 1.0`, RPUSH at `MAX(idx) + 1.0`. This avoids O(n) reindexing on push operations. An empty list starts at `idx = 0.0`.
 - **BLOB storage** for values and members. All values are stored as-is. Numeric operations parse the blob as UTF-8 text then as an integer.
 - **Separate expiry table** rather than a column on each data table. One table to check, works across all types. Uses absolute Unix timestamps (seconds).
@@ -90,10 +93,14 @@ Subcommands use **kebab-case** on the CLI (e.g. `s-add`, `l-push`, `h-set`). Thi
 
 #### SET key value
 
-Store a string value at key. Overwrites any existing value.
+Store a string value at key. Overwrites any existing value **of any type** — if the key currently holds a list, set, or hash, those rows are deleted first so the key becomes a string. A live TTL is preserved; an already-expired TTL row is cleared so the new value is immediately visible.
 
 ```
-INSERT OR REPLACE INTO strings (key, value) VALUES (?, ?)
+DELETE FROM list_items   WHERE key = ?;
+DELETE FROM set_members  WHERE key = ?;
+DELETE FROM hash_fields  WHERE key = ?;
+-- clear expiry only if already expired
+INSERT OR REPLACE INTO strings (key, value) VALUES (?, ?);
 ```
 
 **Output:** `OK`
@@ -112,9 +119,9 @@ Delete one or more keys from ALL tables (strings, lists, sets, hashes).
 
 #### INCR key
 
-Increment the integer value at key by 1. If the key does not exist, it is initialized to 0 before incrementing.
+Increment the integer value at key by 1. If the key does not exist (or has lazily expired), it is initialized to 0 before incrementing.
 
-**Error:** If the value is not a valid integer, print `ERR value is not an integer` to stderr and exit with code 1.
+**Error:** If the value is not a valid integer, print `ERR value is not an integer` to stderr and exit with code 1. If the result would overflow `i64`, print `ERR increment or decrement would overflow` to stderr and exit with code 1. In both cases the stored value is left unchanged.
 
 **Output:** `(integer) N` where N is the new value.
 
@@ -130,6 +137,8 @@ Increment by a specified integer amount.
 
 Decrement by a specified integer amount. Internally: `INCRBY key (-amount)`.
 
+**Error:** If the result would overflow `i64` (including `DECRBY key -9223372036854775808`, where negating the amount itself overflows), print `ERR increment or decrement would overflow` to stderr and exit with code 1. The stored value is left unchanged.
+
 #### APPEND key value
 
 Append `value` to the existing string at key. If key does not exist, creates it with `value` as the content.
@@ -144,7 +153,7 @@ Return the length of the string at key.
 
 #### MSET key value [key value ...]
 
-Set multiple keys atomically (within a single transaction).
+Set multiple keys atomically (within a single transaction). Like `SET`, each key is overwritten regardless of its prior type.
 
 **Error:** If an odd number of arguments is provided, print `ERR wrong number of arguments for 'mset' command` to stderr and exit with code 1.
 
@@ -162,13 +171,13 @@ Lists are ordered sequences. Items are stored with a floating-point index (`idx`
 
 #### LPUSH key value [value ...]
 
-Insert values at the head (lowest index) of the list. Each value is inserted at `MIN(idx) - 1.0`. Multiple values are inserted left-to-right, meaning the last value will be at the head.
+Insert values at the head (lowest index) of the list. The first element of an empty list is inserted at `idx = 0.0`; subsequent head insertions go at `MIN(idx) - 1.0`. Multiple values are inserted left-to-right, meaning the last value will be at the head.
 
 **Output:** `(integer) N` where N is the length of the list after the operation.
 
 #### RPUSH key value [value ...]
 
-Insert values at the tail (highest index).
+Insert values at the tail (highest index). The first element of an empty list is inserted at `idx = 0.0`; subsequent tail insertions go at `MAX(idx) + 1.0`.
 
 **Output:** `(integer) N`
 
@@ -255,9 +264,11 @@ Return the number of members (cardinality).
 
 **Output:** `(integer) N`
 
+For all set operations, an expired input set is treated as empty (consistent with lazy expiry).
+
 #### SUNION key [key ...]
 
-Return the union of all specified sets.
+Return the union of all specified sets. Expired input sets contribute no members.
 
 ```sql
 SELECT DISTINCT member FROM set_members WHERE key IN (?, ?, ...)
@@ -267,18 +278,18 @@ SELECT DISTINCT member FROM set_members WHERE key IN (?, ?, ...)
 
 #### SINTER key [key ...]
 
-Return the intersection of all specified sets.
+Return the intersection of all specified sets. Duplicate key arguments are de-duplicated first, so `SINTER s s` returns the members of `s`. If any input set is expired/missing, the result is empty.
 
 ```sql
 SELECT member FROM set_members WHERE key IN (?, ?, ...)
-GROUP BY member HAVING COUNT(DISTINCT key) = <num_keys>
+GROUP BY member HAVING COUNT(DISTINCT key) = <num_distinct_keys>
 ```
 
 **Output:** Numbered lines or `(empty set)`.
 
 #### SDIFF key [key ...]
 
-Return members in the first set that are not in any of the other sets.
+Return members in the first set that are not in any of the other sets. If the first set is expired/missing the result is empty; expired subsequent sets subtract nothing.
 
 ```sql
 SELECT member FROM set_members WHERE key = ?
@@ -347,9 +358,9 @@ These operate across all data types.
 
 #### KEYS [pattern]
 
-Return all keys matching a glob-style pattern. `*` matches any sequence, `?` matches one character. If no pattern is given, return all keys.
+Return all keys matching a glob-style pattern. `*` matches any sequence, `?` matches one character. If no pattern is given, return all keys. Expired keys are excluded.
 
-Implementation: translate `*` to `%` and `?` to `_` for SQL LIKE. Query all four tables and deduplicate.
+Implementation: translate `*` to `%` and `?` to `_` for SQL LIKE, escaping any literal `%`, `_`, or `\` in the pattern (via `ESCAPE '\'`) so they match themselves. Query all four tables and deduplicate.
 
 **Output:** Numbered lines or `(empty list)`.
 
@@ -363,37 +374,37 @@ Test if a key exists in any table.
 
 Return the data type of the key.
 
-**Output:** One of `string`, `list`, `set`, `hash`, or `none`.
-
-Priority order if ambiguous: string > list > set > hash (but a key should only exist in one table).
+**Output:** One of `string`, `list`, `set`, `hash`, or `none`. A key exists in only one table (enforced via the type-safety check below), so the result is unambiguous; an expired key reports `none`.
 
 #### RENAME key newkey
 
-Rename a key. If `newkey` already exists, it is overwritten. Operates across all tables atomically.
+Rename a key, carrying its TTL with it. If `newkey` already exists it is overwritten across **all** tables (so no rows of a different type survive at the target). Renaming a key onto itself (`key == newkey`) is a no-op that returns `OK`. Operates inside a single transaction.
 
-**Error:** If key does not exist: `ERR no such key` to stderr, exit code 1.
+**Error:** If `key` does not exist (or has lazily expired): `ERR no such key` to stderr, exit code 1.
 
 **Output:** `OK`
 
 ### TTL Commands
 
-Expiry uses lazy filtering: expired keys are not deleted from disk but are invisible to all read commands. Use `PURGE` to reclaim disk space.
+Expiry uses lazy filtering: expired keys are not deleted from disk but are invisible to all read commands, and are treated as absent by write commands (which drop the stale rows before proceeding). Use `PURGE` to reclaim disk space.
+
+A key is expired once the current time **reaches** its `expires_at` — the check is `expires_at <= unixepoch()` (used by both reads and `PURGE`).
 
 #### EXPIRE key seconds
 
-Set a key to expire `seconds` from now. The key must exist and not already be expired.
+Set a key to expire `seconds` from now. The key must exist and not already be expired. A zero or negative `seconds` stores an already-past timestamp, so the key becomes immediately invisible.
 
 **Output:** `(integer) 1` if the timeout was set, `(integer) 0` if the key does not exist.
 
 #### PEXPIRE key milliseconds
 
-Set a key to expire `milliseconds` from now. Internally rounds up to the nearest second (the expiry table stores seconds).
+Set a key to expire `milliseconds` from now. Internally rounds up to the nearest second (the expiry table stores seconds). A zero or negative value expires the key immediately.
 
 **Output:** `(integer) 1` or `(integer) 0`.
 
 #### EXPIREAT key timestamp
 
-Set a key to expire at an absolute Unix timestamp (seconds since epoch).
+Set a key to expire at an absolute Unix timestamp (seconds since epoch). A timestamp in the past expires the key immediately.
 
 **Output:** `(integer) 1` or `(integer) 0`.
 
@@ -408,9 +419,9 @@ Get the remaining time-to-live in seconds.
 
 #### PERSIST key
 
-Remove the expiry from a key, making it persist indefinitely.
+Remove the expiry from a key, making it persist indefinitely. A key that has already lazily expired is treated as non-existent: `PERSIST` returns `(integer) 0` and does **not** resurrect it.
 
-**Output:** `(integer) 1` if the timeout was removed, `(integer) 0` if the key had no expiry.
+**Output:** `(integer) 1` if the timeout was removed, `(integer) 0` if the key had no expiry, doesn't exist, or has expired.
 
 #### PURGE
 
@@ -432,6 +443,16 @@ Delete all data from all tables.
 
 **Output:** `OK`
 
+## Type Safety
+
+A key may hold only one of the four types at a time. Because each type lives in its own table, this invariant is enforced at the command level rather than by the schema:
+
+- A type-specific mutating command first checks whether the key already exists as a different type. If so it prints `WRONGTYPE Operation against a key holding the wrong kind of value` to stderr, exits with code 1, and leaves the data unchanged. This covers `INCR`/`INCRBY`/`DECR`/`DECRBY`/`APPEND` (string), `LPUSH`/`RPUSH`/`LREM` (list), `SADD`/`SREM` (set), and `HSET`/`HDEL` (hash).
+- `SET` and `MSET` are the exception: they overwrite the key regardless of its current type, deleting any list/set/hash rows first.
+- An expired key counts as absent for this check, so a write may freely reuse the key as a new type.
+
+The check is performed inside the same transaction as the write so it cannot race a concurrent writer.
+
 ## Output Format
 
 All output follows Redis CLI conventions:
@@ -452,6 +473,8 @@ Exit code is 0 on success, 1 on error.
 
 SQLite in WAL mode supports multiple concurrent readers and a single writer. klyv does not implement its own locking — it relies on SQLite's built-in locking. Multiple processes can safely read from the same database simultaneously. Writes are serialized by SQLite's write lock.
 
+On open, `PRAGMA busy_timeout=5000` is set so a writer waits (up to 5s) for a competing lock instead of failing immediately with `SQLITE_BUSY`. Read-modify-write commands (`INCR`/`INCRBY`/`DECR`/`DECRBY`, `APPEND`, `LPOP`/`RPOP`, `LREM`, `SET`/`MSET`, `LPUSH`/`RPUSH`, `SADD`/`SREM`, `HSET`/`HDEL`, `RENAME`) run inside a `BEGIN IMMEDIATE` transaction so the write lock is taken up front and the operation is atomic against other processes. The type-safety check (below) runs inside this transaction so it cannot race a concurrent writer.
+
 For CLI usage (one command per invocation), this is sufficient. A long-running server mode (future) would hold a single connection and serialize commands.
 
 ## Compatibility Notes
@@ -463,9 +486,9 @@ For CLI usage (one command per invocation), this is sufficient. A long-running s
 3. **No pub/sub** — no server means no subscribers.
 4. **No transactions (MULTI/EXEC)** — each CLI invocation is implicitly atomic. (Future: a batch/pipe mode could wrap multiple commands in a SQLite transaction.)
 5. **No Lua scripting.**
-6. **Pattern matching** uses SQL LIKE semantics, which differs from Redis glob in edge cases (e.g. character classes `[abc]` are not supported).
+6. **Pattern matching** uses SQL LIKE semantics, which differs from Redis glob in edge cases (e.g. character classes `[abc]` are not supported). `*`/`?` map to `%`/`_`; literal `%`, `_`, and `\` are escaped so they match themselves.
 7. **DEL counts rows, not keys** — if a key exists in multiple tables (shouldn't happen), the count reflects total rows deleted, not keys.
-8. **SET does not clear expiry** — unlike Redis where SET removes the TTL, klyv preserves it. Use PERSIST explicitly to remove expiry.
+8. **SET keeps a live TTL** — unlike Redis where SET removes the TTL, klyv preserves a still-valid TTL across a `SET`/`MSET` (use PERSIST to remove it). A *stale* (already-expired) TTL is cleared so the new value is visible.
 
 ### Implementation Requirements for Ports
 

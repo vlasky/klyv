@@ -134,18 +134,18 @@ Either `--db` or the `KLYV_DB` environment variable is required. The database fi
 
 ## Architecture
 
-- **SQLite WAL mode** for concurrent readers and safe writes
+- **SQLite WAL mode** for concurrent readers and safe writes; `busy_timeout` plus `BEGIN IMMEDIATE` transactions keep read-modify-write commands atomic across processes
 - **Fractional indexing** for O(1) list push (no reindexing)
-- **Lazy expiry** — expired keys are hidden from reads but stay on disk until `purge`
-- **Separate tables** per data type for type-specific indexing and constraints
+- **Lazy expiry** — expired keys are hidden from reads, treated as absent on write, and stay on disk until `purge`
+- **Separate tables** per data type for type-specific indexing and constraints; a key holds one type at a time (mismatched commands fail with `WRONGTYPE`, Redis-style)
 
 ## Differences from Redis
 
 1. Every write persists to disk immediately (no in-memory mode)
 2. Expired keys require explicit `purge` to reclaim space
 3. No pub/sub, transactions (MULTI/EXEC), or Lua scripting
-4. `SET` preserves existing TTL (use `persist` to clear it)
-5. Pattern matching uses SQL LIKE (no `[abc]` character classes)
+4. `SET` preserves a still-valid TTL (use `persist` to clear it); a stale one is dropped
+5. Pattern matching uses SQL LIKE (no `[abc]` character classes); `%`, `_`, `\` are escaped to match literally
 
 ## License
 
