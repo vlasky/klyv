@@ -916,7 +916,12 @@ fn test_expire_sets_ttl() {
     assert_eq!(out.trim(), "(integer) 1");
 
     let (out, _, _) = klyv(&db, &["ttl", "k"]);
-    let ttl: i64 = out.trim().strip_prefix("(integer) ").unwrap().parse().unwrap();
+    let ttl: i64 = out
+        .trim()
+        .strip_prefix("(integer) ")
+        .unwrap()
+        .parse()
+        .unwrap();
     assert!(ttl > 0 && ttl <= 100);
 }
 
@@ -1045,7 +1050,12 @@ fn test_pexpire() {
     assert_eq!(out.trim(), "(integer) 1");
 
     let (out, _, _) = klyv(&db, &["ttl", "k"]);
-    let ttl: i64 = out.trim().strip_prefix("(integer) ").unwrap().parse().unwrap();
+    let ttl: i64 = out
+        .trim()
+        .strip_prefix("(integer) ")
+        .unwrap()
+        .parse()
+        .unwrap();
     assert!(ttl > 0 && ttl <= 60);
 }
 
@@ -1061,7 +1071,12 @@ fn test_expire_at_future() {
     assert_eq!(out.trim(), "v");
 
     let (out, _, _) = klyv(&db, &["ttl", "k"]);
-    let ttl: i64 = out.trim().strip_prefix("(integer) ").unwrap().parse().unwrap();
+    let ttl: i64 = out
+        .trim()
+        .strip_prefix("(integer) ")
+        .unwrap()
+        .parse()
+        .unwrap();
     assert!(ttl > 0);
 }
 
@@ -1121,7 +1136,12 @@ fn test_set_overwrites_clears_expiry_not() {
     klyv(&db, &["set", "k", "new"]);
 
     let (out, _, _) = klyv(&db, &["ttl", "k"]);
-    let ttl: i64 = out.trim().strip_prefix("(integer) ").unwrap().parse().unwrap();
+    let ttl: i64 = out
+        .trim()
+        .strip_prefix("(integer) ")
+        .unwrap()
+        .parse()
+        .unwrap();
     // SET does not clear expiry (Redis-compatible: only DEL/PERSIST clear it)
     assert!(ttl > 0);
 }
@@ -1134,7 +1154,12 @@ fn test_rename_preserves_expiry() {
     klyv(&db, &["rename", "old", "new"]);
 
     let (out, _, _) = klyv(&db, &["ttl", "new"]);
-    let ttl: i64 = out.trim().strip_prefix("(integer) ").unwrap().parse().unwrap();
+    let ttl: i64 = out
+        .trim()
+        .strip_prefix("(integer) ")
+        .unwrap()
+        .parse()
+        .unwrap();
     assert!(ttl > 0 && ttl <= 100);
 
     let (out, _, _) = klyv(&db, &["ttl", "old"]);

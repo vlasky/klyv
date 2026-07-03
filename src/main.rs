@@ -3,7 +3,11 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "klyv", version, about = "Redis-compatible embedded KV store backed by SQLite")]
+#[command(
+    name = "klyv",
+    version,
+    about = "Redis-compatible embedded KV store backed by SQLite"
+)]
 struct Cli {
     #[arg(short, long, env = "KLYV_DB")]
     db: PathBuf,
@@ -43,9 +47,15 @@ enum Command {
     Incr { key: String },
     #[command(about = "Decrement integer value by 1 (creates key at 0 if missing)")]
     Decr { key: String },
-    #[command(about = "Increment integer value by amount", allow_hyphen_values = true)]
+    #[command(
+        about = "Increment integer value by amount",
+        allow_hyphen_values = true
+    )]
     IncrBy { key: String, amount: i64 },
-    #[command(about = "Decrement integer value by amount", allow_hyphen_values = true)]
+    #[command(
+        about = "Decrement integer value by amount",
+        allow_hyphen_values = true
+    )]
     DecrBy { key: String, amount: i64 },
     #[command(about = "Append to string value (creates key if missing), returns new length")]
     Append { key: String, value: String },
@@ -67,11 +77,17 @@ enum Command {
     LPop { key: String },
     #[command(about = "Remove and return element from tail of list")]
     RPop { key: String },
-    #[command(about = "Return elements from index START to STOP (inclusive, 0-based, negatives count from end)", allow_hyphen_values = true)]
+    #[command(
+        about = "Return elements from index START to STOP (inclusive, 0-based, negatives count from end)",
+        allow_hyphen_values = true
+    )]
     LRange { key: String, start: i64, stop: i64 },
     #[command(about = "Get list length")]
     LLen { key: String },
-    #[command(about = "Remove COUNT occurrences of value (0=all, +N=from head, -N=from tail)", allow_hyphen_values = true)]
+    #[command(
+        about = "Remove COUNT occurrences of value (0=all, +N=from head, -N=from tail)",
+        allow_hyphen_values = true
+    )]
     LRem {
         key: String,
         #[arg(help = "0=remove all, +N=first N from head, -N=first N from tail")]
@@ -127,11 +143,20 @@ enum Command {
     Rename { key: String, newkey: String },
 
     // TTL commands
-    #[command(about = "Set key expiry in seconds from now", allow_hyphen_values = true)]
+    #[command(
+        about = "Set key expiry in seconds from now",
+        allow_hyphen_values = true
+    )]
     Expire { key: String, seconds: i64 },
-    #[command(about = "Set key expiry in milliseconds from now", allow_hyphen_values = true)]
+    #[command(
+        about = "Set key expiry in milliseconds from now",
+        allow_hyphen_values = true
+    )]
     PExpire { key: String, milliseconds: i64 },
-    #[command(about = "Set key expiry at Unix timestamp (seconds)", allow_hyphen_values = true)]
+    #[command(
+        about = "Set key expiry at Unix timestamp (seconds)",
+        allow_hyphen_values = true
+    )]
     ExpireAt { key: String, timestamp: i64 },
     #[command(about = "Get remaining TTL in seconds (-1=no expiry, -2=key missing)")]
     Ttl { key: String },
@@ -328,7 +353,8 @@ fn render(reply: &Reply, format: OutputFormat) -> String {
 
 fn open_db(path: &PathBuf) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.execute_batch("
+    conn.execute_batch(
+        "
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=NORMAL;
         PRAGMA busy_timeout=5000;
@@ -363,7 +389,8 @@ fn open_db(path: &PathBuf) -> rusqlite::Result<Connection> {
             expires_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_expiry_at ON expiry(expires_at);
-    ")?;
+    ",
+    )?;
     Ok(conn)
 }
 
@@ -379,7 +406,10 @@ fn is_expired(conn: &Connection, key: &str) -> Result<bool, rusqlite::Error> {
 }
 
 fn exists_in(conn: &Connection, sql: &str, key: &str) -> Result<bool, rusqlite::Error> {
-    Ok(conn.query_row(sql, params![key], |_| Ok(())).optional()?.is_some())
+    Ok(conn
+        .query_row(sql, params![key], |_| Ok(()))
+        .optional()?
+        .is_some())
 }
 
 fn key_type(conn: &Connection, key: &str) -> Result<Option<&'static str>, rusqlite::Error> {
@@ -392,10 +422,18 @@ fn key_type(conn: &Connection, key: &str) -> Result<Option<&'static str>, rusqli
     if exists_in(conn, "SELECT 1 FROM list_items WHERE key = ?1 LIMIT 1", key)? {
         return Ok(Some("list"));
     }
-    if exists_in(conn, "SELECT 1 FROM set_members WHERE key = ?1 LIMIT 1", key)? {
+    if exists_in(
+        conn,
+        "SELECT 1 FROM set_members WHERE key = ?1 LIMIT 1",
+        key,
+    )? {
         return Ok(Some("set"));
     }
-    if exists_in(conn, "SELECT 1 FROM hash_fields WHERE key = ?1 LIMIT 1", key)? {
+    if exists_in(
+        conn,
+        "SELECT 1 FROM hash_fields WHERE key = ?1 LIMIT 1",
+        key,
+    )? {
         return Ok(Some("hash"));
     }
     Ok(None)
@@ -422,10 +460,20 @@ fn drop_if_expired(conn: &Connection, key: &str) -> Result<(), rusqlite::Error> 
 }
 
 fn key_exists_in_data(conn: &Connection, key: &str) -> Result<bool, rusqlite::Error> {
-    Ok(exists_in(conn, "SELECT 1 FROM strings WHERE key = ?1", key)?
-        || exists_in(conn, "SELECT 1 FROM list_items WHERE key = ?1 LIMIT 1", key)?
-        || exists_in(conn, "SELECT 1 FROM set_members WHERE key = ?1 LIMIT 1", key)?
-        || exists_in(conn, "SELECT 1 FROM hash_fields WHERE key = ?1 LIMIT 1", key)?)
+    Ok(
+        exists_in(conn, "SELECT 1 FROM strings WHERE key = ?1", key)?
+            || exists_in(conn, "SELECT 1 FROM list_items WHERE key = ?1 LIMIT 1", key)?
+            || exists_in(
+                conn,
+                "SELECT 1 FROM set_members WHERE key = ?1 LIMIT 1",
+                key,
+            )?
+            || exists_in(
+                conn,
+                "SELECT 1 FROM hash_fields WHERE key = ?1 LIMIT 1",
+                key,
+            )?,
+    )
 }
 
 /// Whether a command mutates the database (BEGIN IMMEDIATE) or only reads
@@ -566,8 +614,12 @@ fn main() {
 // --- String commands ---
 
 fn get_string(conn: &Connection, key: &str) -> Result<Option<String>, rusqlite::Error> {
-    conn.query_row("SELECT value FROM strings WHERE key = ?1", params![key], |row| row.get(0))
-        .optional()
+    conn.query_row(
+        "SELECT value FROM strings WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 fn cmd_set(conn: &Connection, key: &str, value: &str) -> CmdResult {
@@ -658,7 +710,9 @@ fn cmd_strlen(conn: &Connection, key: &str) -> CmdResult {
 
 fn cmd_mset(conn: &Connection, pairs: &[String]) -> CmdResult {
     if !pairs.len().is_multiple_of(2) {
-        return Err(CmdError::new("ERR wrong number of arguments for 'mset' command"));
+        return Err(CmdError::new(
+            "ERR wrong number of arguments for 'mset' command",
+        ));
     }
     for chunk in pairs.chunks(2) {
         // MSET overwrites each key regardless of its prior type.
@@ -694,7 +748,10 @@ fn cmd_mget(conn: &Connection, keys: &[String]) -> CmdResult {
 // --- List commands ---
 
 // Returns (element count, min idx, max idx) for a list in one query.
-fn list_bounds(conn: &Connection, key: &str) -> Result<(i64, Option<f64>, Option<f64>), rusqlite::Error> {
+fn list_bounds(
+    conn: &Connection,
+    key: &str,
+) -> Result<(i64, Option<f64>, Option<f64>), rusqlite::Error> {
     conn.query_row(
         "SELECT COUNT(*), MIN(idx), MAX(idx) FROM list_items WHERE key = ?1",
         params![key],
@@ -736,7 +793,9 @@ fn cmd_pop(conn: &Connection, key: &str, order: &str) -> CmdResult {
     drop_if_expired(conn, key)?;
     let result: Option<(i64, String)> = conn
         .query_row(
-            &format!("SELECT rowid, value FROM list_items WHERE key = ?1 ORDER BY idx {order} LIMIT 1"),
+            &format!(
+                "SELECT rowid, value FROM list_items WHERE key = ?1 ORDER BY idx {order} LIMIT 1"
+            ),
             params![key],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -764,8 +823,16 @@ fn cmd_lrange(conn: &Connection, key: &str, start: i64, stop: i64) -> CmdResult 
         return Ok(Reply::Array(vec![], Empty::List));
     }
 
-    let s = if start < 0 { (len + start).max(0) } else { start.min(len) };
-    let e = if stop < 0 { (len + stop).max(0) } else { stop.min(len - 1) };
+    let s = if start < 0 {
+        (len + start).max(0)
+    } else {
+        start.min(len)
+    };
+    let e = if stop < 0 {
+        (len + stop).max(0)
+    } else {
+        stop.min(len - 1)
+    };
 
     if s > e {
         return Ok(Reply::Array(vec![], Empty::List));
@@ -773,7 +840,7 @@ fn cmd_lrange(conn: &Connection, key: &str, start: i64, stop: i64) -> CmdResult 
 
     let limit = e - s + 1;
     let mut stmt = conn.prepare(
-        "SELECT value FROM list_items WHERE key = ?1 ORDER BY idx ASC LIMIT ?2 OFFSET ?3"
+        "SELECT value FROM list_items WHERE key = ?1 ORDER BY idx ASC LIMIT ?2 OFFSET ?3",
     )?;
     let rows: Vec<String> = stmt
         .query_map(params![key, limit, s], |row| row.get(0))?
@@ -802,9 +869,8 @@ fn cmd_lrem(conn: &Connection, key: &str, count: i64, value: &str) -> CmdResult 
 
     ensure_type(conn, key, "list")?;
     drop_if_expired(conn, key)?;
-    let sql = format!(
-        "SELECT rowid FROM list_items WHERE key = ?1 AND value = ?2 ORDER BY idx {order}"
-    );
+    let sql =
+        format!("SELECT rowid FROM list_items WHERE key = ?1 AND value = ?2 ORDER BY idx {order}");
     let rowids: Vec<i64> = {
         let mut stmt = conn.prepare(&sql)?;
         stmt.query_map(params![key, value], |row| row.get(0))?
@@ -823,9 +889,7 @@ fn cmd_lpos(conn: &Connection, key: &str, value: &str) -> CmdResult {
     if is_expired(conn, key)? {
         return Ok(Reply::Nil);
     }
-    let mut stmt = conn.prepare(
-        "SELECT value FROM list_items WHERE key = ?1 ORDER BY idx ASC"
-    )?;
+    let mut stmt = conn.prepare("SELECT value FROM list_items WHERE key = ?1 ORDER BY idx ASC")?;
     // Stream rows and stop at the first match instead of loading the whole list.
     let mut rows = stmt.query(params![key])?;
     let mut pos: i64 = 0;
@@ -917,13 +981,18 @@ fn cmd_sunion(conn: &Connection, keys: &[String]) -> CmdResult {
     if live.is_empty() {
         return Ok(Reply::Array(vec![], Empty::Set));
     }
-    let placeholders: Vec<String> = live.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+    let placeholders: Vec<String> = live
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect();
     let sql = format!(
         "SELECT DISTINCT member FROM set_members WHERE key IN ({})",
         placeholders.join(", ")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> = live.iter().map(|k| *k as &dyn rusqlite::ToSql).collect();
+    let params: Vec<&dyn rusqlite::ToSql> =
+        live.iter().map(|k| *k as &dyn rusqlite::ToSql).collect();
     let rows: Vec<String> = stmt
         .query_map(params.as_slice(), |row| row.get(0))?
         .collect::<Result<_, _>>()?;
@@ -945,14 +1014,21 @@ fn cmd_sinter(conn: &Connection, keys: &[String]) -> CmdResult {
     keys.sort();
     keys.dedup();
     let num_keys = keys.len();
-    let placeholders: Vec<String> = keys.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+    let placeholders: Vec<String> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect();
     let sql = format!(
         "SELECT member FROM set_members WHERE key IN ({}) GROUP BY member HAVING COUNT(DISTINCT key) = ?{}",
         placeholders.join(", "),
         num_keys + 1
     );
     let mut stmt = conn.prepare(&sql)?;
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = keys.iter().map(|k| Box::new((*k).clone()) as Box<dyn rusqlite::ToSql>).collect();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = keys
+        .iter()
+        .map(|k| Box::new((*k).clone()) as Box<dyn rusqlite::ToSql>)
+        .collect();
     params.push(Box::new(num_keys as i64));
     let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let rows: Vec<String> = stmt
@@ -982,7 +1058,11 @@ fn cmd_sdiff(conn: &Connection, keys: &[String]) -> CmdResult {
     if rest.is_empty() {
         return cmd_smembers(conn, first);
     }
-    let placeholders: Vec<String> = rest.iter().enumerate().map(|(i, _)| format!("?{}", i + 2)).collect();
+    let placeholders: Vec<String> = rest
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect();
     let sql = format!(
         "SELECT member FROM set_members WHERE key = ?1 AND member NOT IN (SELECT member FROM set_members WHERE key IN ({}))",
         placeholders.join(", ")
@@ -1002,7 +1082,9 @@ fn cmd_sdiff(conn: &Connection, keys: &[String]) -> CmdResult {
 
 fn cmd_hset(conn: &Connection, key: &str, pairs: &[String]) -> CmdResult {
     if !pairs.len().is_multiple_of(2) {
-        return Err(CmdError::new("ERR wrong number of arguments for 'hset' command"));
+        return Err(CmdError::new(
+            "ERR wrong number of arguments for 'hset' command",
+        ));
     }
     ensure_type(conn, key, "hash")?;
     drop_if_expired(conn, key)?;
@@ -1177,11 +1259,26 @@ fn cmd_rename(conn: &Connection, key: &str, newkey: &str) -> CmdResult {
     // Overwrite the target across every table so no stale rows of another
     // type survive, then move the source rows. TTL is preserved by moving
     // the expiry row along with the data.
-    for t in ["strings", "list_items", "set_members", "hash_fields", "expiry"] {
+    for t in [
+        "strings",
+        "list_items",
+        "set_members",
+        "hash_fields",
+        "expiry",
+    ] {
         conn.execute(&format!("DELETE FROM {t} WHERE key = ?1"), params![newkey])?;
     }
-    for t in ["strings", "list_items", "set_members", "hash_fields", "expiry"] {
-        conn.execute(&format!("UPDATE {t} SET key = ?2 WHERE key = ?1"), params![key, newkey])?;
+    for t in [
+        "strings",
+        "list_items",
+        "set_members",
+        "hash_fields",
+        "expiry",
+    ] {
+        conn.execute(
+            &format!("UPDATE {t} SET key = ?2 WHERE key = ?1"),
+            params![key, newkey],
+        )?;
     }
     Ok(Reply::Simple("OK"))
 }
@@ -1190,21 +1287,31 @@ fn cmd_rename(conn: &Connection, key: &str, newkey: &str) -> CmdResult {
 
 fn cmd_dbsize(conn: &Connection) -> CmdResult {
     let mut count: i64 = 0;
-    count += conn.query_row("SELECT COUNT(*) FROM strings", [], |row| row.get::<_, i64>(0))?;
-    count += conn.query_row("SELECT COUNT(DISTINCT key) FROM list_items", [], |row| row.get::<_, i64>(0))?;
-    count += conn.query_row("SELECT COUNT(DISTINCT key) FROM set_members", [], |row| row.get::<_, i64>(0))?;
-    count += conn.query_row("SELECT COUNT(DISTINCT key) FROM hash_fields", [], |row| row.get::<_, i64>(0))?;
+    count += conn.query_row("SELECT COUNT(*) FROM strings", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    count += conn.query_row("SELECT COUNT(DISTINCT key) FROM list_items", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    count += conn.query_row("SELECT COUNT(DISTINCT key) FROM set_members", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    count += conn.query_row("SELECT COUNT(DISTINCT key) FROM hash_fields", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
     Ok(Reply::Int(count))
 }
 
 fn cmd_flushall(conn: &Connection) -> CmdResult {
-    conn.execute_batch("
+    conn.execute_batch(
+        "
         DELETE FROM strings;
         DELETE FROM list_items;
         DELETE FROM set_members;
         DELETE FROM hash_fields;
         DELETE FROM expiry;
-    ")?;
+    ",
+    )?;
     Ok(Reply::Simple("OK"))
 }
 
@@ -1256,9 +1363,7 @@ fn cmd_persist(conn: &Connection, key: &str) -> CmdResult {
 
 fn cmd_purge(conn: &Connection) -> CmdResult {
     let expired_keys: Vec<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT key FROM expiry WHERE expires_at <= unixepoch()"
-        )?;
+        let mut stmt = conn.prepare("SELECT key FROM expiry WHERE expires_at <= unixepoch()")?;
         stmt.query_map([], |row| row.get(0))?
             .collect::<Result<_, _>>()?
     };
