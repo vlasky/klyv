@@ -113,9 +113,9 @@ Retrieve the string value at key.
 
 #### DEL key [key ...]
 
-Delete one or more keys from ALL tables (strings, lists, sets, hashes).
+Delete one or more keys from ALL tables (strings, lists, sets, hashes). The whole operation runs in a single `BEGIN IMMEDIATE` transaction, so a multi-key delete is atomic and no key is ever left half-deleted (e.g. data rows gone but an expiry row surviving).
 
-**Output:** `(integer) N` where N is the total number of rows deleted across all tables.
+**Output:** `(integer) N` where N is the number of *keys* that existed and were deleted, matching Redis. A key that has lazily expired is already logically gone, so it does not count toward N — but its physical rows (including the expiry row) are still reclaimed. Repeating a key in the argument list counts it once.
 
 #### INCR key
 
@@ -425,7 +425,7 @@ Remove the expiry from a key, making it persist indefinitely. A key that has alr
 
 #### PURGE
 
-Delete all expired keys from disk (data tables + expiry table). This is the only command that physically removes expired data.
+Delete all expired keys from disk (data tables + expiry table). This is the only command that physically removes expired data. Runs in a single `BEGIN IMMEDIATE` transaction, so the scan for expired keys and their deletion see one consistent snapshot and cannot race a concurrent `EXPIRE`/`PERSIST`.
 
 **Output:** `(integer) N` where N is the number of keys purged.
 
@@ -439,7 +439,7 @@ Return the total number of distinct keys across all tables. Note: counts raw row
 
 #### FLUSHALL
 
-Delete all data from all tables.
+Delete all data from all tables, atomically (single transaction).
 
 **Output:** `OK`
 
@@ -473,7 +473,7 @@ Exit code is 0 on success, 1 on error.
 
 SQLite in WAL mode supports multiple concurrent readers and a single writer. klyv does not implement its own locking — it relies on SQLite's built-in locking. Multiple processes can safely read from the same database simultaneously. Writes are serialized by SQLite's write lock.
 
-On open, `PRAGMA busy_timeout=5000` is set so a writer waits (up to 5s) for a competing lock instead of failing immediately with `SQLITE_BUSY`. Read-modify-write commands (`INCR`/`INCRBY`/`DECR`/`DECRBY`, `APPEND`, `LPOP`/`RPOP`, `LREM`, `SET`/`MSET`, `LPUSH`/`RPUSH`, `SADD`/`SREM`, `HSET`/`HDEL`, `RENAME`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`, `PERSIST`) run inside a `BEGIN IMMEDIATE` transaction so the write lock is taken up front and the operation is atomic against other processes. The type-safety check (below) runs inside this transaction so it cannot race a concurrent writer. For the TTL mutators, the existence/expiry check and the expiry write are serialized together, so a concurrent writer cannot leave an orphan TTL on a key that was deleted between the check and the write.
+On open, `PRAGMA busy_timeout=5000` is set so a writer waits (up to 5s) for a competing lock instead of failing immediately with `SQLITE_BUSY`. Read-modify-write commands (`INCR`/`INCRBY`/`DECR`/`DECRBY`, `APPEND`, `LPOP`/`RPOP`, `LREM`, `SET`/`MSET`, `LPUSH`/`RPUSH`, `SADD`/`SREM`, `HSET`/`HDEL`, `DEL`, `RENAME`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`, `PERSIST`, `PURGE`, `FLUSHALL`) run inside a `BEGIN IMMEDIATE` transaction so the write lock is taken up front and the operation is atomic against other processes. The type-safety check (below) runs inside this transaction so it cannot race a concurrent writer. For the TTL mutators, the existence/expiry check and the expiry write are serialized together, so a concurrent writer cannot leave an orphan TTL on a key that was deleted between the check and the write.
 
 For CLI usage (one command per invocation), this is sufficient. A long-running server mode (future) would hold a single connection and serialize commands.
 
@@ -487,8 +487,7 @@ For CLI usage (one command per invocation), this is sufficient. A long-running s
 4. **No transactions (MULTI/EXEC)** — each CLI invocation is implicitly atomic. (Future: a batch/pipe mode could wrap multiple commands in a SQLite transaction.)
 5. **No Lua scripting.**
 6. **Pattern matching** uses SQL LIKE semantics, which differs from Redis glob in edge cases (e.g. character classes `[abc]` are not supported). `*`/`?` map to `%`/`_`; literal `%`, `_`, and `\` are escaped so they match themselves.
-7. **DEL counts rows, not keys** — if a key exists in multiple tables (shouldn't happen), the count reflects total rows deleted, not keys.
-8. **SET keeps a live TTL** — unlike Redis where SET removes the TTL, klyv preserves a still-valid TTL across a `SET`/`MSET` (use PERSIST to remove it). A *stale* (already-expired) TTL is cleared so the new value is visible.
+7. **SET keeps a live TTL** — unlike Redis where SET removes the TTL, klyv preserves a still-valid TTL across a `SET`/`MSET` (use PERSIST to remove it). A *stale* (already-expired) TTL is cleared so the new value is visible.
 
 ### Implementation Requirements for Ports
 
