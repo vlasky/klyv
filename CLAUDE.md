@@ -5,10 +5,10 @@ Redis-compatible embedded KV store backed by SQLite. No server, no daemon — ju
 ## Usage
 
 ```
-klyv --db <PATH> <COMMAND> [ARGS...]
+klyv --db <PATH> [--format <human|raw|json>] <COMMAND> [ARGS...]
 ```
 
-Either `--db` or the `KLYV_DB` env var is required. The database file is created on first use.
+Either `--db` or the `KLYV_DB` env var is required. The database file is created on first use. `--format` selects the rendering: `human` (default, redis-cli style), `raw` (bare values, nil = empty line), or `json` (single JSON value; `h-get-all` renders as an object, nil as `null`).
 
 ## Commands
 

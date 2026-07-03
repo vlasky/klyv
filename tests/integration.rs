@@ -1653,3 +1653,101 @@ fn test_expireat_on_missing_key_returns_zero() {
     assert!(ok);
     assert_eq!(out.trim(), "(integer) 0");
 }
+
+// === OUTPUT FORMATS ===
+
+fn klyv_fmt(db: &str, format: &str, args: &[&str]) -> (String, String, bool) {
+    let output = Command::new(env!("CARGO_BIN_EXE_klyv"))
+        .arg("--db")
+        .arg(db)
+        .arg("--format")
+        .arg(format)
+        .args(args)
+        .output()
+        .expect("failed to run klyv");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (stdout, stderr, output.status.success())
+}
+
+#[test]
+fn test_raw_get_and_nil() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "hello"]);
+    let (out, _, ok) = klyv_fmt(&db, "raw", &["get", "k"]);
+    assert!(ok);
+    assert_eq!(out, "hello\n");
+
+    // Nil is a bare empty line in raw mode.
+    let (out, _, ok) = klyv_fmt(&db, "raw", &["get", "missing"]);
+    assert!(ok);
+    assert_eq!(out, "\n");
+}
+
+#[test]
+fn test_raw_int_and_array() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "l", "a", "b"]);
+    let (out, _, _) = klyv_fmt(&db, "raw", &["l-len", "l"]);
+    assert_eq!(out, "2\n");
+
+    let (out, _, _) = klyv_fmt(&db, "raw", &["l-range", "l", "0", "-1"]);
+    assert_eq!(out, "a\nb\n");
+
+    // Empty array prints nothing in raw mode.
+    let (out, _, _) = klyv_fmt(&db, "raw", &["l-range", "nolist", "0", "-1"]);
+    assert_eq!(out, "");
+}
+
+#[test]
+fn test_raw_mget_lines() {
+    let db = fresh_db();
+    klyv(&db, &["set", "a", "1"]);
+    let (out, _, _) = klyv_fmt(&db, "raw", &["m-get", "a", "missing"]);
+    assert_eq!(out, "1\n\n");
+}
+
+#[test]
+fn test_json_scalar_nil_and_array() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "hello"]);
+    let (out, _, ok) = klyv_fmt(&db, "json", &["get", "k"]);
+    assert!(ok);
+    assert_eq!(out, "\"hello\"\n");
+
+    let (out, _, _) = klyv_fmt(&db, "json", &["get", "missing"]);
+    assert_eq!(out, "null\n");
+
+    let (out, _, _) = klyv_fmt(&db, "json", &["incr", "n"]);
+    assert_eq!(out, "1\n");
+
+    klyv(&db, &["r-push", "l", "a", "b"]);
+    let (out, _, _) = klyv_fmt(&db, "json", &["l-range", "l", "0", "-1"]);
+    assert_eq!(out, "[\"a\",\"b\"]\n");
+
+    let (out, _, _) = klyv_fmt(&db, "json", &["set", "k2", "v"]);
+    assert_eq!(out, "\"OK\"\n");
+}
+
+#[test]
+fn test_json_hgetall_object_and_mget() {
+    let db = fresh_db();
+    klyv(&db, &["h-set", "h", "name", "Alice", "role", "admin"]);
+    let (out, _, _) = klyv_fmt(&db, "json", &["h-get-all", "h"]);
+    assert_eq!(out, "{\"name\":\"Alice\",\"role\":\"admin\"}\n");
+
+    let (out, _, _) = klyv_fmt(&db, "json", &["h-get-all", "missing"]);
+    assert_eq!(out, "{}\n");
+
+    klyv(&db, &["set", "a", "1"]);
+    let (out, _, _) = klyv_fmt(&db, "json", &["m-get", "a", "missing"]);
+    assert_eq!(out, "[\"1\",null]\n");
+}
+
+#[test]
+fn test_json_escapes_special_characters() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "line1\nline2\t\"quoted\" back\\slash"]);
+    let (out, _, _) = klyv_fmt(&db, "json", &["get", "k"]);
+    assert_eq!(out, "\"line1\\nline2\\t\\\"quoted\\\" back\\\\slash\"\n");
+}

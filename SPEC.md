@@ -80,6 +80,7 @@ klyv [OPTIONS] <COMMAND> [ARGS...]
 | Option | Env Var | Default | Description |
 |--------|---------|---------|-------------|
 | `-d`, `--db <PATH>` | `KLYV_DB` | (required) | Path to the SQLite database file |
+| `-f`, `--format <FMT>` | | `human` | Output rendering: `human`, `raw`, or `json` (see Output Format) |
 
 Either `--db` or the `KLYV_DB` environment variable must be provided. There is no default — this avoids silently creating database files in the working directory. The file is created automatically on first use if it doesn't exist.
 
@@ -468,6 +469,22 @@ All output follows Redis CLI conventions:
 | Error | `ERR message` to stderr | `ERR value is not an integer` |
 
 Exit code is 0 on success, 1 on error.
+
+### Alternative renderings
+
+The table above describes the default `human` format, which is the normative output for this spec's examples. The same typed reply can also be rendered with `--format raw` or `--format json`; errors are unaffected (stderr + exit 1):
+
+| Reply | `raw` | `json` |
+|-------|-------|--------|
+| OK status | `OK` | `"OK"` |
+| Integer | bare number | number |
+| String value | bare text | JSON string |
+| Nil | empty line | `null` |
+| List/set items | one bare value per line | array of strings |
+| HGETALL | alternating field/value lines | object `{"field":"value"}` |
+| Empty collection | (nothing) | `[]` / `{}` |
+
+`raw` matches `redis-cli --raw` conventions, including its ambiguities (nil vs empty string). `json` is the unambiguous machine-readable format. Ports must implement `human`; `raw` and `json` are recommended but optional.
 
 ## Concurrency
 
