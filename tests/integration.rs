@@ -85,6 +85,38 @@ fn test_del_nonexistent() {
 }
 
 #[test]
+fn test_del_list_counts_keys_not_rows() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "mylist", "a", "b", "c", "d", "e"]);
+    let (out, _, _) = klyv(&db, &["del", "mylist"]);
+    assert_eq!(out.trim(), "(integer) 1");
+}
+
+#[test]
+fn test_del_duplicate_key_counts_once() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    let (out, _, _) = klyv(&db, &["del", "k", "k"]);
+    assert_eq!(out.trim(), "(integer) 1");
+}
+
+#[test]
+fn test_del_expired_key_counts_zero_but_reclaims_rows() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    klyv(&db, &["expire-at", "k", "0"]);
+
+    let (out, _, _) = klyv(&db, &["del", "k"]);
+    assert_eq!(out.trim(), "(integer) 0");
+
+    // Physical rows are reclaimed even though the count is 0.
+    let (out, _, _) = klyv(&db, &["db-size"]);
+    assert_eq!(out.trim(), "(integer) 0");
+    let (out, _, _) = klyv(&db, &["purge"]);
+    assert_eq!(out.trim(), "(integer) 0");
+}
+
+#[test]
 fn test_incr_new_key() {
     let db = fresh_db();
     let (out, _, ok) = klyv(&db, &["incr", "counter"]);
@@ -827,7 +859,7 @@ fn test_del_across_types() {
     klyv(&db, &["r-push", "k2", "list_val"]);
 
     let (out, _, _) = klyv(&db, &["del", "k", "k2"]);
-    assert!(out.contains("(integer)"));
+    assert_eq!(out.trim(), "(integer) 2");
 
     let (out, _, _) = klyv(&db, &["exists", "k"]);
     assert_eq!(out.trim(), "(integer) 0");

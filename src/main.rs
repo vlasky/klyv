@@ -317,14 +317,21 @@ fn cmd_get(conn: &Connection, key: &str) {
 }
 
 fn cmd_del(conn: &Connection, keys: &[String]) {
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     let mut count = 0u64;
     for key in keys {
-        count += conn.execute("DELETE FROM strings WHERE key = ?1", params![key]).unwrap() as u64;
-        count += conn.execute("DELETE FROM list_items WHERE key = ?1", params![key]).unwrap() as u64;
-        count += conn.execute("DELETE FROM set_members WHERE key = ?1", params![key]).unwrap() as u64;
-        count += conn.execute("DELETE FROM hash_fields WHERE key = ?1", params![key]).unwrap() as u64;
+        // Count keys like Redis, not rows; an expired key is already logically
+        // gone so it doesn't count, but its physical rows are still reclaimed.
+        if key_exists_in_data(conn, key) && !is_expired(conn, key) {
+            count += 1;
+        }
+        conn.execute("DELETE FROM strings WHERE key = ?1", params![key]).unwrap();
+        conn.execute("DELETE FROM list_items WHERE key = ?1", params![key]).unwrap();
+        conn.execute("DELETE FROM set_members WHERE key = ?1", params![key]).unwrap();
+        conn.execute("DELETE FROM hash_fields WHERE key = ?1", params![key]).unwrap();
         conn.execute("DELETE FROM expiry WHERE key = ?1", params![key]).unwrap();
     }
+    conn.execute_batch("COMMIT").unwrap();
     println!("(integer) {count}");
 }
 
@@ -1079,11 +1086,13 @@ fn cmd_dbsize(conn: &Connection) {
 
 fn cmd_flushall(conn: &Connection) {
     conn.execute_batch("
+        BEGIN IMMEDIATE;
         DELETE FROM strings;
         DELETE FROM list_items;
         DELETE FROM set_members;
         DELETE FROM hash_fields;
         DELETE FROM expiry;
+        COMMIT;
     ").unwrap();
     println!("OK");
 }
@@ -1164,6 +1173,7 @@ fn cmd_persist(conn: &Connection, key: &str) {
 }
 
 fn cmd_purge(conn: &Connection) {
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     let expired_keys: Vec<String> = {
         let mut stmt = conn.prepare(
             "SELECT key FROM expiry WHERE expires_at <= unixepoch()"
@@ -1182,5 +1192,6 @@ fn cmd_purge(conn: &Connection) {
         conn.execute("DELETE FROM hash_fields WHERE key = ?1", params![key]).unwrap();
         conn.execute("DELETE FROM expiry WHERE key = ?1", params![key]).unwrap();
     }
+    conn.execute_batch("COMMIT").unwrap();
     println!("(integer) {count}");
 }
