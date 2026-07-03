@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::PathBuf;
 
@@ -8,8 +8,27 @@ struct Cli {
     #[arg(short, long, env = "KLYV_DB")]
     db: PathBuf,
 
+    #[arg(
+        short,
+        long,
+        value_enum,
+        default_value = "human",
+        help = "Output format: human (redis-cli style), raw (bare values), json"
+    )]
+    format: OutputFormat,
+
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    /// redis-cli-style text: (integer) N, (nil), numbered quoted arrays
+    Human,
+    /// Bare values, one per line; nil is an empty line, like redis-cli --raw
+    Raw,
+    /// A single JSON value: strings, numbers, null, arrays
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -205,6 +224,106 @@ fn render_human(reply: &Reply, out: &mut String) {
             }
         }
     }
+}
+
+fn render_raw(reply: &Reply, out: &mut String) {
+    match reply {
+        Reply::Simple(s) => {
+            out.push_str(s);
+            out.push('\n');
+        }
+        Reply::Int(n) => {
+            out.push_str(&n.to_string());
+            out.push('\n');
+        }
+        Reply::Bulk(v) => {
+            out.push_str(v);
+            out.push('\n');
+        }
+        Reply::Nil => out.push('\n'),
+        Reply::Array(items, _) => {
+            for item in items {
+                out.push_str(item);
+                out.push('\n');
+            }
+        }
+        Reply::Lines(replies) => {
+            for r in replies {
+                render_raw(r, out);
+            }
+        }
+    }
+}
+
+fn push_json_string(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn render_json(reply: &Reply, out: &mut String) {
+    match reply {
+        Reply::Simple(s) => push_json_string(s, out),
+        Reply::Int(n) => out.push_str(&n.to_string()),
+        Reply::Bulk(v) => push_json_string(v, out),
+        Reply::Nil => out.push_str("null"),
+        // Alternating field/value items (HGETALL) become a JSON object.
+        Reply::Array(items, Empty::Hash) => {
+            out.push('{');
+            for (i, pair) in items.chunks(2).enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(&pair[0], out);
+                out.push(':');
+                push_json_string(pair.get(1).map_or("", |v| v), out);
+            }
+            out.push('}');
+        }
+        Reply::Array(items, _) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(item, out);
+            }
+            out.push(']');
+        }
+        Reply::Lines(replies) => {
+            out.push('[');
+            for (i, r) in replies.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                render_json(r, out);
+            }
+            out.push(']');
+        }
+    }
+}
+
+fn render(reply: &Reply, format: OutputFormat) -> String {
+    let mut out = String::new();
+    match format {
+        OutputFormat::Human => render_human(reply, &mut out),
+        OutputFormat::Raw => render_raw(reply, &mut out),
+        OutputFormat::Json => {
+            render_json(reply, &mut out);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn open_db(path: &PathBuf) -> rusqlite::Result<Connection> {
@@ -436,11 +555,7 @@ fn main() {
         }
     };
     match dispatch(&mut conn, cli.command) {
-        Ok(reply) => {
-            let mut out = String::new();
-            render_human(&reply, &mut out);
-            print!("{out}");
-        }
+        Ok(reply) => print!("{}", render(&reply, cli.format)),
         Err(CmdError(msg)) => {
             eprintln!("{msg}");
             std::process::exit(1);

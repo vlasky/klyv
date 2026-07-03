@@ -51,10 +51,28 @@ klyv h-get-all user:1
 ## Usage
 
 ```
-klyv --db <PATH> <COMMAND> [ARGS...]
+klyv --db <PATH> [--format <human|raw|json>] <COMMAND> [ARGS...]
 ```
 
 Either `--db` or the `KLYV_DB` environment variable is required. The database file is created on first use.
+
+### Output formats
+
+The default `human` format mirrors redis-cli (`(integer) 5`, `(nil)`, numbered quoted arrays). For scripting, pass `--format raw` or `--format json`:
+
+```sh
+klyv --format raw l-range tasks 0 -1
+# ship feature
+# write docs
+
+klyv --format json h-get-all user:1
+# {"name":"Alice","role":"admin"}
+
+klyv --format json get missing
+# null
+```
+
+`raw` prints bare values one per line (nil is an empty line, like `redis-cli --raw`). `json` prints a single JSON value: strings, integers as numbers, nil as `null`, list/set results as arrays, `h-get-all` as an object. JSON is the unambiguous choice for scripts — in the other formats a stored value of `(nil)` or an empty string is indistinguishable from a missing key. Errors go to stderr with exit code 1 in every format.
 
 ### Strings
 
