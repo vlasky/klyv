@@ -3,7 +3,7 @@ use rusqlite::{Connection, params};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "klyv", about = "Redis-compatible embedded KV store backed by SQLite")]
+#[command(name = "klyv", version, about = "Redis-compatible embedded KV store backed by SQLite")]
 struct Cli {
     #[arg(short, long, env = "KLYV_DB")]
     db: PathBuf,
@@ -442,40 +442,29 @@ fn cmd_mget(conn: &Connection, keys: &[String]) {
 
 // --- List commands ---
 
-fn list_min_idx(conn: &Connection, key: &str) -> f64 {
+// Returns (element count, min idx, max idx) for a list in one query.
+fn list_bounds(conn: &Connection, key: &str) -> (i64, Option<f64>, Option<f64>) {
     conn.query_row(
-        "SELECT MIN(idx) FROM list_items WHERE key = ?1",
+        "SELECT COUNT(*), MIN(idx), MAX(idx) FROM list_items WHERE key = ?1",
         params![key],
-        |row| row.get::<_, Option<f64>>(0),
-    ).unwrap().unwrap_or(0.0)
-}
-
-fn list_max_idx(conn: &Connection, key: &str) -> f64 {
-    conn.query_row(
-        "SELECT MAX(idx) FROM list_items WHERE key = ?1",
-        params![key],
-        |row| row.get::<_, Option<f64>>(0),
-    ).unwrap().unwrap_or(0.0)
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap()
 }
 
 fn cmd_lpush(conn: &Connection, key: &str, values: &[String]) {
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     ensure_type(conn, key, "list");
     drop_if_expired(conn, key);
+    let (count, min_idx, _) = list_bounds(conn, key);
+    let mut idx = min_idx.map_or(0.0, |m| m - 1.0);
     for value in values {
-        let empty: bool = conn
-            .query_row("SELECT COUNT(*) FROM list_items WHERE key = ?1", params![key], |row| row.get::<_, i64>(0))
-            .unwrap()
-            == 0;
-        let idx = if empty { 0.0 } else { list_min_idx(conn, key) - 1.0 };
         conn.execute(
             "INSERT INTO list_items (key, idx, value) VALUES (?1, ?2, ?3)",
             params![key, idx, value],
         ).unwrap();
+        idx -= 1.0;
     }
-    let len: i64 = conn
-        .query_row("SELECT COUNT(*) FROM list_items WHERE key = ?1", params![key], |row| row.get(0))
-        .unwrap();
+    let len = count + values.len() as i64;
     conn.execute_batch("COMMIT").unwrap();
     println!("(integer) {len}");
 }
@@ -484,20 +473,16 @@ fn cmd_rpush(conn: &Connection, key: &str, values: &[String]) {
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     ensure_type(conn, key, "list");
     drop_if_expired(conn, key);
+    let (count, _, max_idx) = list_bounds(conn, key);
+    let mut idx = max_idx.map_or(0.0, |m| m + 1.0);
     for value in values {
-        let empty: bool = conn
-            .query_row("SELECT COUNT(*) FROM list_items WHERE key = ?1", params![key], |row| row.get::<_, i64>(0))
-            .unwrap()
-            == 0;
-        let idx = if empty { 0.0 } else { list_max_idx(conn, key) + 1.0 };
         conn.execute(
             "INSERT INTO list_items (key, idx, value) VALUES (?1, ?2, ?3)",
             params![key, idx, value],
         ).unwrap();
+        idx += 1.0;
     }
-    let len: i64 = conn
-        .query_row("SELECT COUNT(*) FROM list_items WHERE key = ?1", params![key], |row| row.get(0))
-        .unwrap();
+    let len = count + values.len() as i64;
     conn.execute_batch("COMMIT").unwrap();
     println!("(integer) {len}");
 }
@@ -639,13 +624,14 @@ fn cmd_lpos(conn: &Connection, key: &str, value: &str) {
     let mut stmt = conn.prepare(
         "SELECT value FROM list_items WHERE key = ?1 ORDER BY idx ASC"
     ).unwrap();
-    let rows: Vec<String> = stmt
-        .query_map(params![key], |row| row.get(0))
+    // Stream rows and stop at the first match instead of loading the whole list.
+    let pos = stmt
+        .query_map(params![key], |row| row.get::<_, String>(0))
         .unwrap()
         .map(|r| r.unwrap())
-        .collect();
+        .position(|v| v == value);
 
-    match rows.iter().position(|v| v == value) {
+    match pos {
         Some(pos) => println!("(integer) {pos}"),
         None => println!("(nil)"),
     }
