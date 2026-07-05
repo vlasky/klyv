@@ -62,7 +62,7 @@ CREATE INDEX IF NOT EXISTS idx_expiry_at ON expiry(expires_at);
 ### Design Rationale
 
 - **Separate tables per type** rather than a single table with a `type` column. Allows type-specific indexing and constraints. A key can only exist in one table; this invariant is enforced at the command level (see [Type Safety](#type-safety)) rather than by the schema.
-- **`idx REAL` for lists** uses fractional indexing. LPUSH inserts at `MIN(idx) - 1.0`, RPUSH at `MAX(idx) + 1.0`. This avoids O(n) reindexing on push operations. An empty list starts at `idx = 0.0`.
+- **`idx REAL` for lists** uses fractional indexing. LPUSH inserts at `MIN(idx) - 1.0`, RPUSH at `MAX(idx) + 1.0`, and LINSERT at the midpoint between the pivot and its neighbour. This avoids O(n) reindexing on pushes and mid-list inserts. An empty list starts at `idx = 0.0`. (See LINSERT for the renumbering fallback when midpoint precision runs out.)
 - **BLOB storage** for values and members. All values are stored as-is. Numeric operations parse the blob as UTF-8 text then as an integer.
 - **Separate expiry table** rather than a column on each data table. One table to check, works across all types. Uses absolute Unix timestamps (seconds).
 - **Lazy expiry** — expired keys are filtered on read (return nil/empty) but not deleted from disk until `PURGE` is called explicitly. This keeps read operations as reads and avoids surprise writes.
@@ -92,7 +92,7 @@ Subcommands use **kebab-case** on the CLI (e.g. `s-add`, `l-push`, `h-set`). Thi
 
 ### String Commands
 
-#### SET key value
+#### SET key value [--nx] [--ex seconds | --px milliseconds]
 
 Store a string value at key. Overwrites any existing value **of any type** — if the key currently holds a list, set, or hash, those rows are deleted first so the key becomes a string. A live TTL is preserved; an already-expired TTL row is cleared so the new value is immediately visible.
 
@@ -104,13 +104,26 @@ DELETE FROM hash_fields  WHERE key = ?;
 INSERT OR REPLACE INTO strings (key, value) VALUES (?, ?);
 ```
 
-**Output:** `OK`
+Options (mirroring Redis SET options):
+
+- `--nx` — only set if the key does not already exist (an expired key counts as absent). If the key exists, nothing is written.
+- `--ex seconds` / `--px milliseconds` — set a TTL atomically with the value, in the same transaction (the two-command `set` + `expire` sequence is not atomic across processes). `--px` rounds up to whole seconds like PEXPIRE. The two options are mutually exclusive. A non-positive TTL is rejected with `ERR invalid expire time in 'set' command` before anything is written.
+
+**Output:** `OK`, or `(nil)` if `--nx` was given and the key already exists.
 
 #### GET key
 
 Retrieve the string value at key.
 
 **Output:** The value as a line of text, or `(nil)` if the key does not exist.
+
+#### GETDEL key
+
+Retrieve the string value at key and delete the key (including its expiry row) in the same transaction.
+
+**Error:** `WRONGTYPE` if the key holds a non-string value.
+
+**Output:** The value, or `(nil)` if the key does not exist (nothing is deleted in that case).
 
 #### DEL key [key ...]
 
@@ -231,6 +244,32 @@ Find the first occurrence of `value` in the list (scanning head to tail).
 
 **Output:** `(integer) N` where N is the zero-based index, or `(nil)` if not found.
 
+#### LINDEX key index
+
+Get the element at `index` (0-based; negative counts from the end).
+
+**Output:** The value, or `(nil)` if the key or index does not exist.
+
+#### LSET key index value
+
+Overwrite the element at `index` (0-based; negative counts from the end).
+
+**Error:** `ERR no such key` if the list does not exist; `ERR index out of range` if the index is out of bounds.
+
+**Output:** `OK`
+
+#### LTRIM key start stop
+
+Trim the list so only elements at positions `start` through `stop` (inclusive) remain. Index normalization matches LRANGE. If the resulting range is empty, the key is deleted entirely — including its expiry row, so a future key of the same name cannot inherit a stale TTL.
+
+**Output:** `OK` (also for a missing key).
+
+#### LINSERT key <before|after> pivot value
+
+Insert `value` immediately before or after the first occurrence of `pivot` (scanning head to tail). This is where fractional indexing earns its keep: the new element's `idx` is the midpoint between the pivot's and its neighbour's (or pivot ± 1 at a boundary). If repeated inserts into the same gap exhaust `f64` midpoint precision, the implementation must renumber the list's indexes (sequential integers, preserving order) and retry.
+
+**Output:** `(integer) N` with the new list length, `(integer) -1` if the pivot was not found, `(integer) 0` if the key does not exist.
+
 ### Set Commands
 
 Sets are unordered collections of unique strings.
@@ -264,6 +303,14 @@ Test if member is in the set.
 Return the number of members (cardinality).
 
 **Output:** `(integer) N`
+
+#### SPOP key
+
+Remove and return a random member (`ORDER BY RANDOM() LIMIT 1`).
+
+**Error:** `WRONGTYPE` if the key holds a non-set value.
+
+**Output:** The removed member, or `(nil)` if the set is empty/missing.
 
 For all set operations, an expired input set is treated as empty (consistent with lazy expiry).
 
@@ -316,6 +363,20 @@ Set fields in the hash. Creates the hash if it doesn't exist. Overwrites existin
 Get a single field's value.
 
 **Output:** The value, or `(nil)`.
+
+#### HEXISTS key field
+
+Test whether a field exists in the hash.
+
+**Output:** `(integer) 1` if present, `(integer) 0` if not (or if the key is missing/expired).
+
+#### HINCRBY key field amount
+
+Increment the integer value of a hash field. A missing key or field is initialized to 0 before incrementing.
+
+**Error:** `ERR hash value is not an integer` if the field holds a non-integer; `ERR increment or decrement would overflow` on i64 overflow. The stored value is left unchanged in both cases.
+
+**Output:** `(integer) N` where N is the new value.
 
 #### HDEL key field [field ...]
 
@@ -389,6 +450,8 @@ Rename a key, carrying its TTL with it. If `newkey` already exists it is overwri
 
 Expiry uses lazy filtering: expired keys are not deleted from disk but are invisible to all read commands, and are treated as absent by write commands (which drop the stale rows before proceeding). Use `PURGE` to reclaim disk space.
 
+A write that removes the last element of a list, set, or hash (`LPOP`/`RPOP`, `LREM`, `LTRIM`, `SREM`, `SPOP`, `HDEL`) deletes the key, and must delete its expiry row along with it — otherwise a later `SET` of the same key would silently inherit the stale TTL.
+
 A key is expired once the current time **reaches** its `expires_at` — the check is `expires_at <= unixepoch()` (used by both reads and `PURGE`).
 
 #### EXPIRE key seconds
@@ -448,7 +511,7 @@ Delete all data from all tables, atomically (single transaction).
 
 A key may hold only one of the four types at a time. Because each type lives in its own table, this invariant is enforced at the command level rather than by the schema:
 
-- A type-specific mutating command first checks whether the key already exists as a different type. If so it prints `WRONGTYPE Operation against a key holding the wrong kind of value` to stderr, exits with code 1, and leaves the data unchanged. This covers `INCR`/`INCRBY`/`DECR`/`DECRBY`/`APPEND` (string), `LPUSH`/`RPUSH`/`LREM` (list), `SADD`/`SREM` (set), and `HSET`/`HDEL` (hash).
+- A type-specific mutating command first checks whether the key already exists as a different type. If so it prints `WRONGTYPE Operation against a key holding the wrong kind of value` to stderr, exits with code 1, and leaves the data unchanged. This covers `INCR`/`INCRBY`/`DECR`/`DECRBY`/`APPEND`/`GETDEL` (string), `LPUSH`/`RPUSH`/`LREM`/`LSET`/`LTRIM`/`LINSERT` (list), `SADD`/`SREM`/`SPOP` (set), and `HSET`/`HINCRBY`/`HDEL` (hash).
 - `SET` and `MSET` are the exception: they overwrite the key regardless of its current type, deleting any list/set/hash rows first.
 - An expired key counts as absent for this check, so a write may freely reuse the key as a new type.
 
@@ -490,7 +553,7 @@ The table above describes the default `human` format, which is the normative out
 
 SQLite in WAL mode supports multiple concurrent readers and a single writer. klyv does not implement its own locking — it relies on SQLite's built-in locking. Multiple processes can safely read from the same database simultaneously. Writes are serialized by SQLite's write lock.
 
-On open, `PRAGMA busy_timeout=5000` is set so a writer waits (up to 5s) for a competing lock instead of failing immediately with `SQLITE_BUSY`. Every command runs inside a single transaction. Mutating commands (`SET`/`MSET`, `DEL`, `INCR`/`INCRBY`/`DECR`/`DECRBY`, `APPEND`, `LPUSH`/`RPUSH`, `LPOP`/`RPOP`, `LREM`, `SADD`/`SREM`, `HSET`/`HDEL`, `RENAME`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`, `PERSIST`, `PURGE`, `FLUSHALL`) use `BEGIN IMMEDIATE` so the write lock is taken up front and the whole operation is atomic against other processes; on any error the transaction rolls back, leaving the data unchanged. Read-only commands use a deferred transaction, so a command that issues several queries (expiry check plus data reads, or scans across the per-type tables) sees one consistent snapshot rather than racing a concurrent writer between statements. The type-safety check (below) runs inside the write transaction so it cannot race a concurrent writer. For the TTL mutators, the existence/expiry check and the expiry write are serialized together, so a concurrent writer cannot leave an orphan TTL on a key that was deleted between the check and the write.
+On open, `PRAGMA busy_timeout=5000` is set so a writer waits (up to 5s) for a competing lock instead of failing immediately with `SQLITE_BUSY`. Every command runs inside a single transaction. Mutating commands (`SET`/`MSET`, `GETDEL`, `DEL`, `INCR`/`INCRBY`/`DECR`/`DECRBY`, `APPEND`, `LPUSH`/`RPUSH`, `LPOP`/`RPOP`, `LREM`, `LSET`/`LTRIM`/`LINSERT`, `SADD`/`SREM`/`SPOP`, `HSET`/`HINCRBY`/`HDEL`, `RENAME`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`, `PERSIST`, `PURGE`, `FLUSHALL`) use `BEGIN IMMEDIATE` so the write lock is taken up front and the whole operation is atomic against other processes; on any error the transaction rolls back, leaving the data unchanged. Read-only commands use a deferred transaction, so a command that issues several queries (expiry check plus data reads, or scans across the per-type tables) sees one consistent snapshot rather than racing a concurrent writer between statements. The type-safety check (below) runs inside the write transaction so it cannot race a concurrent writer. For the TTL mutators, the existence/expiry check and the expiry write are serialized together, so a concurrent writer cannot leave an orphan TTL on a key that was deleted between the check and the write.
 
 For CLI usage (one command per invocation), this is sufficient. A long-running server mode (future) would hold a single connection and serialize commands.
 
