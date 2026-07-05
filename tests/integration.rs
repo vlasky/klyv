@@ -1261,8 +1261,10 @@ fn test_set_overwrites_other_type() {
     assert_eq!(out.trim(), "string");
     let (out, _, _) = klyv(&db, &["get", "k"]);
     assert_eq!(out.trim(), "v");
-    let (out, _, _) = klyv(&db, &["l-len", "k"]);
-    assert_eq!(out.trim(), "(integer) 0");
+    // The list rows are gone; the key is now a string, so l-len is WRONGTYPE.
+    let (_, err, ok) = klyv(&db, &["l-len", "k"]);
+    assert!(!ok);
+    assert!(err.contains("WRONGTYPE"));
 }
 
 #[test]
@@ -1288,8 +1290,10 @@ fn test_rename_overwrites_target_cross_type() {
     assert_eq!(out.trim(), "string");
     let (out, _, _) = klyv(&db, &["get", "dst"]);
     assert_eq!(out.trim(), "v");
-    let (out, _, _) = klyv(&db, &["l-len", "dst"]);
-    assert_eq!(out.trim(), "(integer) 0");
+    // The list rows are gone; the key is now a string, so l-len is WRONGTYPE.
+    let (_, err, ok) = klyv(&db, &["l-len", "dst"]);
+    assert!(!ok);
+    assert!(err.contains("WRONGTYPE"));
 }
 
 #[test]
@@ -1358,8 +1362,10 @@ fn test_mset_overwrites_other_type() {
     assert_eq!(out.trim(), "string");
     let (out, _, _) = klyv(&db, &["get", "k"]);
     assert_eq!(out.trim(), "v");
-    let (out, _, _) = klyv(&db, &["l-len", "k"]);
-    assert_eq!(out.trim(), "(integer) 0");
+    // The list rows are gone; the key is now a string, so l-len is WRONGTYPE.
+    let (_, err, ok) = klyv(&db, &["l-len", "k"]);
+    assert!(!ok);
+    assert!(err.contains("WRONGTYPE"));
 }
 
 #[test]
@@ -2055,4 +2061,105 @@ fn test_hdel_to_empty_drops_expiry() {
     klyv(&db, &["set", "h", "v"]);
     let (out, _, _) = klyv(&db, &["ttl", "h"]);
     assert_eq!(out.trim(), "(integer) -1");
+}
+
+// === WRONGTYPE ON TYPE-SPECIFIC READS (codex review follow-up) ===
+
+#[test]
+fn test_wrongtype_reads_on_string_key() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    for args in [
+        vec!["l-pop", "k"],
+        vec!["r-pop", "k"],
+        vec!["l-len", "k"],
+        vec!["l-range", "k", "0", "-1"],
+        vec!["l-pos", "k", "v"],
+        vec!["l-index", "k", "0"],
+        vec!["s-members", "k"],
+        vec!["s-is-member", "k", "v"],
+        vec!["s-card", "k"],
+        vec!["h-get", "k", "f"],
+        vec!["h-exists", "k", "f"],
+        vec!["h-get-all", "k"],
+        vec!["h-keys", "k"],
+        vec!["h-vals", "k"],
+        vec!["h-len", "k"],
+    ] {
+        let (_, err, ok) = klyv(&db, &args);
+        assert!(!ok, "{args:?} should fail");
+        assert!(err.contains("WRONGTYPE"), "{args:?} stderr: {err}");
+    }
+}
+
+#[test]
+fn test_wrongtype_get_and_strlen_on_list() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "l", "a"]);
+    let (_, err, ok) = klyv(&db, &["get", "l"]);
+    assert!(!ok);
+    assert!(err.contains("WRONGTYPE"));
+    let (_, err, ok) = klyv(&db, &["strlen", "l"]);
+    assert!(!ok);
+    assert!(err.contains("WRONGTYPE"));
+}
+
+#[test]
+fn test_wrongtype_set_algebra_input() {
+    let db = fresh_db();
+    klyv(&db, &["s-add", "s", "a"]);
+    klyv(&db, &["set", "str", "v"]);
+    for cmd in ["s-union", "s-inter", "s-diff"] {
+        let (_, err, ok) = klyv(&db, &[cmd, "s", "str"]);
+        assert!(!ok, "{cmd} should fail");
+        assert!(err.contains("WRONGTYPE"), "{cmd} stderr: {err}");
+    }
+}
+
+#[test]
+fn test_mget_stays_lenient_on_wrong_type() {
+    // Redis MGET returns nil for non-string keys instead of erroring.
+    let db = fresh_db();
+    klyv(&db, &["r-push", "l", "a"]);
+    klyv(&db, &["set", "k", "v"]);
+    let (out, _, ok) = klyv(&db, &["m-get", "k", "l"]);
+    assert!(ok);
+    assert_eq!(out, "v\n(nil)\n");
+}
+
+#[test]
+fn test_expired_key_reads_as_missing_not_wrongtype() {
+    // An expired key must never trip the type check for its old type.
+    let db = fresh_db();
+    klyv(&db, &["r-push", "l", "a"]);
+    klyv(&db, &["expire-at", "l", "0"]);
+    let (out, _, ok) = klyv(&db, &["get", "l"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(nil)");
+    let (out, _, ok) = klyv(&db, &["h-len", "l"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(integer) 0");
+}
+
+// === REDIS-STYLE STOP NORMALIZATION (no clamp-to-0 for negative stop) ===
+
+#[test]
+fn test_lrange_stop_beyond_head_is_empty() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "l", "a", "b", "c"]);
+    // stop = 3 + (-5) = -2 < start: Redis returns empty, not element 0.
+    let (out, _, ok) = klyv(&db, &["l-range", "l", "0", "-5"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(empty list)");
+}
+
+#[test]
+fn test_ltrim_stop_beyond_head_empties_list() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "l", "a", "b", "c"]);
+    let (out, _, ok) = klyv(&db, &["l-trim", "l", "0", "-5"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "OK");
+    let (out, _, _) = klyv(&db, &["exists", "l"]);
+    assert_eq!(out.trim(), "(integer) 0");
 }
