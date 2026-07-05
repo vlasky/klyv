@@ -1776,3 +1776,283 @@ fn test_json_escapes_special_characters() {
     let (out, _, _) = klyv_fmt(&db, "json", &["get", "k"]);
     assert_eq!(out, "\"line1\\nline2\\t\\\"quoted\\\" back\\\\slash\"\n");
 }
+
+// === SET OPTIONS (--nx, --ex, --px) ===
+
+#[test]
+fn test_set_nx_only_sets_missing_key() {
+    let db = fresh_db();
+    let (out, _, ok) = klyv(&db, &["set", "k", "first", "--nx"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "OK");
+
+    let (out, _, ok) = klyv(&db, &["set", "k", "second", "--nx"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(nil)");
+
+    let (out, _, _) = klyv(&db, &["get", "k"]);
+    assert_eq!(out.trim(), "first");
+}
+
+#[test]
+fn test_set_nx_succeeds_on_expired_key() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "old"]);
+    klyv(&db, &["expire-at", "k", "0"]);
+    let (out, _, _) = klyv(&db, &["set", "k", "new", "--nx"]);
+    assert_eq!(out.trim(), "OK");
+    let (out, _, _) = klyv(&db, &["get", "k"]);
+    assert_eq!(out.trim(), "new");
+}
+
+#[test]
+fn test_set_ex_sets_ttl_atomically() {
+    let db = fresh_db();
+    let (out, _, _) = klyv(&db, &["set", "k", "v", "--ex", "100"]);
+    assert_eq!(out.trim(), "OK");
+    let (out, _, _) = klyv(&db, &["ttl", "k"]);
+    let ttl: i64 = out.trim().trim_start_matches("(integer) ").parse().unwrap();
+    assert!((99..=100).contains(&ttl));
+}
+
+#[test]
+fn test_set_px_rounds_up_to_seconds() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v", "--px", "1500"]);
+    let (out, _, _) = klyv(&db, &["ttl", "k"]);
+    let ttl: i64 = out.trim().trim_start_matches("(integer) ").parse().unwrap();
+    assert!((1..=2).contains(&ttl));
+}
+
+#[test]
+fn test_set_invalid_expire_errors() {
+    let db = fresh_db();
+    let (_, err, ok) = klyv(&db, &["set", "k", "v", "--ex", "0"]);
+    assert!(!ok);
+    assert!(err.contains("ERR invalid expire time"));
+    // Nothing was written.
+    let (out, _, _) = klyv(&db, &["get", "k"]);
+    assert_eq!(out.trim(), "(nil)");
+}
+
+// === GETDEL ===
+
+#[test]
+fn test_getdel_returns_and_deletes() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    klyv(&db, &["expire", "k", "100"]);
+    let (out, _, ok) = klyv(&db, &["get-del", "k"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "v");
+    let (out, _, _) = klyv(&db, &["exists", "k"]);
+    assert_eq!(out.trim(), "(integer) 0");
+    // The expiry row went with it: a fresh SET has no TTL.
+    klyv(&db, &["set", "k", "new"]);
+    let (out, _, _) = klyv(&db, &["ttl", "k"]);
+    assert_eq!(out.trim(), "(integer) -1");
+}
+
+#[test]
+fn test_getdel_missing_and_wrongtype() {
+    let db = fresh_db();
+    let (out, _, ok) = klyv(&db, &["get-del", "nope"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(nil)");
+
+    klyv(&db, &["r-push", "l", "a"]);
+    let (_, err, ok) = klyv(&db, &["get-del", "l"]);
+    assert!(!ok);
+    assert!(err.contains("WRONGTYPE"));
+}
+
+// === LINDEX / LSET / LTRIM / LINSERT ===
+
+#[test]
+fn test_lindex() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "l", "a", "b", "c"]);
+    let (out, _, _) = klyv(&db, &["l-index", "l", "0"]);
+    assert_eq!(out.trim(), "a");
+    let (out, _, _) = klyv(&db, &["l-index", "l", "-1"]);
+    assert_eq!(out.trim(), "c");
+    let (out, _, _) = klyv(&db, &["l-index", "l", "5"]);
+    assert_eq!(out.trim(), "(nil)");
+    let (out, _, _) = klyv(&db, &["l-index", "nolist", "0"]);
+    assert_eq!(out.trim(), "(nil)");
+}
+
+#[test]
+fn test_lset() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "l", "a", "b", "c"]);
+    let (out, _, ok) = klyv(&db, &["l-set", "l", "1", "B"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "OK");
+    let (out, _, _) = klyv(&db, &["l-set", "l", "-1", "C"]);
+    assert_eq!(out.trim(), "OK");
+    let (out, _, _) = klyv(&db, &["l-range", "l", "0", "-1"]);
+    let lines: Vec<&str> = out.trim().lines().collect();
+    assert_eq!(lines, ["1) \"a\"", "2) \"B\"", "3) \"C\""]);
+
+    let (_, err, ok) = klyv(&db, &["l-set", "l", "9", "x"]);
+    assert!(!ok);
+    assert!(err.contains("ERR index out of range"));
+    let (_, err, ok) = klyv(&db, &["l-set", "missing", "0", "x"]);
+    assert!(!ok);
+    assert!(err.contains("ERR no such key"));
+}
+
+#[test]
+fn test_ltrim_keeps_range() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "l", "a", "b", "c", "d", "e"]);
+    let (out, _, ok) = klyv(&db, &["l-trim", "l", "1", "-2"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "OK");
+    let (out, _, _) = klyv(&db, &["l-range", "l", "0", "-1"]);
+    let lines: Vec<&str> = out.trim().lines().collect();
+    assert_eq!(lines, ["1) \"b\"", "2) \"c\"", "3) \"d\""]);
+}
+
+#[test]
+fn test_ltrim_empty_range_removes_key_and_ttl() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "l", "a", "b"]);
+    klyv(&db, &["expire", "l", "100"]);
+    klyv(&db, &["l-trim", "l", "5", "1"]);
+    let (out, _, _) = klyv(&db, &["exists", "l"]);
+    assert_eq!(out.trim(), "(integer) 0");
+    // No stale TTL survives for a future key.
+    klyv(&db, &["set", "l", "v"]);
+    let (out, _, _) = klyv(&db, &["ttl", "l"]);
+    assert_eq!(out.trim(), "(integer) -1");
+}
+
+#[test]
+fn test_linsert_before_and_after() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "l", "a", "c"]);
+    let (out, _, ok) = klyv(&db, &["l-insert", "l", "before", "c", "b"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(integer) 3");
+    let (out, _, _) = klyv(&db, &["l-insert", "l", "after", "c", "d"]);
+    assert_eq!(out.trim(), "(integer) 4");
+    let (out, _, _) = klyv(&db, &["l-range", "l", "0", "-1"]);
+    let lines: Vec<&str> = out.trim().lines().collect();
+    assert_eq!(lines, ["1) \"a\"", "2) \"b\"", "3) \"c\"", "4) \"d\""]);
+
+    let (out, _, _) = klyv(&db, &["l-insert", "l", "before", "zz", "x"]);
+    assert_eq!(out.trim(), "(integer) -1");
+    let (out, _, _) = klyv(&db, &["l-insert", "missing", "before", "a", "x"]);
+    assert_eq!(out.trim(), "(integer) 0");
+}
+
+#[test]
+fn test_linsert_survives_midpoint_precision_exhaustion() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "l", "a", "b"]);
+    // Repeatedly inserting after the same pivot halves the gap each time;
+    // ~55 iterations exhaust f64 precision and force a renumber.
+    for i in 0..60 {
+        let v = format!("x{i}");
+        let (out, _, ok) = klyv(&db, &["l-insert", "l", "after", "a", &v]);
+        assert!(ok, "insert {i} failed");
+        assert_eq!(out.trim(), format!("(integer) {}", i + 3));
+    }
+    let (out, _, _) = klyv(&db, &["l-len", "l"]);
+    assert_eq!(out.trim(), "(integer) 62");
+    let (out, _, _) = klyv(&db, &["l-index", "l", "0"]);
+    assert_eq!(out.trim(), "a");
+    let (out, _, _) = klyv(&db, &["l-index", "l", "1"]);
+    assert_eq!(out.trim(), "x59");
+    let (out, _, _) = klyv(&db, &["l-index", "l", "2"]);
+    assert_eq!(out.trim(), "x58");
+    let (out, _, _) = klyv(&db, &["l-index", "l", "-1"]);
+    assert_eq!(out.trim(), "b");
+}
+
+// === SPOP ===
+
+#[test]
+fn test_spop() {
+    let db = fresh_db();
+    klyv(&db, &["s-add", "s", "only"]);
+    let (out, _, ok) = klyv(&db, &["s-pop", "s"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "only");
+    let (out, _, _) = klyv(&db, &["s-card", "s"]);
+    assert_eq!(out.trim(), "(integer) 0");
+    let (out, _, _) = klyv(&db, &["s-pop", "s"]);
+    assert_eq!(out.trim(), "(nil)");
+
+    klyv(&db, &["set", "str", "v"]);
+    let (_, err, ok) = klyv(&db, &["s-pop", "str"]);
+    assert!(!ok);
+    assert!(err.contains("WRONGTYPE"));
+}
+
+// === HEXISTS / HINCRBY ===
+
+#[test]
+fn test_hexists() {
+    let db = fresh_db();
+    klyv(&db, &["h-set", "h", "f", "v"]);
+    let (out, _, _) = klyv(&db, &["h-exists", "h", "f"]);
+    assert_eq!(out.trim(), "(integer) 1");
+    let (out, _, _) = klyv(&db, &["h-exists", "h", "g"]);
+    assert_eq!(out.trim(), "(integer) 0");
+    let (out, _, _) = klyv(&db, &["h-exists", "missing", "f"]);
+    assert_eq!(out.trim(), "(integer) 0");
+}
+
+#[test]
+fn test_hincrby() {
+    let db = fresh_db();
+    let (out, _, ok) = klyv(&db, &["h-incr-by", "h", "n", "5"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(integer) 5");
+    let (out, _, _) = klyv(&db, &["h-incr-by", "h", "n", "-2"]);
+    assert_eq!(out.trim(), "(integer) 3");
+
+    klyv(&db, &["h-set", "h", "s", "notanumber"]);
+    let (_, err, ok) = klyv(&db, &["h-incr-by", "h", "s", "1"]);
+    assert!(!ok);
+    assert!(err.contains("ERR hash value is not an integer"));
+}
+
+// === EXPIRY CLEANUP ON KEY-EMPTYING WRITES ===
+
+#[test]
+fn test_pop_to_empty_drops_expiry() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "l", "only"]);
+    klyv(&db, &["expire", "l", "100"]);
+    klyv(&db, &["l-pop", "l"]);
+    // A fresh SET must not inherit the old list's TTL.
+    klyv(&db, &["set", "l", "v"]);
+    let (out, _, _) = klyv(&db, &["ttl", "l"]);
+    assert_eq!(out.trim(), "(integer) -1");
+}
+
+#[test]
+fn test_srem_to_empty_drops_expiry() {
+    let db = fresh_db();
+    klyv(&db, &["s-add", "s", "only"]);
+    klyv(&db, &["expire", "s", "100"]);
+    klyv(&db, &["s-rem", "s", "only"]);
+    klyv(&db, &["set", "s", "v"]);
+    let (out, _, _) = klyv(&db, &["ttl", "s"]);
+    assert_eq!(out.trim(), "(integer) -1");
+}
+
+#[test]
+fn test_hdel_to_empty_drops_expiry() {
+    let db = fresh_db();
+    klyv(&db, &["h-set", "h", "f", "v"]);
+    klyv(&db, &["expire", "h", "100"]);
+    klyv(&db, &["h-del", "h", "f"]);
+    klyv(&db, &["set", "h", "v"]);
+    let (out, _, _) = klyv(&db, &["ttl", "h"]);
+    assert_eq!(out.trim(), "(integer) -1");
+}

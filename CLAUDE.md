@@ -14,9 +14,11 @@ Either `--db` or the `KLYV_DB` env var is required. The database file is created
 
 ### Strings
 ```
-set <key> <value>             Store a value
+set <key> <value> [--nx] [--ex <s> | --px <ms>]
+                              Store a value (--nx: only if missing; --ex/--px: TTL, atomic)
 get <key>                     Retrieve a value (prints "(nil)" if missing)
-del <key> [key ...]           Delete keys (any type)
+get-del <key>                 Retrieve a value and delete the key atomically
+del <key> [key ...]           Delete keys (any type), returns number of keys deleted
 incr <key>                    Increment by 1 (inits to 0 if missing)
 decr <key>                    Decrement by 1
 incr-by <key> <amount>        Increment by N
@@ -37,6 +39,11 @@ l-range <key> <start> <stop>  Slice (0-based, negatives from end, inclusive)
 l-len <key>                   List length
 l-rem <key> <count> <value>   Remove occurrences (0=all, +N=head, -N=tail)
 l-pos <key> <value>           Index of first occurrence (nil if missing)
+l-index <key> <index>         Get element at index (negatives from end)
+l-set <key> <index> <value>   Overwrite element at index
+l-trim <key> <start> <stop>   Keep only elements in range (inclusive)
+l-insert <key> <before|after> <pivot> <value>
+                              Insert next to first occurrence of pivot
 ```
 
 ### Sets
@@ -46,6 +53,7 @@ s-rem <key> <m> [m ...]       Remove members
 s-members <key>               List all members
 s-is-member <key> <member>    Test membership (1/0)
 s-card <key>                  Count members
+s-pop <key>                   Remove and return a random member
 s-union <k1> [k2 ...]         Union of sets
 s-inter <k1> [k2 ...]         Intersection of sets
 s-diff <k1> [k2 ...]          Members in first set not in others
@@ -55,6 +63,8 @@ s-diff <k1> [k2 ...]          Members in first set not in others
 ```
 h-set <key> <f1> <v1> [f2 v2 ...]  Set field-value pairs
 h-get <key> <field>                 Get field value
+h-exists <key> <field>              Test field existence (1/0)
+h-incr-by <key> <field> <n>         Increment integer field by N
 h-del <key> <f1> [f2 ...]          Delete fields
 h-get-all <key>                     All fields and values
 h-keys <key>                        All field names

@@ -78,8 +78,9 @@ klyv --format json get missing
 
 | Command | Description |
 |---------|-------------|
-| `set <key> <value>` | Store a value |
+| `set <key> <value> [--nx] [--ex <s> \| --px <ms>]` | Store a value (optionally only-if-missing, with TTL) |
 | `get <key>` | Retrieve a value |
+| `get-del <key>` | Retrieve a value and delete the key atomically |
 | `del <key> [key ...]` | Delete keys (any type) |
 | `incr <key>` | Increment by 1 |
 | `decr <key>` | Decrement by 1 |
@@ -102,6 +103,10 @@ klyv --format json get missing
 | `l-len <key>` | List length |
 | `l-rem <key> <count> <value>` | Remove occurrences |
 | `l-pos <key> <value>` | Index of first occurrence |
+| `l-index <key> <index>` | Get element at index |
+| `l-set <key> <index> <value>` | Overwrite element at index |
+| `l-trim <key> <start> <stop>` | Keep only the given range |
+| `l-insert <key> <before\|after> <pivot> <value>` | Insert next to first occurrence of pivot |
 
 ### Sets
 
@@ -112,6 +117,7 @@ klyv --format json get missing
 | `s-members <key>` | List all members |
 | `s-is-member <key> <m>` | Test membership (1/0) |
 | `s-card <key>` | Count members |
+| `s-pop <key>` | Remove and return a random member |
 | `s-union <k> [...]` | Union of sets |
 | `s-inter <k> [...]` | Intersection |
 | `s-diff <k> [...]` | Difference |
@@ -122,6 +128,8 @@ klyv --format json get missing
 |---------|-------------|
 | `h-set <key> <f v> [...]` | Set field-value pairs |
 | `h-get <key> <field>` | Get field value |
+| `h-exists <key> <field>` | Test field existence (1/0) |
+| `h-incr-by <key> <field> <n>` | Increment integer field by N |
 | `h-del <key> <f> [...]` | Delete fields |
 | `h-get-all <key>` | All fields and values |
 | `h-keys <key>` | All field names |

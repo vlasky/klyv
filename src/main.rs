@@ -35,12 +35,41 @@ enum OutputFormat {
     Json,
 }
 
+/// Where LINSERT places the new element relative to the pivot.
+#[derive(Clone, Copy, ValueEnum)]
+enum InsertWhere {
+    Before,
+    After,
+}
+
 #[derive(Subcommand)]
 enum Command {
     #[command(about = "Set a string value")]
-    Set { key: String, value: String },
+    Set {
+        key: String,
+        value: String,
+        #[arg(long, help = "Only set if the key does not already exist")]
+        nx: bool,
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            conflicts_with = "px",
+            allow_hyphen_values = true,
+            help = "Set TTL in seconds, atomically with the value"
+        )]
+        ex: Option<i64>,
+        #[arg(
+            long,
+            value_name = "MILLISECONDS",
+            allow_hyphen_values = true,
+            help = "Set TTL in milliseconds (rounds up to seconds)"
+        )]
+        px: Option<i64>,
+    },
     #[command(about = "Get a string value (prints '(nil)' if not found)")]
     Get { key: String },
+    #[command(about = "Get a string value and delete the key atomically")]
+    GetDel { key: String },
     #[command(about = "Delete one or more keys (any type)")]
     Del { keys: Vec<String> },
     #[command(about = "Increment integer value by 1 (creates key at 0 if missing)")]
@@ -96,6 +125,33 @@ enum Command {
     },
     #[command(about = "Find first occurrence of value in list (returns 0-based index or '(nil)')")]
     LPos { key: String, value: String },
+    #[command(
+        about = "Get element at index (0-based, negatives count from end)",
+        allow_hyphen_values = true
+    )]
+    LIndex { key: String, index: i64 },
+    #[command(
+        about = "Set element at index to value (errors if key or index missing)",
+        allow_hyphen_values = true
+    )]
+    LSet {
+        key: String,
+        index: i64,
+        value: String,
+    },
+    #[command(
+        about = "Trim list to elements from index START to STOP (inclusive)",
+        allow_hyphen_values = true
+    )]
+    LTrim { key: String, start: i64, stop: i64 },
+    #[command(about = "Insert value before/after first occurrence of pivot")]
+    LInsert {
+        key: String,
+        #[arg(value_enum)]
+        r#where: InsertWhere,
+        pivot: String,
+        value: String,
+    },
 
     #[command(about = "Add members to set (ignores duplicates)")]
     SAdd { key: String, members: Vec<String> },
@@ -107,6 +163,8 @@ enum Command {
     SIsMember { key: String, member: String },
     #[command(about = "Get number of members in set")]
     SCard { key: String },
+    #[command(about = "Remove and return a random member from set")]
+    SPop { key: String },
     #[command(about = "Return union of multiple sets")]
     SUnion { keys: Vec<String> },
     #[command(about = "Return intersection of multiple sets")]
@@ -122,6 +180,17 @@ enum Command {
     },
     #[command(about = "Get a field's value from a hash")]
     HGet { key: String, field: String },
+    #[command(about = "Test if field exists in hash (returns 1 or 0)")]
+    HExists { key: String, field: String },
+    #[command(
+        about = "Increment integer hash field by amount (creates field at 0 if missing)",
+        allow_hyphen_values = true
+    )]
+    HIncrBy {
+        key: String,
+        field: String,
+        amount: i64,
+    },
     #[command(about = "Delete fields from a hash")]
     HDel { key: String, fields: Vec<String> },
     #[command(about = "Get all field-value pairs (alternating lines: field, value)")]
@@ -476,12 +545,23 @@ fn key_exists_in_data(conn: &Connection, key: &str) -> Result<bool, rusqlite::Er
     )
 }
 
+/// Removing the last element of a list/set/hash deletes the key, so any
+/// expiry row must go with it — otherwise a later SET on the same key would
+/// silently inherit the stale TTL.
+fn drop_expiry_if_empty(conn: &Connection, key: &str) -> Result<(), rusqlite::Error> {
+    if !key_exists_in_data(conn, key)? {
+        conn.execute("DELETE FROM expiry WHERE key = ?1", params![key])?;
+    }
+    Ok(())
+}
+
 /// Whether a command mutates the database (BEGIN IMMEDIATE) or only reads
 /// (deferred transaction, giving all its statements one consistent snapshot).
 fn is_write(cmd: &Command) -> bool {
     matches!(
         cmd,
         Command::Set { .. }
+            | Command::GetDel { .. }
             | Command::Del { .. }
             | Command::Incr { .. }
             | Command::Decr { .. }
@@ -494,9 +574,14 @@ fn is_write(cmd: &Command) -> bool {
             | Command::LPop { .. }
             | Command::RPop { .. }
             | Command::LRem { .. }
+            | Command::LSet { .. }
+            | Command::LTrim { .. }
+            | Command::LInsert { .. }
             | Command::SAdd { .. }
             | Command::SRem { .. }
+            | Command::SPop { .. }
             | Command::HSet { .. }
+            | Command::HIncrBy { .. }
             | Command::HDel { .. }
             | Command::Rename { .. }
             | Command::Expire { .. }
@@ -525,8 +610,27 @@ fn dispatch(conn: &mut Connection, cmd: Command) -> CmdResult {
 
 fn run(conn: &Connection, cmd: Command) -> CmdResult {
     match cmd {
-        Command::Set { key, value } => cmd_set(conn, &key, &value),
+        Command::Set {
+            key,
+            value,
+            nx,
+            ex,
+            px,
+        } => {
+            // --px rounds up to whole seconds, like p-expire.
+            let ttl_seconds = match (ex, px) {
+                (Some(s), _) => Some(s),
+                (None, Some(ms)) => Some(if ms <= 0 {
+                    ms
+                } else {
+                    ms.saturating_add(999) / 1000
+                }),
+                (None, None) => None,
+            };
+            cmd_set(conn, &key, &value, nx, ttl_seconds)
+        }
         Command::Get { key } => cmd_get(conn, &key),
+        Command::GetDel { key } => cmd_getdel(conn, &key),
         Command::Del { keys } => cmd_del(conn, &keys),
         Command::Incr { key } => cmd_incrby(conn, &key, 1),
         Command::Decr { key } => cmd_incrby(conn, &key, -1),
@@ -550,18 +654,30 @@ fn run(conn: &Connection, cmd: Command) -> CmdResult {
         Command::LLen { key } => cmd_llen(conn, &key),
         Command::LRem { key, count, value } => cmd_lrem(conn, &key, count, &value),
         Command::LPos { key, value } => cmd_lpos(conn, &key, &value),
+        Command::LIndex { key, index } => cmd_lindex(conn, &key, index),
+        Command::LSet { key, index, value } => cmd_lset(conn, &key, index, &value),
+        Command::LTrim { key, start, stop } => cmd_ltrim(conn, &key, start, stop),
+        Command::LInsert {
+            key,
+            r#where,
+            pivot,
+            value,
+        } => cmd_linsert(conn, &key, r#where, &pivot, &value),
 
         Command::SAdd { key, members } => cmd_sadd(conn, &key, &members),
         Command::SRem { key, members } => cmd_srem(conn, &key, &members),
         Command::SMembers { key } => cmd_smembers(conn, &key),
         Command::SIsMember { key, member } => cmd_sismember(conn, &key, &member),
         Command::SCard { key } => cmd_scard(conn, &key),
+        Command::SPop { key } => cmd_spop(conn, &key),
         Command::SUnion { keys } => cmd_sunion(conn, &keys),
         Command::SInter { keys } => cmd_sinter(conn, &keys),
         Command::SDiff { keys } => cmd_sdiff(conn, &keys),
 
         Command::HSet { key, pairs } => cmd_hset(conn, &key, &pairs),
         Command::HGet { key, field } => cmd_hget(conn, &key, &field),
+        Command::HExists { key, field } => cmd_hexists(conn, &key, &field),
+        Command::HIncrBy { key, field, amount } => cmd_hincrby(conn, &key, &field, amount),
         Command::HDel { key, fields } => cmd_hdel(conn, &key, &fields),
         Command::HGetAll { key } => cmd_hgetall(conn, &key),
         Command::HKeys { key } => cmd_hkeys(conn, &key),
@@ -622,7 +738,21 @@ fn get_string(conn: &Connection, key: &str) -> Result<Option<String>, rusqlite::
     .optional()
 }
 
-fn cmd_set(conn: &Connection, key: &str, value: &str) -> CmdResult {
+fn cmd_set(
+    conn: &Connection,
+    key: &str,
+    value: &str,
+    nx: bool,
+    ttl_seconds: Option<i64>,
+) -> CmdResult {
+    if let Some(secs) = ttl_seconds
+        && secs <= 0
+    {
+        return Err(CmdError::new("ERR invalid expire time in 'set' command"));
+    }
+    if nx && key_exists_in_data(conn, key)? && !is_expired(conn, key)? {
+        return Ok(Reply::Nil);
+    }
     // SET overwrites any existing key, regardless of its prior type.
     conn.execute("DELETE FROM list_items WHERE key = ?1", params![key])?;
     conn.execute("DELETE FROM set_members WHERE key = ?1", params![key])?;
@@ -636,7 +766,26 @@ fn cmd_set(conn: &Connection, key: &str, value: &str) -> CmdResult {
         "INSERT OR REPLACE INTO strings (key, value) VALUES (?1, ?2)",
         params![key, value],
     )?;
+    if let Some(secs) = ttl_seconds {
+        conn.execute(
+            "INSERT OR REPLACE INTO expiry (key, expires_at) VALUES (?1, unixepoch() + ?2)",
+            params![key, secs],
+        )?;
+    }
     Ok(Reply::Simple("OK"))
+}
+
+fn cmd_getdel(conn: &Connection, key: &str) -> CmdResult {
+    ensure_type(conn, key, "string")?;
+    drop_if_expired(conn, key)?;
+    match get_string(conn, key)? {
+        Some(v) => {
+            conn.execute("DELETE FROM strings WHERE key = ?1", params![key])?;
+            conn.execute("DELETE FROM expiry WHERE key = ?1", params![key])?;
+            Ok(Reply::Bulk(v))
+        }
+        None => Ok(Reply::Nil),
+    }
 }
 
 fn cmd_get(conn: &Connection, key: &str) -> CmdResult {
@@ -803,6 +952,7 @@ fn cmd_pop(conn: &Connection, key: &str, order: &str) -> CmdResult {
     match result {
         Some((rowid, value)) => {
             conn.execute("DELETE FROM list_items WHERE rowid = ?1", params![rowid])?;
+            drop_expiry_if_empty(conn, key)?;
             Ok(Reply::Bulk(value))
         }
         None => Ok(Reply::Nil),
@@ -882,6 +1032,9 @@ fn cmd_lrem(conn: &Connection, key: &str, count: i64, value: &str) -> CmdResult 
     for rowid in &rowids {
         conn.execute("DELETE FROM list_items WHERE rowid = ?1", params![rowid])?;
     }
+    if removed > 0 {
+        drop_expiry_if_empty(conn, key)?;
+    }
     Ok(Reply::Int(removed))
 }
 
@@ -900,6 +1053,167 @@ fn cmd_lpos(conn: &Connection, key: &str, value: &str) -> CmdResult {
         pos += 1;
     }
     Ok(Reply::Nil)
+}
+
+// Normalizes a possibly-negative list index to 0-based; None if out of range.
+fn normalize_index(index: i64, len: i64) -> Option<i64> {
+    let i = if index < 0 { len + index } else { index };
+    (0..len).contains(&i).then_some(i)
+}
+
+fn cmd_lindex(conn: &Connection, key: &str, index: i64) -> CmdResult {
+    if is_expired(conn, key)? {
+        return Ok(Reply::Nil);
+    }
+    let (len, _, _) = list_bounds(conn, key)?;
+    let Some(i) = normalize_index(index, len) else {
+        return Ok(Reply::Nil);
+    };
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM list_items WHERE key = ?1 ORDER BY idx ASC LIMIT 1 OFFSET ?2",
+            params![key, i],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match value {
+        Some(v) => Reply::Bulk(v),
+        None => Reply::Nil,
+    })
+}
+
+fn cmd_lset(conn: &Connection, key: &str, index: i64, value: &str) -> CmdResult {
+    ensure_type(conn, key, "list")?;
+    drop_if_expired(conn, key)?;
+    let (len, _, _) = list_bounds(conn, key)?;
+    if len == 0 {
+        return Err(CmdError::new("ERR no such key"));
+    }
+    let i = normalize_index(index, len).ok_or_else(|| CmdError::new("ERR index out of range"))?;
+    let rowid: i64 = conn.query_row(
+        "SELECT rowid FROM list_items WHERE key = ?1 ORDER BY idx ASC LIMIT 1 OFFSET ?2",
+        params![key, i],
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "UPDATE list_items SET value = ?2 WHERE rowid = ?1",
+        params![rowid, value],
+    )?;
+    Ok(Reply::Simple("OK"))
+}
+
+fn cmd_ltrim(conn: &Connection, key: &str, start: i64, stop: i64) -> CmdResult {
+    ensure_type(conn, key, "list")?;
+    drop_if_expired(conn, key)?;
+    let (len, _, _) = list_bounds(conn, key)?;
+    if len == 0 {
+        return Ok(Reply::Simple("OK"));
+    }
+    let s = if start < 0 {
+        (len + start).max(0)
+    } else {
+        start.min(len)
+    };
+    let e = if stop < 0 {
+        (len + stop).max(0)
+    } else {
+        stop.min(len - 1)
+    };
+
+    if s > e {
+        // Everything trimmed away: the key ceases to exist.
+        conn.execute("DELETE FROM list_items WHERE key = ?1", params![key])?;
+        conn.execute("DELETE FROM expiry WHERE key = ?1", params![key])?;
+        return Ok(Reply::Simple("OK"));
+    }
+    // Delete rows outside positions [s, e] by rank.
+    conn.execute(
+        "DELETE FROM list_items WHERE rowid IN (
+            SELECT rowid FROM list_items WHERE key = ?1 ORDER BY idx ASC LIMIT ?2
+        )",
+        params![key, s],
+    )?;
+    conn.execute(
+        "DELETE FROM list_items WHERE rowid IN (
+            SELECT rowid FROM list_items WHERE key = ?1 ORDER BY idx DESC LIMIT ?2
+        )",
+        params![key, len - 1 - e],
+    )?;
+    Ok(Reply::Simple("OK"))
+}
+
+// Rewrites a list's fractional indexes as sequential integers. Called when
+// repeated LINSERTs into the same gap exhaust f64 midpoint precision.
+fn renumber_list(conn: &Connection, key: &str) -> Result<(), rusqlite::Error> {
+    let rowids: Vec<i64> = {
+        let mut stmt =
+            conn.prepare("SELECT rowid FROM list_items WHERE key = ?1 ORDER BY idx ASC")?;
+        stmt.query_map(params![key], |row| row.get(0))?
+            .collect::<Result<_, _>>()?
+    };
+    for (i, rowid) in rowids.iter().enumerate() {
+        conn.execute(
+            "UPDATE list_items SET idx = ?2 WHERE rowid = ?1",
+            params![rowid, i as f64],
+        )?;
+    }
+    Ok(())
+}
+
+fn cmd_linsert(
+    conn: &Connection,
+    key: &str,
+    place: InsertWhere,
+    pivot: &str,
+    value: &str,
+) -> CmdResult {
+    ensure_type(conn, key, "list")?;
+    drop_if_expired(conn, key)?;
+    let (len, _, _) = list_bounds(conn, key)?;
+    if len == 0 {
+        return Ok(Reply::Int(0));
+    }
+    // Two passes at most: if the midpoint between neighbours is no longer
+    // representable, renumber the list to integer indexes and try again.
+    for attempt in 0..2 {
+        // First occurrence of the pivot, searching from the head.
+        let pivot_idx: Option<f64> = conn
+            .query_row(
+                "SELECT idx FROM list_items WHERE key = ?1 AND value = ?2 ORDER BY idx ASC LIMIT 1",
+                params![key, pivot],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(p) = pivot_idx else {
+            return Ok(Reply::Int(-1));
+        };
+        let (neighbour_sql, fallback) = match place {
+            InsertWhere::Before => (
+                "SELECT MAX(idx) FROM list_items WHERE key = ?1 AND idx < ?2",
+                p - 1.0,
+            ),
+            InsertWhere::After => (
+                "SELECT MIN(idx) FROM list_items WHERE key = ?1 AND idx > ?2",
+                p + 1.0,
+            ),
+        };
+        let neighbour: Option<f64> =
+            conn.query_row(neighbour_sql, params![key, p], |row| row.get(0))?;
+        let new_idx = neighbour.map_or(fallback, |n| (n + p) / 2.0);
+        if new_idx != p && Some(new_idx) != neighbour {
+            conn.execute(
+                "INSERT INTO list_items (key, idx, value) VALUES (?1, ?2, ?3)",
+                params![key, new_idx, value],
+            )?;
+            return Ok(Reply::Int(len + 1));
+        }
+        if attempt == 0 {
+            renumber_list(conn, key)?;
+        }
+    }
+    // Unreachable: after renumbering, adjacent indexes differ by 1.0 and the
+    // midpoint is always representable.
+    Err(CmdError::new("ERR could not compute insert position"))
 }
 
 // --- Set commands ---
@@ -928,6 +1242,9 @@ fn cmd_srem(conn: &Connection, key: &str, members: &[String]) -> CmdResult {
             params![key, member],
         )?;
         count += deleted as i64;
+    }
+    if count > 0 {
+        drop_expiry_if_empty(conn, key)?;
     }
     Ok(Reply::Int(count))
 }
@@ -968,6 +1285,26 @@ fn cmd_scard(conn: &Connection, key: &str) -> CmdResult {
         |row| row.get(0),
     )?;
     Ok(Reply::Int(count))
+}
+
+fn cmd_spop(conn: &Connection, key: &str) -> CmdResult {
+    ensure_type(conn, key, "set")?;
+    drop_if_expired(conn, key)?;
+    let picked: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT rowid, member FROM set_members WHERE key = ?1 ORDER BY RANDOM() LIMIT 1",
+            params![key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match picked {
+        Some((rowid, member)) => {
+            conn.execute("DELETE FROM set_members WHERE rowid = ?1", params![rowid])?;
+            drop_expiry_if_empty(conn, key)?;
+            Ok(Reply::Bulk(member))
+        }
+        None => Ok(Reply::Nil),
+    }
 }
 
 fn cmd_sunion(conn: &Connection, keys: &[String]) -> CmdResult {
@@ -1126,6 +1463,47 @@ fn cmd_hget(conn: &Connection, key: &str, field: &str) -> CmdResult {
     })
 }
 
+fn cmd_hexists(conn: &Connection, key: &str, field: &str) -> CmdResult {
+    if is_expired(conn, key)? {
+        return Ok(Reply::Int(0));
+    }
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM hash_fields WHERE key = ?1 AND field = ?2",
+            params![key, field],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(Reply::Int(exists as i64))
+}
+
+fn cmd_hincrby(conn: &Connection, key: &str, field: &str, amount: i64) -> CmdResult {
+    ensure_type(conn, key, "hash")?;
+    drop_if_expired(conn, key)?;
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT value FROM hash_fields WHERE key = ?1 AND field = ?2",
+            params![key, field],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let val: i64 = match current {
+        Some(s) => s
+            .parse::<i64>()
+            .map_err(|_| CmdError::new("ERR hash value is not an integer"))?,
+        None => 0,
+    };
+    let new_val = val
+        .checked_add(amount)
+        .ok_or_else(|| CmdError::new("ERR increment or decrement would overflow"))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO hash_fields (key, field, value) VALUES (?1, ?2, ?3)",
+        params![key, field, new_val.to_string()],
+    )?;
+    Ok(Reply::Int(new_val))
+}
+
 fn cmd_hdel(conn: &Connection, key: &str, fields: &[String]) -> CmdResult {
     ensure_type(conn, key, "hash")?;
     drop_if_expired(conn, key)?;
@@ -1136,6 +1514,9 @@ fn cmd_hdel(conn: &Connection, key: &str, fields: &[String]) -> CmdResult {
             params![key, field],
         )?;
         count += deleted as i64;
+    }
+    if count > 0 {
+        drop_expiry_if_empty(conn, key)?;
     }
     Ok(Reply::Int(count))
 }
