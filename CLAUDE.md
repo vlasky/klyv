@@ -116,14 +116,14 @@ See SPEC.md for the full portable specification.
 
 ### Interactive mode (REPL) — easy, fits the architecture
 
-A `redis-cli`-style shell entered via `klyv --db <PATH>` with no subcommand. All 43 `cmd_*` functions are reusable verbatim (they take `&Connection` and print redis-cli-formatted output), so the work is mostly plumbing:
+A `redis-cli`-style shell entered via `klyv --db <PATH>` with no subcommand. **Phase 0 (see below) has shipped**, so the prerequisites are in place: commands return `Result<Reply, CmdError>` (no `process::exit` inside command bodies), and `dispatch(&mut conn, cmd)` runs any command in its own transaction and hands back a typed reply. The remaining work is pure plumbing:
 
 - Make `command: Command` → `Option<Command>`; `None` enters the REPL loop.
 - Tokenize each line with quote handling (`shlex` crate), then re-dispatch via `Command::try_parse_from(["klyv", ...tokens])` — `try_parse_from` returns a `Result` instead of exiting, so bad input is printed and the loop continues.
 - Read loop: `rustyline` for history/line-editing (redis-cli quality) or `std::io::stdin().lines()` for a minimal version.
-- **Only real refactor:** the 7 `process::exit(1)` sites must become recoverable errors so one bad command doesn't kill the session (in-process you can't catch `process::exit`). One-shot mode still turns the error into an exit code.
+- Each loop iteration: `dispatch` → `render(&reply, format)` on success, print the `CmdError` message on failure, keep looping.
 
-Effort: ~half a day for the polished in-process version; ~1–2 hrs for a crude MVP that shells out to its own binary per line (zero error refactor, but reopens the DB each line). No architectural tension.
+Effort: a couple of hours now that the error refactor is done. No architectural tension. (An even cheaper sibling: a non-interactive `--pipe` mode reading commands from stdin — one process, one DB open — great for shell scripts.)
 
 ### Pub/Sub — hard, fights the architecture
 
@@ -143,14 +143,14 @@ A `klyv serve` daemon that speaks the **RESP** wire protocol over **TCP and/or a
 
 Transports (mirrors real Redis): `--bind 127.0.0.1:6379` for TCP and `--unixsocket /path/klyv.sock` for a Unix socket; either or both can be enabled at once (`redis-cli -s /path/klyv.sock` connects to the latter). Listening only on a Unix socket is a common, lower-overhead setup for same-host clients and sidesteps TCP port/firewall concerns.
 
-**The crux — split compute from render (the shared foundation).** Today all 43 `cmd_*` functions compute *and* `println!` human `redis-cli` text (`(integer) 5`, `(nil)`, `1) "foo"`), which is the *display* format, not the wire format (RESP integer `:5\r\n`, nil bulk `$-1\r\n`, simple string `+OK\r\n`, error `-WRONGTYPE …\r\n`). Refactor `cmd_*` to return a typed reply instead of printing:
+**The crux — split compute from render (the shared foundation): ✅ DONE.** All command functions now return `Result<Reply, CmdError>` instead of printing, with three renderers (human/raw/json) consuming the `Reply`:
 
 ```rust
-enum Reply { Simple(String), Error(String), Int(i64), Bulk(Vec<u8>), Nil, Array(Vec<Reply>) }
-fn cmd_get(conn, key) -> Result<Reply, Reply>   // not println!
+enum Reply { Simple(&'static str), Int(i64), Bulk(String), Nil, Array(Vec<String>, Empty), Lines(Vec<Reply>) }
+fn cmd_get(conn, key) -> CmdResult   // not println!
 ```
 
-Then two renderers consume `Reply`: a **human** renderer reproducing today's exact `redis-cli` text (the integration tests assert on that stdout — must match byte-for-byte) and a **RESP encoder** for the server. This is mechanical but touches all 43 commands, and it subsumes the 7 `process::exit` → recoverable-error cleanup. **It is also the foundation the REPL needs**, so the two features share it.
+What remains for the server is a **RESP encoder** as a fourth renderer. Note two Reply-shape gaps to close when wiring RESP: values are `String` not `Vec<u8>` (fine for CLI input, RESP allows arbitrary bytes), and `Array` holds flat strings rather than nested replies (sufficient today; RESP2 nil-inside-array cases like `LPOS` misses may need a richer variant).
 
 **Other key points:**
 - RESP2 is ~150 lines to hand-roll, or use the `redis-protocol` crate (RESP2/3). A command arrives as an array of bulk strings → `Vec<Vec<u8>>` = `[name, args…]`.
@@ -160,7 +160,7 @@ Then two renderers consume `Reply`: a **human** renderer reproducing today's exa
 - **The real long tail:** clients probe on connect, so you need stubs for `PING`/`QUIT`/`HELLO`/`SELECT 0`/`COMMAND`/`CLIENT`/`CONFIG GET`/`INFO`, plus exact reply-*type* fidelity (`TYPE`→`+string`, `HGETALL`→flat array in RESP2 vs map in RESP3, missing-key pops→nil bulk). Error strings (`WRONGTYPE`, `ERR …`) are already wire-correct.
 
 **Phased effort:**
-- Phase 0 — compute/render split (`Reply` enum + dual renderer, tests stay green): **1–2 days**. *Shared with the REPL.*
+- Phase 0 — compute/render split (`Reply` enum + renderers, tests stay green): ✅ **shipped** (with human/raw/json renderers; RESP encoder still to write).
 - Phase 1 — minimal server (`serve`, thread-per-conn, RESP2, `PING`/`QUIT`/`SELECT 0` + handshake stubs): **1–2 days**.
 - Phase 2 — real-client compat (RESP3/`HELLO`, `SCAN`, `MULTI`/`EXEC`, richer `INFO`/`CONFIG`, reply-type audit): **several days → open-ended**.
 - Phase 3 — ops/perf (pipelining, optional faster sync mode, graceful shutdown, max-conns, optional `AUTH`/TLS): **a few days**.
@@ -171,4 +171,4 @@ Realistic total for "real clients can use the commands klyv implements": **~1–
 - Performance is SQLite-bound, not Redis-bound (every write hits WAL — durable but slower than in-memory). Position it as a *durable, Redis-wire-compatible store*, not a drop-in perf replacement; a `synchronous=OFF`/memory-mode flag could narrow the gap.
 - This server is the prerequisite for real pub/sub (see above).
 
-**Suggested build order:** Phase 0 first (unblocks both the REPL and the server), then the REPL (cheap win), then server Phases 1→2, then pub/sub on top.
+**Suggested build order:** ~~Phase 0~~ (done), then the REPL (cheap win), then server Phases 1→2, then pub/sub on top.

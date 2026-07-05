@@ -2,7 +2,28 @@
 
 ## Unreleased
 
+### Added
+
+- New commands: `get-del`, `l-index`, `l-set`, `l-trim`, `l-insert` (before/after a pivot, using fractional-index midpoints with an automatic renumber when f64 precision runs out), `s-pop`, `h-exists`, `h-incr-by`.
+- `set` options: `--nx` (only set if missing) and `--ex <seconds>` / `--px <milliseconds>` (TTL set atomically with the value; non-positive TTLs are rejected).
+- `--format raw|json` output modes alongside the default redis-cli-style `human` format. `raw` matches `redis-cli --raw` conventions; `json` is unambiguous for scripting (nil is `null`, `h-get-all` renders as an object).
+- `--version` flag.
+- GitHub Actions CI: rustfmt, clippy `-D warnings`, and tests on Linux/macOS/Windows.
+
 ### Fixed
+
+- **`del` return value:** now counts *keys* deleted like Redis, not rows — deleting a 5-element list reports `(integer) 1`, not `5`. Expired keys count 0 but their physical rows are still reclaimed.
+- **Stale TTL inheritance:** a write that empties a list/set/hash (`l-pop`/`r-pop` of the last element, `l-rem`, `l-trim`, `s-rem`, `s-pop`, `h-del`) now deletes the key's expiry row with it, so a later `set` of the same key no longer silently inherits the old TTL.
+- **Swallowed database errors:** genuine SQLite failures (busy timeout, I/O errors) previously rendered as `(nil)`/`0` on read commands; they now report `ERR database error: ...` and exit 1. Opening an unreadable database reports a clean error instead of panicking.
+- **Atomicity:** `del`, `purge`, and `flush-all` now run in a single transaction (a crash mid-`del` could previously leave data rows deleted but a live expiry row behind). All read commands run in a deferred transaction so multi-statement reads see one consistent snapshot.
+
+### Changed
+
+- Internal: commands now compute a typed `Reply` consumed by pluggable renderers (human/raw/json), with recoverable errors instead of `process::exit` — the groundwork for the planned REPL and RESP server. Human output is byte-for-byte unchanged.
+- `l-push`/`r-push` query list bounds once per invocation instead of twice per pushed value; `l-pos` streams instead of loading the whole list.
+- Integration test suite expanded to 177 tests.
+
+### Fixed (earlier hardening pass)
 
 - **Type safety:** type-specific commands now reject a key of a different type with `WRONGTYPE` instead of silently creating a key that exists in multiple type tables. `set`/`m-set` overwrite across types; the check runs inside the write transaction. `l-rem` is now covered too (previously returned `(integer) 0` on a non-list key).
 - **`rename`:** `rename k k` is now a no-op (previously deleted the key); renaming over an existing key clears the target across all types and preserves the source TTL.
@@ -14,10 +35,9 @@
 - **`keys`:** glob is translated to SQL `LIKE` with `%`, `_`, and `\` escaped so they match literally.
 - **Lists:** an empty list's first element is stored at `idx = 0.0`, matching the storage spec.
 
-### Changed
+### Changed (earlier hardening pass)
 
 - Added `PRAGMA busy_timeout=5000` and wrapped read-modify-write commands (now including the TTL mutators) in `BEGIN IMMEDIATE` transactions for cross-process atomicity.
-- Expanded the integration test suite to 149 tests covering the above.
 
 ## 0.1.0 (2026-05-29)
 
