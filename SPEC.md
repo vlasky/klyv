@@ -211,14 +211,14 @@ Remove and return the element at the tail.
 
 Return a range of elements. Indices are zero-based. Negative indices count from the end (`-1` = last element).
 
-**Index normalization:**
+**Index normalization** (matches Redis):
 ```
 if start < 0: start = max(0, len + start)
-if stop < 0:  stop = max(0, len + stop)
-stop = min(stop, len - 1)
+if stop < 0:  stop = len + stop        -- NOT clamped to 0
+else:         stop = min(stop, len - 1)
 ```
 
-If `start > stop` after normalization, return empty.
+If `start > stop` after normalization, return empty. A `stop` that is still negative after adding `len` therefore yields an empty range (e.g. `LRANGE l 0 -5` on a 3-element list is empty, not element 0) — clamping `stop` to 0 here would be a Redis deviation.
 
 **Output:** Numbered lines: `1) "value"`, `2) "value"`, ..., or `(empty list)`.
 
@@ -511,8 +511,11 @@ Delete all data from all tables, atomically (single transaction).
 
 A key may hold only one of the four types at a time. Because each type lives in its own table, this invariant is enforced at the command level rather than by the schema:
 
-- A type-specific mutating command first checks whether the key already exists as a different type. If so it prints `WRONGTYPE Operation against a key holding the wrong kind of value` to stderr, exits with code 1, and leaves the data unchanged. This covers `INCR`/`INCRBY`/`DECR`/`DECRBY`/`APPEND`/`GETDEL` (string), `LPUSH`/`RPUSH`/`LREM`/`LSET`/`LTRIM`/`LINSERT` (list), `SADD`/`SREM`/`SPOP` (set), and `HSET`/`HINCRBY`/`HDEL` (hash).
-- `SET` and `MSET` are the exception: they overwrite the key regardless of its current type, deleting any list/set/hash rows first.
+- Every type-specific command — reads and writes alike — first checks whether the key exists as a different type. If so it prints `WRONGTYPE Operation against a key holding the wrong kind of value` to stderr, exits with code 1, and (for writes) leaves the data unchanged. This matches Redis: `GET` on a list, `LLEN` on a string, or `SUNION` over a hash all raise `WRONGTYPE` rather than pretending the key is absent. For the set-algebra commands (`SUNION`/`SINTER`/`SDIFF`) every input key is checked. An expired key has no type, so it never trips the check.
+- Exceptions, matching Redis:
+  - `SET` and `MSET` overwrite the key regardless of its current type, deleting any list/set/hash rows first.
+  - `MGET` returns `(nil)` for keys of the wrong type instead of erroring.
+  - Key-generic commands (`DEL`, `EXISTS`, `TYPE`, `RENAME`, `KEYS`, the TTL family) operate on any type.
 - An expired key counts as absent for this check, so a write may freely reuse the key as a new type.
 
 The check is performed inside the same transaction as the write so it cannot race a concurrent writer.

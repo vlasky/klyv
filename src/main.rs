@@ -789,6 +789,7 @@ fn cmd_getdel(conn: &Connection, key: &str) -> CmdResult {
 }
 
 fn cmd_get(conn: &Connection, key: &str) -> CmdResult {
+    ensure_type(conn, key, "string")?;
     if is_expired(conn, key)? {
         return Ok(Reply::Nil);
     }
@@ -850,6 +851,7 @@ fn cmd_append(conn: &Connection, key: &str, value: &str) -> CmdResult {
 }
 
 fn cmd_strlen(conn: &Connection, key: &str) -> CmdResult {
+    ensure_type(conn, key, "string")?;
     if is_expired(conn, key)? {
         return Ok(Reply::Int(0));
     }
@@ -939,6 +941,7 @@ fn cmd_rpush(conn: &Connection, key: &str, values: &[String]) -> CmdResult {
 }
 
 fn cmd_pop(conn: &Connection, key: &str, order: &str) -> CmdResult {
+    ensure_type(conn, key, "list")?;
     drop_if_expired(conn, key)?;
     let result: Option<(i64, String)> = conn
         .query_row(
@@ -959,7 +962,25 @@ fn cmd_pop(conn: &Connection, key: &str, order: &str) -> CmdResult {
     }
 }
 
+// Redis range normalization: a negative start clamps to the head, but a stop
+// that is still negative after adding len means the range ends before the
+// head — the caller must treat s > e as empty, not clamp e back to 0.
+fn normalize_range(start: i64, stop: i64, len: i64) -> (i64, i64) {
+    let s = if start < 0 {
+        (len + start).max(0)
+    } else {
+        start.min(len)
+    };
+    let e = if stop < 0 {
+        len + stop
+    } else {
+        stop.min(len - 1)
+    };
+    (s, e)
+}
+
 fn cmd_lrange(conn: &Connection, key: &str, start: i64, stop: i64) -> CmdResult {
+    ensure_type(conn, key, "list")?;
     if is_expired(conn, key)? {
         return Ok(Reply::Array(vec![], Empty::List));
     }
@@ -973,17 +994,7 @@ fn cmd_lrange(conn: &Connection, key: &str, start: i64, stop: i64) -> CmdResult 
         return Ok(Reply::Array(vec![], Empty::List));
     }
 
-    let s = if start < 0 {
-        (len + start).max(0)
-    } else {
-        start.min(len)
-    };
-    let e = if stop < 0 {
-        (len + stop).max(0)
-    } else {
-        stop.min(len - 1)
-    };
-
+    let (s, e) = normalize_range(start, stop, len);
     if s > e {
         return Ok(Reply::Array(vec![], Empty::List));
     }
@@ -999,6 +1010,7 @@ fn cmd_lrange(conn: &Connection, key: &str, start: i64, stop: i64) -> CmdResult 
 }
 
 fn cmd_llen(conn: &Connection, key: &str) -> CmdResult {
+    ensure_type(conn, key, "list")?;
     if is_expired(conn, key)? {
         return Ok(Reply::Int(0));
     }
@@ -1039,6 +1051,7 @@ fn cmd_lrem(conn: &Connection, key: &str, count: i64, value: &str) -> CmdResult 
 }
 
 fn cmd_lpos(conn: &Connection, key: &str, value: &str) -> CmdResult {
+    ensure_type(conn, key, "list")?;
     if is_expired(conn, key)? {
         return Ok(Reply::Nil);
     }
@@ -1062,6 +1075,7 @@ fn normalize_index(index: i64, len: i64) -> Option<i64> {
 }
 
 fn cmd_lindex(conn: &Connection, key: &str, index: i64) -> CmdResult {
+    ensure_type(conn, key, "list")?;
     if is_expired(conn, key)? {
         return Ok(Reply::Nil);
     }
@@ -1109,17 +1123,7 @@ fn cmd_ltrim(conn: &Connection, key: &str, start: i64, stop: i64) -> CmdResult {
     if len == 0 {
         return Ok(Reply::Simple("OK"));
     }
-    let s = if start < 0 {
-        (len + start).max(0)
-    } else {
-        start.min(len)
-    };
-    let e = if stop < 0 {
-        (len + stop).max(0)
-    } else {
-        stop.min(len - 1)
-    };
-
+    let (s, e) = normalize_range(start, stop, len);
     if s > e {
         // Everything trimmed away: the key ceases to exist.
         conn.execute("DELETE FROM list_items WHERE key = ?1", params![key])?;
@@ -1250,6 +1254,7 @@ fn cmd_srem(conn: &Connection, key: &str, members: &[String]) -> CmdResult {
 }
 
 fn cmd_smembers(conn: &Connection, key: &str) -> CmdResult {
+    ensure_type(conn, key, "set")?;
     if is_expired(conn, key)? {
         return Ok(Reply::Array(vec![], Empty::Set));
     }
@@ -1261,6 +1266,7 @@ fn cmd_smembers(conn: &Connection, key: &str) -> CmdResult {
 }
 
 fn cmd_sismember(conn: &Connection, key: &str, member: &str) -> CmdResult {
+    ensure_type(conn, key, "set")?;
     if is_expired(conn, key)? {
         return Ok(Reply::Int(0));
     }
@@ -1276,6 +1282,7 @@ fn cmd_sismember(conn: &Connection, key: &str, member: &str) -> CmdResult {
 }
 
 fn cmd_scard(conn: &Connection, key: &str) -> CmdResult {
+    ensure_type(conn, key, "set")?;
     if is_expired(conn, key)? {
         return Ok(Reply::Int(0));
     }
@@ -1308,6 +1315,9 @@ fn cmd_spop(conn: &Connection, key: &str) -> CmdResult {
 }
 
 fn cmd_sunion(conn: &Connection, keys: &[String]) -> CmdResult {
+    for k in keys {
+        ensure_type(conn, k, "set")?;
+    }
     // Expired input sets are treated as empty and contribute nothing.
     let mut live: Vec<&String> = Vec::with_capacity(keys.len());
     for k in keys {
@@ -1337,6 +1347,9 @@ fn cmd_sunion(conn: &Connection, keys: &[String]) -> CmdResult {
 }
 
 fn cmd_sinter(conn: &Connection, keys: &[String]) -> CmdResult {
+    for k in keys {
+        ensure_type(conn, k, "set")?;
+    }
     if keys.is_empty() {
         return Ok(Reply::Array(vec![], Empty::Set));
     }
@@ -1375,6 +1388,9 @@ fn cmd_sinter(conn: &Connection, keys: &[String]) -> CmdResult {
 }
 
 fn cmd_sdiff(conn: &Connection, keys: &[String]) -> CmdResult {
+    for k in keys {
+        ensure_type(conn, k, "set")?;
+    }
     if keys.is_empty() {
         return Ok(Reply::Array(vec![], Empty::Set));
     }
@@ -1447,6 +1463,7 @@ fn cmd_hset(conn: &Connection, key: &str, pairs: &[String]) -> CmdResult {
 }
 
 fn cmd_hget(conn: &Connection, key: &str, field: &str) -> CmdResult {
+    ensure_type(conn, key, "hash")?;
     if is_expired(conn, key)? {
         return Ok(Reply::Nil);
     }
@@ -1464,6 +1481,7 @@ fn cmd_hget(conn: &Connection, key: &str, field: &str) -> CmdResult {
 }
 
 fn cmd_hexists(conn: &Connection, key: &str, field: &str) -> CmdResult {
+    ensure_type(conn, key, "hash")?;
     if is_expired(conn, key)? {
         return Ok(Reply::Int(0));
     }
@@ -1522,6 +1540,7 @@ fn cmd_hdel(conn: &Connection, key: &str, fields: &[String]) -> CmdResult {
 }
 
 fn cmd_hgetall(conn: &Connection, key: &str) -> CmdResult {
+    ensure_type(conn, key, "hash")?;
     if is_expired(conn, key)? {
         return Ok(Reply::Array(vec![], Empty::Hash));
     }
@@ -1547,6 +1566,7 @@ fn hash_column(conn: &Connection, key: &str, column: &str) -> Result<Vec<String>
 }
 
 fn cmd_hkeys(conn: &Connection, key: &str) -> CmdResult {
+    ensure_type(conn, key, "hash")?;
     if is_expired(conn, key)? {
         return Ok(Reply::Array(vec![], Empty::List));
     }
@@ -1554,6 +1574,7 @@ fn cmd_hkeys(conn: &Connection, key: &str) -> CmdResult {
 }
 
 fn cmd_hvals(conn: &Connection, key: &str) -> CmdResult {
+    ensure_type(conn, key, "hash")?;
     if is_expired(conn, key)? {
         return Ok(Reply::Array(vec![], Empty::List));
     }
@@ -1561,6 +1582,7 @@ fn cmd_hvals(conn: &Connection, key: &str) -> CmdResult {
 }
 
 fn cmd_hlen(conn: &Connection, key: &str) -> CmdResult {
+    ensure_type(conn, key, "hash")?;
     if is_expired(conn, key)? {
         return Ok(Reply::Int(0));
     }

@@ -12,6 +12,8 @@
 
 ### Fixed
 
+- **WRONGTYPE on reads:** type-specific read commands (`get`, `strlen`, `l-len`, `l-range`, `l-pos`, `l-index`, `s-members`, `s-is-member`, `s-card`, `s-union`/`s-inter`/`s-diff` inputs, `h-get`, `h-exists`, `h-get-all`, `h-keys`, `h-vals`, `h-len`) and `l-pop`/`r-pop` now raise `WRONGTYPE` on a key of another type, matching Redis, instead of silently reporting nil/empty/0. `m-get` stays lenient like Redis MGET.
+- **Range normalization:** `l-range`/`l-trim` no longer clamp a still-negative stop index to 0 — `l-range l 0 -5` on a 3-element list is now empty (Redis behavior) instead of returning the first element.
 - **`del` return value:** now counts *keys* deleted like Redis, not rows — deleting a 5-element list reports `(integer) 1`, not `5`. Expired keys count 0 but their physical rows are still reclaimed.
 - **Stale TTL inheritance:** a write that empties a list/set/hash (`l-pop`/`r-pop` of the last element, `l-rem`, `l-trim`, `s-rem`, `s-pop`, `h-del`) now deletes the key's expiry row with it, so a later `set` of the same key no longer silently inherits the old TTL.
 - **Swallowed database errors:** genuine SQLite failures (busy timeout, I/O errors) previously rendered as `(nil)`/`0` on read commands; they now report `ERR database error: ...` and exit 1. Opening an unreadable database reports a clean error instead of panicking.
