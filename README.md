@@ -58,6 +58,28 @@ Either `--db` or the `KLYV_DB` environment variable is required. The database fi
 
 To store values that begin with a hyphen, use the standard `--` separator so they aren't parsed as flags: `klyv append -- k -leading-hyphen`. (Numeric arguments like `incr-by k -5` or `l-range k 0 -1` work without it.)
 
+### Interactive shell and pipe mode
+
+Run `klyv` with no command to enter a `redis-cli`-style shell with line editing and history:
+
+```
+$ klyv --db my.db
+klyv 0.2.0 — 'help' lists commands, 'exit' or Ctrl-D quits
+klyv> set greeting "hello world"
+OK
+klyv> get greeting
+hello world
+klyv> exit
+```
+
+When stdin is not a terminal, the same invocation reads commands one per line — one process and one database open for the whole batch, instead of a process per command:
+
+```sh
+printf 'set a 1\nincr counter\nl-push tasks "write docs"\n' | klyv --db my.db
+```
+
+Values with spaces use shell-style quoting in both modes. A failing line prints its error to stderr and the session continues; pipe mode exits 1 if any line failed. `--format` applies to every reply in the session.
+
 ### Output formats
 
 The default `human` format mirrors redis-cli (`(integer) 5`, `(nil)`, numbered quoted arrays). For scripting, pass `--format raw` or `--format json`:

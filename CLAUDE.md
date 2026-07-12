@@ -10,6 +10,8 @@ klyv --db <PATH> [--format <human|raw|json>] <COMMAND> [ARGS...]
 
 Either `--db` or the `KLYV_DB` env var is required. The database file is created on first use. `--format` selects the rendering: `human` (default, redis-cli style), `raw` (bare values, nil = empty line), or `json` (single JSON value; `h-get-all` renders as an object, nil as `null`).
 
+Run with no command to enter the interactive shell (rustyline REPL when stdin is a tty) or pipe mode (commands one per line from stdin, one process and one DB open for the batch). Quoting is shell-style via shlex; errors are recoverable per line; `exit`/`quit` ends the session; pipe mode exits 1 if any line failed.
+
 ## Commands
 
 ### Strings
@@ -118,16 +120,9 @@ See SPEC.md for the full portable specification.
 
 ## Future Features
 
-### Interactive mode (REPL) — easy, fits the architecture
+### Interactive mode (REPL) and pipe mode — ✅ SHIPPED
 
-A `redis-cli`-style shell entered via `klyv --db <PATH>` with no subcommand. **Phase 0 (see below) has shipped**, so the prerequisites are in place: commands return `Result<Reply, CmdError>` (no `process::exit` inside command bodies), and `dispatch(&mut conn, cmd)` runs any command in its own transaction and hands back a typed reply. The remaining work is pure plumbing:
-
-- Make `command: Command` → `Option<Command>`; `None` enters the REPL loop.
-- Tokenize each line with quote handling (`shlex` crate), then re-dispatch via `Command::try_parse_from(["klyv", ...tokens])` — `try_parse_from` returns a `Result` instead of exiting, so bad input is printed and the loop continues.
-- Read loop: `rustyline` for history/line-editing (redis-cli quality) or `std::io::stdin().lines()` for a minimal version.
-- Each loop iteration: `dispatch` → `render(&reply, format)` on success, print the `CmdError` message on failure, keep looping.
-
-Effort: a couple of hours now that the error refactor is done. No architectural tension. (An even cheaper sibling: a non-interactive `--pipe` mode reading commands from stdin — one process, one DB open — great for shell scripts.)
+`klyv --db <PATH>` with no subcommand enters the loop: a rustyline REPL when stdin is a tty, non-interactive pipe mode (one command per line from stdin) otherwise. One process, one DB open, per-line recoverable errors via `LineInput::try_parse_from` + `dispatch`. See `run_line`/`repl`/`pipe` in src/main.rs.
 
 ### Pub/Sub — hard, fights the architecture
 
@@ -175,4 +170,4 @@ Realistic total for "real clients can use the commands klyv implements": **~1–
 - Performance is SQLite-bound, not Redis-bound (every write hits WAL — durable but slower than in-memory). Position it as a *durable, Redis-wire-compatible store*, not a drop-in perf replacement; a `synchronous=OFF`/memory-mode flag could narrow the gap.
 - This server is the prerequisite for real pub/sub (see above).
 
-**Suggested build order:** ~~Phase 0~~ (done), then the REPL (cheap win), then server Phases 1→2, then pub/sub on top.
+**Suggested build order:** ~~Phase 0~~ (done), ~~the REPL~~ (done), then server Phases 1→2, then pub/sub on top.
