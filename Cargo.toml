@@ -1,6 +1,6 @@
 [package]
 name = "klyv"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Redis-compatible embedded KV store backed by SQLite"
 license = "MIT"
