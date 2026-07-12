@@ -1,6 +1,6 @@
 # klyv
 
-[![Version](https://img.shields.io/badge/version-0.1.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Redis-compatible embedded key-value store backed by SQLite. No server, no daemon — just a CLI and a file.
