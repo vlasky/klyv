@@ -56,6 +56,8 @@ klyv --db <PATH> [--format <human|raw|json>] <COMMAND> [ARGS...]
 
 Either `--db` or the `KLYV_DB` environment variable is required. The database file is created on first use.
 
+To store values that begin with a hyphen, use the standard `--` separator so they aren't parsed as flags: `klyv append -- k -leading-hyphen`. (Numeric arguments like `incr-by k -5` or `l-range k 0 -1` work without it.)
+
 ### Output formats
 
 The default `human` format mirrors redis-cli (`(integer) 5`, `(nil)`, numbered quoted arrays). For scripting, pass `--format raw` or `--format json`:
