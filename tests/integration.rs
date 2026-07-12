@@ -2163,3 +2163,122 @@ fn test_ltrim_stop_beyond_head_empties_list() {
     let (out, _, _) = klyv(&db, &["exists", "l"]);
     assert_eq!(out.trim(), "(integer) 0");
 }
+
+// === PIPE MODE (no subcommand, stdin not a tty) ===
+
+fn klyv_pipe(db: &str, extra_args: &[&str], input: &str) -> (String, String, bool) {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_klyv"))
+        .arg("--db")
+        .arg(db)
+        .args(extra_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn klyv");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().expect("failed to wait for klyv");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.success(),
+    )
+}
+
+#[test]
+fn test_pipe_basic_sequence() {
+    let db = fresh_db();
+    let (out, err, ok) = klyv_pipe(&db, &[], "set k v\nget k\nincr n\nincr n\n");
+    assert!(ok, "stderr: {err}");
+    assert_eq!(out, "OK\nv\n(integer) 1\n(integer) 2\n");
+}
+
+#[test]
+fn test_pipe_state_persists_after_session() {
+    let db = fresh_db();
+    klyv_pipe(&db, &[], "set k piped\n");
+    let (out, _, _) = klyv(&db, &["get", "k"]);
+    assert_eq!(out.trim(), "piped");
+}
+
+#[test]
+fn test_pipe_quoted_values() {
+    let db = fresh_db();
+    let (out, _, ok) = klyv_pipe(&db, &[], "set k \"hello world\"\nget k\n");
+    assert!(ok);
+    assert_eq!(out, "OK\nhello world\n");
+}
+
+#[test]
+fn test_pipe_errors_are_recoverable() {
+    let db = fresh_db();
+    let (out, err, ok) = klyv_pipe(&db, &[], "set s notanum\nincr s\nset j 1\nget j\n");
+    // The failing line reports to stderr, the session continues, and the
+    // overall exit code is 1.
+    assert!(!ok);
+    assert!(err.contains("ERR value is not an integer"));
+    assert_eq!(out, "OK\nOK\n1\n");
+}
+
+#[test]
+fn test_pipe_unknown_command_recoverable() {
+    let db = fresh_db();
+    let (out, err, ok) = klyv_pipe(&db, &[], "nosuchcmd\nset k v\nget k\n");
+    assert!(!ok);
+    assert!(err.contains("unrecognized subcommand"));
+    assert_eq!(out, "OK\nv\n");
+}
+
+#[test]
+fn test_pipe_unbalanced_quotes_recoverable() {
+    let db = fresh_db();
+    let (out, err, ok) = klyv_pipe(&db, &[], "set k \"unterminated\nset k2 fine\nget k2\n");
+    assert!(!ok);
+    assert!(err.contains("ERR unbalanced quotes"));
+    assert_eq!(out, "OK\nfine\n");
+}
+
+#[test]
+fn test_pipe_quit_stops_processing() {
+    let db = fresh_db();
+    let (out, _, ok) = klyv_pipe(&db, &[], "set a 1\nquit\nset b 2\n");
+    assert!(ok);
+    assert_eq!(out, "OK\n");
+    let (out, _, _) = klyv(&db, &["exists", "b"]);
+    assert_eq!(out.trim(), "(integer) 0");
+}
+
+#[test]
+fn test_pipe_empty_and_blank_lines_ignored() {
+    let db = fresh_db();
+    let (out, _, ok) = klyv_pipe(&db, &[], "\n   \nset k v\n\nget k\n");
+    assert!(ok);
+    assert_eq!(out, "OK\nv\n");
+}
+
+#[test]
+fn test_pipe_respects_format_flag() {
+    let db = fresh_db();
+    let (out, _, ok) = klyv_pipe(
+        &db,
+        &["--format", "json"],
+        "get missing\nh-set h f v\nh-get-all h\n",
+    );
+    assert!(ok);
+    assert_eq!(out, "null\n1\n{\"f\":\"v\"}\n");
+}
+
+#[test]
+fn test_pipe_wrongtype_recoverable() {
+    let db = fresh_db();
+    let (out, err, ok) = klyv_pipe(&db, &[], "r-push l a\nget l\nl-len l\n");
+    assert!(!ok);
+    assert!(err.contains("WRONGTYPE"));
+    assert_eq!(out, "(integer) 1\n(integer) 1\n");
+}

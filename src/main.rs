@@ -1,12 +1,15 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use std::io::{BufRead, IsTerminal};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
     name = "klyv",
     version,
-    about = "Redis-compatible embedded KV store backed by SQLite"
+    about = "Redis-compatible embedded KV store backed by SQLite",
+    after_help = "Run without a command to enter the interactive shell (or pipe \
+                  commands, one per line, into stdin)."
 )]
 struct Cli {
     #[arg(short, long, env = "KLYV_DB")]
@@ -21,6 +24,15 @@ struct Cli {
     )]
     format: OutputFormat,
 
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Parser for one line of shell/pipe input: just the subcommand, no --db or
+/// --format (those belong to the session, not the line).
+#[derive(Parser)]
+#[command(name = "klyv", no_binary_name = true, disable_version_flag = true)]
+struct LineInput {
     #[command(subcommand)]
     command: Command,
 }
@@ -718,11 +730,121 @@ fn main() {
             std::process::exit(1);
         }
     };
-    match dispatch(&mut conn, cli.command) {
-        Ok(reply) => print!("{}", render(&reply, cli.format)),
-        Err(CmdError(msg)) => {
-            eprintln!("{msg}");
-            std::process::exit(1);
+    match cli.command {
+        Some(command) => match dispatch(&mut conn, command) {
+            Ok(reply) => print!("{}", render(&reply, cli.format)),
+            Err(CmdError(msg)) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+        },
+        // No subcommand: interactive shell on a terminal, pipe mode otherwise.
+        None => {
+            let code = if std::io::stdin().is_terminal() {
+                repl(&mut conn, cli.format)
+            } else {
+                pipe(&mut conn, cli.format)
+            };
+            std::process::exit(code);
+        }
+    }
+}
+
+enum LineOutcome {
+    Ok,
+    Failed,
+    Quit,
+}
+
+/// Tokenizes and executes one line of shell/pipe input against the open
+/// connection. Every error is recoverable: the session continues.
+fn run_line(conn: &mut Connection, line: &str, format: OutputFormat) -> LineOutcome {
+    let Some(tokens) = shlex::split(line) else {
+        eprintln!("ERR unbalanced quotes in input");
+        return LineOutcome::Failed;
+    };
+    if tokens.is_empty() {
+        return LineOutcome::Ok;
+    }
+    if tokens.len() == 1 && ["exit", "quit"].contains(&tokens[0].to_lowercase().as_str()) {
+        return LineOutcome::Quit;
+    }
+    match LineInput::try_parse_from(&tokens) {
+        Ok(input) => match dispatch(conn, input.command) {
+            Ok(reply) => {
+                print!("{}", render(&reply, format));
+                LineOutcome::Ok
+            }
+            Err(CmdError(msg)) => {
+                eprintln!("{msg}");
+                LineOutcome::Failed
+            }
+        },
+        Err(e) => {
+            // Prints help/version requests to stdout, parse errors to stderr.
+            let _ = e.print();
+            if e.use_stderr() {
+                LineOutcome::Failed
+            } else {
+                LineOutcome::Ok
+            }
+        }
+    }
+}
+
+/// Non-interactive loop: executes commands from stdin, one per line, over a
+/// single connection (one process, one DB open). Failing lines report to
+/// stderr and processing continues; the exit code is 1 if any line failed.
+fn pipe(conn: &mut Connection, format: OutputFormat) -> i32 {
+    let mut failed = false;
+    for line in std::io::stdin().lock().lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(e) => {
+                eprintln!("ERR reading stdin: {e}");
+                return 1;
+            }
+        };
+        match run_line(conn, &line, format) {
+            LineOutcome::Ok => {}
+            LineOutcome::Failed => failed = true,
+            LineOutcome::Quit => break,
+        }
+    }
+    if failed { 1 } else { 0 }
+}
+
+/// Interactive shell with line editing and in-session history.
+fn repl(conn: &mut Connection, format: OutputFormat) -> i32 {
+    let mut rl = match rustyline::DefaultEditor::new() {
+        Ok(rl) => rl,
+        Err(e) => {
+            eprintln!("ERR failed to initialize line editor: {e}");
+            return 1;
+        }
+    };
+    println!(
+        "klyv {} — 'help' lists commands, 'exit' or Ctrl-D quits",
+        env!("CARGO_PKG_VERSION")
+    );
+    loop {
+        match rl.readline("klyv> ") {
+            Ok(line) => {
+                if !line.trim().is_empty() {
+                    let _ = rl.add_history_entry(&line);
+                }
+                // Interactive errors are shown, not fatal, and don't affect
+                // the exit code.
+                if matches!(run_line(conn, &line, format), LineOutcome::Quit) {
+                    return 0;
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => continue,
+            Err(rustyline::error::ReadlineError::Eof) => return 0,
+            Err(e) => {
+                eprintln!("ERR reading input: {e}");
+                return 1;
+            }
         }
     }
 }
