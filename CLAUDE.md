@@ -106,6 +106,10 @@ cargo build --release
 cargo test
 ```
 
+`tests/differential.rs` runs the same command sequences through klyv and a real Redis server (started ephemerally on a free port) and diffs the replies — the authoritative check for Redis compatibility. It self-skips when `redis-server`/`redis-cli` are not on PATH (`brew install redis`); CI runs it in a dedicated ubuntu job. When adding or changing a command, add differential steps for it, and mind the comparator notes at the top of that file (error-code-only comparison, empty-array quirk, sorted modes for unordered replies).
+
+Values beginning with a hyphen need the standard `--` escape on the CLI (`klyv append -- k -value`); keep that in mind when writing tests.
+
 ## Architecture
 
 Single-file Rust binary. All state in one SQLite database with five tables: `strings`, `list_items`, `set_members`, `hash_fields`, `expiry`. Lists use fractional indexing (REAL column) for O(1) push. Expiry uses lazy filtering (reads check `expiry` table, `purge` does physical deletion). WAL mode for concurrent reads.

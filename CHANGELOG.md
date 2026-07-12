@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Differential test harness (`tests/differential.rs`): runs ~190 identical command steps through klyv and a real Redis server and diffs the replies. Self-skips when redis is not installed; CI runs it in a dedicated ubuntu job.
+- Documented the `--` escape for storing values that begin with a hyphen (`klyv append -- k -value`).
+
 ## 0.2.0 (2026-07-12)
 
 ### Added
