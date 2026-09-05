@@ -756,10 +756,73 @@ enum LineOutcome {
     Quit,
 }
 
+/// Shell-style tokenizer for shell/pipe input: words split on unquoted
+/// whitespace, with single quotes (literal), double quotes (with \" and \\
+/// escapes), and bare backslash escapes. Unlike a real shell — and unlike the
+/// shlex crate, which this replaced — `#` has no special meaning: in a data
+/// store it is data, never a comment. Returns None on an unterminated quote
+/// or trailing backslash.
+fn split_line(line: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut it = line.chars();
+    while let Some(c) = it.next() {
+        match c {
+            ' ' | '\t' => {
+                if in_word {
+                    tokens.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            '\'' => {
+                in_word = true;
+                loop {
+                    match it.next() {
+                        Some('\'') => break,
+                        Some(c) => cur.push(c),
+                        None => return None,
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match it.next() {
+                        Some('"') => break,
+                        Some('\\') => match it.next() {
+                            Some(e @ ('"' | '\\')) => cur.push(e),
+                            Some(e) => {
+                                cur.push('\\');
+                                cur.push(e);
+                            }
+                            None => return None,
+                        },
+                        Some(c) => cur.push(c),
+                        None => return None,
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                cur.push(it.next()?);
+            }
+            c => {
+                in_word = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_word {
+        tokens.push(cur);
+    }
+    Some(tokens)
+}
+
 /// Tokenizes and executes one line of shell/pipe input against the open
 /// connection. Every error is recoverable: the session continues.
 fn run_line(conn: &mut Connection, line: &str, format: OutputFormat) -> LineOutcome {
-    let Some(tokens) = shlex::split(line) else {
+    let Some(tokens) = split_line(line) else {
         eprintln!("ERR unbalanced quotes in input");
         return LineOutcome::Failed;
     };
