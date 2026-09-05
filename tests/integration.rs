@@ -2282,3 +2282,39 @@ fn test_pipe_wrongtype_recoverable() {
     assert!(err.contains("WRONGTYPE"));
     assert_eq!(out, "(integer) 1\n(integer) 1\n");
 }
+
+#[test]
+fn test_pipe_hash_char_is_data_not_comment() {
+    // Regression: the shlex crate treated word-initial '#' as a shell
+    // comment, silently truncating stored data.
+    let db = fresh_db();
+    let (out, _, ok) = klyv_pipe(
+        &db,
+        &[],
+        "set b #value\nget b\nset t \"value #tagged\"\nget t\n",
+    );
+    assert!(ok);
+    assert_eq!(out, "OK\n#value\nOK\nvalue #tagged\n");
+}
+
+#[test]
+fn test_pipe_single_quotes_and_backslash_escapes() {
+    let db = fresh_db();
+    let (out, _, ok) = klyv_pipe(
+        &db,
+        &[],
+        "set q 'sq uoted'\nget q\nset bs hello\\ world\nget bs\nset dq \"a \\\"quote\\\"\"\nget dq\n",
+    );
+    assert!(ok);
+    assert_eq!(out, "OK\nsq uoted\nOK\nhello world\nOK\na \"quote\"\n");
+}
+
+#[test]
+fn test_pipe_trailing_backslash_recoverable() {
+    let db = fresh_db();
+    // Line 1 has a trailing backslash, so the set fails and k stays unset.
+    let (out, err, ok) = klyv_pipe(&db, &[], "set k v\\\nget k\n");
+    assert!(!ok);
+    assert!(err.contains("ERR unbalanced quotes"));
+    assert_eq!(out, "(nil)\n");
+}
