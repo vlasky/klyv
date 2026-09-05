@@ -10,7 +10,7 @@ klyv --db <PATH> [--format <human|raw|json>] <COMMAND> [ARGS...]
 
 Either `--db` or the `KLYV_DB` env var is required. The database file is created on first use. `--format` selects the rendering: `human` (default, redis-cli style), `raw` (bare values, nil = empty line), or `json` (single JSON value; `h-get-all` renders as an object, nil as `null`).
 
-Run with no command to enter the interactive shell (rustyline REPL when stdin is a tty) or pipe mode (commands one per line from stdin, one process and one DB open for the batch). Quoting is shell-style via shlex; errors are recoverable per line; `exit`/`quit` ends the session; pipe mode exits 1 if any line failed.
+Run with no command to enter the interactive shell (rustyline REPL when stdin is a tty) or pipe mode (commands one per line from stdin, one process and one DB open for the batch). Quoting is shell-style via the hand-rolled `split_line` tokenizer (single/double quotes, backslash escapes; `#` is ordinary data, never a comment — the shlex crate was dropped for treating it as one); errors are recoverable per line; `exit`/`quit` ends the session; pipe mode exits 1 if any line failed.
 
 ## Commands
 
