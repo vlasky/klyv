@@ -16,8 +16,8 @@
 //! - Unordered replies (sets, keys, hashes) are sorted on both sides.
 //!
 //! Deliberate klyv deviations documented in SPEC.md are not exercised here:
-//! SET preserving a live TTL, db-size counting unpurged expired keys, purge
-//! itself, p-expire second-rounding, and `[abc]` glob classes in keys.
+//! db-size counting unpurged expired keys, purge itself, and p-expire
+//! second-rounding.
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -641,6 +641,52 @@ fn scenarios() -> Vec<(&'static str, Vec<Step>)> {
                     Exact,
                 ),
                 step(&["exists", "k"], &["EXISTS", "k"], Exact),
+            ],
+        ),
+        (
+            "set-ttl-semantics",
+            vec![
+                step(&["set", "k", "v"], &["SET", "k", "v"], Exact),
+                step(&["expire", "k", "1000"], &["EXPIRE", "k", "1000"], Exact),
+                // Plain SET discards the TTL.
+                step(&["set", "k", "v2"], &["SET", "k", "v2"], Exact),
+                step(&["ttl", "k"], &["TTL", "k"], Exact),
+                step(&["expire", "k", "1000"], &["EXPIRE", "k", "1000"], Exact),
+                // KEEPTTL keeps it: PERSIST then has something to remove.
+                step(
+                    &["set", "k", "v3", "--keep-ttl"],
+                    &["SET", "k", "v3", "KEEPTTL"],
+                    Exact,
+                ),
+                step(&["persist", "k"], &["PERSIST", "k"], Exact),
+                step(&["expire", "k", "1000"], &["EXPIRE", "k", "1000"], Exact),
+                step(&["m-set", "k", "v4"], &["MSET", "k", "v4"], Exact),
+                step(&["ttl", "k"], &["TTL", "k"], Exact),
+            ],
+        ),
+        (
+            "keys-glob",
+            vec![
+                step(&["set", "user:1", "a"], &["SET", "user:1", "a"], Exact),
+                step(&["set", "User:2", "b"], &["SET", "User:2", "b"], Exact),
+                step(&["set", "USER:3", "c"], &["SET", "USER:3", "c"], Exact),
+                step(&["set", "k1", "v"], &["SET", "k1", "v"], Exact),
+                step(&["set", "k2", "v"], &["SET", "k2", "v"], Exact),
+                step(&["set", "ka", "v"], &["SET", "ka", "v"], Exact),
+                step(&["set", "a*b", "v"], &["SET", "a*b", "v"], Exact),
+                step(&["set", "axb", "v"], &["SET", "axb", "v"], Exact),
+                step(&["keys", "user:*"], &["KEYS", "user:*"], Sorted),
+                step(&["keys", "U*"], &["KEYS", "U*"], Sorted),
+                step(&["keys", "k[12]"], &["KEYS", "k[12]"], Sorted),
+                step(&["keys", "k[^12]"], &["KEYS", "k[^12]"], Sorted),
+                step(&["keys", "k[a-z]"], &["KEYS", "k[a-z]"], Sorted),
+                step(&["keys", "a\\*b"], &["KEYS", "a\\*b"], Sorted),
+                step(&["keys", "a?b"], &["KEYS", "a?b"], Sorted),
+                step(&["keys", "?"], &["KEYS", "?"], Sorted),
+                step(&["set", "a\\b", "v"], &["SET", "a\\b", "v"], Exact),
+                step(&["set", "ab", "v"], &["SET", "ab", "v"], Exact),
+                step(&["keys", "a\\b"], &["KEYS", "a\\b"], Sorted),
+                step(&["keys", "a\\\\b"], &["KEYS", "a\\\\b"], Sorted),
             ],
         ),
     ]

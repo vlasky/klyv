@@ -1129,12 +1129,24 @@ fn test_del_removes_expiry() {
 }
 
 #[test]
-fn test_set_overwrites_clears_expiry_not() {
+fn test_set_clears_live_ttl_like_redis() {
     let db = fresh_db();
     klyv(&db, &["set", "k", "v"]);
     klyv(&db, &["expire", "k", "100"]);
     klyv(&db, &["set", "k", "new"]);
+    // Redis SET discards the TTL unless KEEPTTL is given.
+    let (out, _, _) = klyv(&db, &["ttl", "k"]);
+    assert_eq!(out.trim(), "(integer) -1");
+}
 
+#[test]
+fn test_set_keep_ttl_preserves_live_ttl() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    klyv(&db, &["expire", "k", "100"]);
+    let (out, _, ok) = klyv(&db, &["set", "k", "new", "--keep-ttl"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "OK");
     let (out, _, _) = klyv(&db, &["ttl", "k"]);
     let ttl: i64 = out
         .trim()
@@ -1142,8 +1154,27 @@ fn test_set_overwrites_clears_expiry_not() {
         .unwrap()
         .parse()
         .unwrap();
-    // SET does not clear expiry (Redis-compatible: only DEL/PERSIST clear it)
-    assert!(ttl > 0);
+    assert!((1..=100).contains(&ttl), "ttl was {ttl}");
+    let (out, _, _) = klyv(&db, &["get", "k"]);
+    assert_eq!(out.trim(), "new");
+}
+
+#[test]
+fn test_set_keep_ttl_conflicts_with_ex() {
+    let db = fresh_db();
+    let (_, err, ok) = klyv(&db, &["set", "k", "v", "--keep-ttl", "--ex", "10"]);
+    assert!(!ok);
+    assert!(err.contains("cannot be used with"), "stderr: {err}");
+}
+
+#[test]
+fn test_mset_clears_live_ttl() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    klyv(&db, &["expire", "k", "100"]);
+    klyv(&db, &["m-set", "k", "new", "j", "1"]);
+    let (out, _, _) = klyv(&db, &["ttl", "k"]);
+    assert_eq!(out.trim(), "(integer) -1");
 }
 
 #[test]
@@ -1343,14 +1374,14 @@ fn test_set_over_expired_clears_stale_expiry() {
 }
 
 #[test]
-fn test_set_preserves_live_ttl() {
+fn test_set_over_live_ttl_then_persist_returns_zero() {
+    // After SET cleared the TTL there is nothing left for PERSIST to remove.
     let db = fresh_db();
     klyv(&db, &["set", "k", "v"]);
     klyv(&db, &["expire", "k", "1000"]);
     klyv(&db, &["set", "k", "v2"]);
-    let (out, _, _) = klyv(&db, &["ttl", "k"]);
-    let n: i64 = out.trim().trim_start_matches("(integer) ").parse().unwrap();
-    assert!(n > 0 && n <= 1000, "ttl was {n}");
+    let (out, _, _) = klyv(&db, &["persist", "k"]);
+    assert_eq!(out.trim(), "(integer) 0");
 }
 
 #[test]
@@ -1511,13 +1542,17 @@ fn test_keys_percent_is_literal() {
 }
 
 #[test]
-fn test_keys_backslash_is_literal() {
+fn test_keys_backslash_is_the_escape_character() {
+    // Redis glob: '\\x' matches a literal x, so a literal backslash in the
+    // key needs a doubled backslash in the pattern (verified against Redis).
     let db = fresh_db();
     klyv(&db, &["set", "a\\b", "1"]);
-    klyv(&db, &["set", "axb", "1"]);
+    klyv(&db, &["set", "ab", "2"]);
+    klyv(&db, &["set", "axb", "3"]);
     let (out, _, _) = klyv(&db, &["keys", "a\\b"]);
-    assert!(out.contains("a\\b"), "out: {out}");
-    assert!(!out.contains("\"axb\""), "out: {out}");
+    assert_eq!(out.trim(), "1) \"ab\"");
+    let (out, _, _) = klyv(&db, &["keys", "a\\\\b"]);
+    assert_eq!(out.trim(), "1) \"a\\b\"");
 }
 
 #[test]
@@ -2317,4 +2352,72 @@ fn test_pipe_trailing_backslash_recoverable() {
     assert!(!ok);
     assert!(err.contains("ERR unbalanced quotes"));
     assert_eq!(out, "(nil)\n");
+}
+
+// === KEYS: Redis glob semantics via SQLite GLOB ===
+
+#[test]
+fn test_keys_is_case_sensitive() {
+    let db = fresh_db();
+    klyv(&db, &["set", "user:1", "a"]);
+    klyv(&db, &["set", "User:2", "b"]);
+    klyv(&db, &["set", "USER:3", "c"]);
+    let (out, _, _) = klyv(&db, &["keys", "user:*"]);
+    assert_eq!(out.trim(), "1) \"user:1\"");
+}
+
+#[test]
+fn test_keys_character_classes_negation_and_ranges() {
+    let db = fresh_db();
+    for k in ["k1", "k2", "k3", "ka", "kb"] {
+        klyv(&db, &["set", k, "v"]);
+    }
+    let (out, _, _) = klyv(&db, &["keys", "k[12]"]);
+    assert_eq!(
+        out.trim().lines().collect::<Vec<_>>(),
+        ["1) \"k1\"", "2) \"k2\""]
+    );
+    let (out, _, _) = klyv(&db, &["keys", "k[^123]"]);
+    assert_eq!(
+        out.trim().lines().collect::<Vec<_>>(),
+        ["1) \"ka\"", "2) \"kb\""]
+    );
+    let (out, _, _) = klyv(&db, &["keys", "k[a-b]"]);
+    assert_eq!(
+        out.trim().lines().collect::<Vec<_>>(),
+        ["1) \"ka\"", "2) \"kb\""]
+    );
+}
+
+#[test]
+fn test_keys_backslash_escapes_specials() {
+    let db = fresh_db();
+    klyv(&db, &["set", "a*b", "1"]);
+    klyv(&db, &["set", "axb", "2"]);
+    klyv(&db, &["set", "a[b", "3"]);
+    klyv(&db, &["set", "a?b", "4"]);
+    let (out, _, _) = klyv(&db, &["keys", "a\\*b"]);
+    assert_eq!(out.trim(), "1) \"a*b\"");
+    let (out, _, _) = klyv(&db, &["keys", "a\\[b"]);
+    assert_eq!(out.trim(), "1) \"a[b\"");
+    let (out, _, _) = klyv(&db, &["keys", "a\\?b"]);
+    assert_eq!(out.trim(), "1) \"a?b\"");
+    // Unescaped specials still act as wildcards.
+    let (out, _, _) = klyv(&db, &["keys", "a?b"]);
+    assert_eq!(out.trim().lines().count(), 4);
+}
+
+#[test]
+fn test_keys_sql_like_metacharacters_are_literal() {
+    // '%' and '_' meant something under the old LIKE translation; under
+    // GLOB they are ordinary characters and must match themselves only.
+    let db = fresh_db();
+    klyv(&db, &["set", "100%", "v"]);
+    klyv(&db, &["set", "100x", "v"]);
+    klyv(&db, &["set", "a_b", "v"]);
+    klyv(&db, &["set", "aXb", "v"]);
+    let (out, _, _) = klyv(&db, &["keys", "100%"]);
+    assert_eq!(out.trim(), "1) \"100%\"");
+    let (out, _, _) = klyv(&db, &["keys", "a_b"]);
+    assert_eq!(out.trim(), "1) \"a_b\"");
 }

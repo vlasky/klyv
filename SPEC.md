@@ -92,9 +92,9 @@ Subcommands use **kebab-case** on the CLI (e.g. `s-add`, `l-push`, `h-set`). Thi
 
 ### String Commands
 
-#### SET key value [--nx] [--ex seconds | --px milliseconds]
+#### SET key value [--nx] [--ex seconds | --px milliseconds | --keep-ttl]
 
-Store a string value at key. Overwrites any existing value **of any type** — if the key currently holds a list, set, or hash, those rows are deleted first so the key becomes a string. A live TTL is preserved; an already-expired TTL row is cleared so the new value is immediately visible.
+Store a string value at key. Overwrites any existing value **of any type** — if the key currently holds a list, set, or hash, those rows are deleted first so the key becomes a string. Like Redis, a plain `SET` discards any existing TTL (`--keep-ttl` preserves a live one; a stale, already-expired TTL row is always cleared so the new value is immediately visible).
 
 ```
 DELETE FROM list_items   WHERE key = ?;
@@ -108,6 +108,7 @@ Options (mirroring Redis SET options):
 
 - `--nx` — only set if the key does not already exist (an expired key counts as absent). If the key exists, nothing is written.
 - `--ex seconds` / `--px milliseconds` — set a TTL atomically with the value, in the same transaction (the two-command `set` + `expire` sequence is not atomic across processes). `--px` rounds up to whole seconds like PEXPIRE. The two options are mutually exclusive. A non-positive TTL is rejected with `ERR invalid expire time in 'set' command` before anything is written.
+- `--keep-ttl` — retain the key's existing TTL instead of discarding it (Redis `KEEPTTL`). Mutually exclusive with `--ex`/`--px`. `MSET` has no such option and always discards TTLs, as in Redis.
 
 **Output:** `OK`, or `(nil)` if `--nx` was given and the key already exists.
 
@@ -420,7 +421,9 @@ These operate across all data types.
 
 #### KEYS [pattern]
 
-Return all keys matching a glob-style pattern. `*` matches any sequence, `?` matches one character. If no pattern is given, return all keys. Expired keys are excluded.
+Return all keys matching a Redis-style glob: `*` matches any sequence, `?` one character, `[abc]` a class, `[^abc]` a negated class, `[a-z]` a range, and `\x` a literal `x` (so a literal backslash is `\\`). Matching is case-sensitive. If no pattern is given, return all keys. Expired keys are excluded.
+
+Implementation note: SQLite's `GLOB` operator has these exact semantics except for escaping (it has no escape character; a literal special is written as a one-character class such as `[*]`), so a pattern translates by rewriting `\*`, `\?`, `\[` to `[*]`, `[?]`, `[[]` and dropping other backslashes. Do **not** use SQL `LIKE`: it ignores ASCII case.
 
 Implementation: translate `*` to `%` and `?` to `_` for SQL LIKE, escaping any literal `%`, `_`, or `\` in the pattern (via `ESCAPE '\'`) so they match themselves. Query all four tables and deduplicate.
 
@@ -569,8 +572,6 @@ For CLI usage (one command per invocation), this is sufficient. A long-running s
 3. **No pub/sub** — no server means no subscribers.
 4. **No transactions (MULTI/EXEC)** — each CLI invocation is implicitly atomic. (Future: a batch/pipe mode could wrap multiple commands in a SQLite transaction.)
 5. **No Lua scripting.**
-6. **Pattern matching** uses SQL LIKE semantics, which differs from Redis glob in edge cases (e.g. character classes `[abc]` are not supported). `*`/`?` map to `%`/`_`; literal `%`, `_`, and `\` are escaped so they match themselves.
-7. **SET keeps a live TTL** — unlike Redis where SET removes the TTL, klyv preserves a still-valid TTL across a `SET`/`MSET` (use PERSIST to remove it). A *stale* (already-expired) TTL is cleared so the new value is visible.
 
 ### Implementation Requirements for Ports
 
