@@ -4,7 +4,7 @@ use crate::cli::{LineInput, OutputFormat, dispatch};
 use crate::reply::{CmdError, render};
 use clap::Parser;
 use rusqlite::Connection;
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 
 pub(crate) enum LineOutcome {
     Ok,
@@ -91,7 +91,7 @@ pub(crate) fn run_line(conn: &mut Connection, line: &str, format: OutputFormat) 
     match LineInput::try_parse_from(&tokens) {
         Ok(input) => match dispatch(conn, input.command) {
             Ok(reply) => {
-                print!("{}", render(&reply, format));
+                let _ = std::io::stdout().write_all(&render(&reply, format));
                 LineOutcome::Ok
             }
             Err(CmdError(msg)) => {

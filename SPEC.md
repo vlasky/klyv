@@ -24,9 +24,17 @@ WAL mode enables concurrent readers and improves write performance. `NORMAL` syn
 
 ### Schema
 
-The database contains four tables:
+Schema version **2**, recorded in `PRAGMA user_version = 2`. A `keyspace` catalogue holds one row per key — its type and expiry — and is the single source of truth for whether a key exists, what type it is and when it expires; the four per-type data tables hold only payload.
 
 ```sql
+CREATE TABLE IF NOT EXISTS keyspace (
+    key TEXT PRIMARY KEY,
+    type TEXT NOT NULL,          -- 'string' | 'list' | 'set' | 'hash'
+    expires_at INTEGER           -- Unix time in milliseconds; NULL = no expiry
+);
+CREATE INDEX IF NOT EXISTS idx_keyspace_expires
+    ON keyspace(expires_at) WHERE expires_at IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS strings (
     key TEXT PRIMARY KEY,
     value BLOB NOT NULL
@@ -51,20 +59,39 @@ CREATE TABLE IF NOT EXISTS hash_fields (
     value BLOB NOT NULL,
     UNIQUE(key, field)
 );
-
-CREATE TABLE IF NOT EXISTS expiry (
-    key TEXT PRIMARY KEY,
-    expires_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_expiry_at ON expiry(expires_at);
 ```
+
+**Invariants** every command must maintain:
+
+1. A key has payload rows in exactly one data table — the one for its catalogue `type`.
+2. A key has a catalogue row **iff** it has payload rows. Writes that create a key insert the catalogue row (`INSERT OR IGNORE`); writes that remove the last element of a list/set/hash delete it (and with it any TTL).
+3. Expiry lives only in `keyspace.expires_at`.
+
+**Value storage class:** a value that is valid UTF-8 is stored as TEXT, anything else as BLOB. The rule is deterministic per byte string so SQL equality comparisons on values (`LREM`, `LPOS`, set membership) stay consistent; readers accept either class.
+
+### Migration from schema v1
+
+A v1 database (klyv ≤ 0.2.0: `user_version` 0, no catalogue, a separate `expiry` table in whole seconds) is migrated in place, inside a `BEGIN IMMEDIATE` transaction, the first time it is opened:
+
+```sql
+INSERT OR IGNORE INTO keyspace (key, type) SELECT key, 'string' FROM strings;
+INSERT OR IGNORE INTO keyspace (key, type) SELECT DISTINCT key, 'list' FROM list_items;
+INSERT OR IGNORE INTO keyspace (key, type) SELECT DISTINCT key, 'set' FROM set_members;
+INSERT OR IGNORE INTO keyspace (key, type) SELECT DISTINCT key, 'hash' FROM hash_fields;
+UPDATE keyspace SET expires_at = (SELECT expires_at * 1000 FROM expiry WHERE expiry.key = keyspace.key);
+DROP TABLE expiry;
+-- then delete payload rows whose key is catalogued as another type
+PRAGMA user_version = 2;
+```
+
+The insert order reproduces the v1 type-lookup precedence for a key that illegally existed in several tables. Expiry rows with no data (orphans) are dropped. A database whose `user_version` is **newer** than the implementation supports must be refused, not opened.
 
 ### Design Rationale
 
-- **Separate tables per type** rather than a single table with a `type` column. Allows type-specific indexing and constraints. A key can only exist in one table; this invariant is enforced at the command level (see [Type Safety](#type-safety)) rather than by the schema.
+- **Catalogue plus per-type payload tables.** The `keyspace` table makes "does this key exist, what type is it, has it expired" one indexed read, and gives `KEYS`, `EXISTS`, `TYPE`, `DBSIZE` and every TTL command a single table to consult. Payload stays in per-type tables for type-specific indexing and constraints. The one-type-per-key invariant is kept by the catalogue (see [Type Safety](#type-safety)).
 - **`idx REAL` for lists** uses fractional indexing. LPUSH inserts at `MIN(idx) - 1.0`, RPUSH at `MAX(idx) + 1.0`, and LINSERT at the midpoint between the pivot and its neighbour. This avoids O(n) reindexing on pushes and mid-list inserts. An empty list starts at `idx = 0.0`. (See LINSERT for the renumbering fallback when midpoint precision runs out.)
 - **BLOB storage** for values and members. All values are stored as-is. Numeric operations parse the blob as UTF-8 text then as an integer.
-- **Separate expiry table** rather than a column on each data table. One table to check, works across all types. Uses absolute Unix timestamps (seconds).
+- **Expiry in the catalogue** as an absolute Unix timestamp in **milliseconds** (`NULL` = never), so `PEXPIRE`/`PTTL` have real millisecond precision and a key's TTL cannot outlive the key.
 - **Lazy expiry** — expired keys are filtered on read (return nil/empty) but not deleted from disk until `PURGE` is called explicitly. This keeps read operations as reads and avoids surprise writes.
 
 ## CLI Interface
@@ -107,7 +134,7 @@ INSERT OR REPLACE INTO strings (key, value) VALUES (?, ?);
 Options (mirroring Redis SET options):
 
 - `--nx` — only set if the key does not already exist (an expired key counts as absent). If the key exists, nothing is written.
-- `--ex seconds` / `--px milliseconds` — set a TTL atomically with the value, in the same transaction (the two-command `set` + `expire` sequence is not atomic across processes). `--px` rounds up to whole seconds like PEXPIRE. The two options are mutually exclusive. A non-positive TTL is rejected with `ERR invalid expire time in 'set' command` before anything is written.
+- `--ex seconds` / `--px milliseconds` — set a TTL atomically with the value, in the same transaction (the two-command `set` + `expire` sequence is not atomic across processes). The two options are mutually exclusive. A non-positive TTL is rejected with `ERR invalid expire time in 'set' command` before anything is written.
 - `--keep-ttl` — retain the key's existing TTL instead of discarding it (Redis `KEEPTTL`). Mutually exclusive with `--ex`/`--px`. `MSET` has no such option and always discards TTLs, as in Redis.
 
 **Output:** `OK`, or `(nil)` if `--nx` was given and the key already exists.
@@ -453,9 +480,9 @@ Rename a key, carrying its TTL with it. If `newkey` already exists it is overwri
 
 Expiry uses lazy filtering: expired keys are not deleted from disk but are invisible to all read commands, and are treated as absent by write commands (which drop the stale rows before proceeding). Use `PURGE` to reclaim disk space.
 
-A write that removes the last element of a list, set, or hash (`LPOP`/`RPOP`, `LREM`, `LTRIM`, `SREM`, `SPOP`, `HDEL`) deletes the key, and must delete its expiry row along with it — otherwise a later `SET` of the same key would silently inherit the stale TTL.
+A write that removes the last element of a list, set, or hash (`LPOP`/`RPOP`, `LREM`, `LTRIM`, `SREM`, `SPOP`, `HDEL`) deletes the key, and must delete its catalogue row (and so its TTL) along with it — otherwise a later `SET` of the same key would silently inherit the stale TTL.
 
-A key is expired once the current time **reaches** its `expires_at` — the check is `expires_at <= unixepoch()` (used by both reads and `PURGE`).
+A key is expired once the current time **reaches** its `expires_at` — the check is `expires_at <= now_ms` (used by reads, writes and `PURGE`). "Now" is taken once per command, in milliseconds, so every statement in a command agrees on it.
 
 #### EXPIRE key seconds
 
@@ -465,7 +492,7 @@ Set a key to expire `seconds` from now. The key must exist and not already be ex
 
 #### PEXPIRE key milliseconds
 
-Set a key to expire `milliseconds` from now. Internally rounds up to the nearest second (the expiry table stores seconds). A zero or negative value expires the key immediately.
+Set a key to expire `milliseconds` from now, with millisecond precision. A zero or negative value expires the key immediately.
 
 **Output:** `(integer) 1` or `(integer) 0`.
 
@@ -475,14 +502,24 @@ Set a key to expire at an absolute Unix timestamp (seconds since epoch). A times
 
 **Output:** `(integer) 1` or `(integer) 0`.
 
+#### PEXPIREAT key timestamp-ms
+
+As `EXPIREAT`, with the timestamp in milliseconds since the epoch.
+
+**Output:** `(integer) 1` or `(integer) 0`.
+
 #### TTL key
 
-Get the remaining time-to-live in seconds.
+Get the remaining time-to-live in seconds. The millisecond remainder is rounded to the nearest second, as in Redis (`(remaining_ms + 500) / 1000`), so `EXPIRE k 100` followed immediately by `TTL k` reports 100, not 99.
 
 **Output:**
 - `(integer) N` — seconds remaining (positive)
 - `(integer) -1` — key exists but has no expiry
 - `(integer) -2` — key does not exist (or is expired)
+
+#### PTTL key
+
+As `TTL`, in milliseconds (no rounding). Same `-1`/`-2` codes.
 
 #### PERSIST key
 
@@ -492,7 +529,7 @@ Remove the expiry from a key, making it persist indefinitely. A key that has alr
 
 #### PURGE
 
-Delete all expired keys from disk (data tables + expiry table). This is the only command that physically removes expired data. Runs in a single `BEGIN IMMEDIATE` transaction, so the scan for expired keys and their deletion see one consistent snapshot and cannot race a concurrent `EXPIRE`/`PERSIST`.
+Delete all expired keys from disk (payload rows + catalogue rows). This is the only command that physically removes expired data. Runs in a single `BEGIN IMMEDIATE` transaction, so the scan for expired keys and their deletion see one consistent snapshot and cannot race a concurrent `EXPIRE`/`PERSIST`.
 
 **Output:** `(integer) N` where N is the number of keys purged.
 
@@ -500,7 +537,7 @@ Delete all expired keys from disk (data tables + expiry table). This is the only
 
 #### DBSIZE
 
-Return the total number of distinct keys across all tables. Note: counts raw rows including expired keys that haven't been purged. Use `PURGE` first for an accurate count.
+Return the number of **live** keys: a single count over the catalogue excluding rows whose expiry has passed. (Unlike Redis, which may briefly count a logically expired key until its active sweep removes it, this is exact.)
 
 **Output:** `(integer) N`
 
@@ -559,7 +596,7 @@ The table above describes the default `human` format, which is the normative out
 
 SQLite in WAL mode supports multiple concurrent readers and a single writer. klyv does not implement its own locking — it relies on SQLite's built-in locking. Multiple processes can safely read from the same database simultaneously. Writes are serialized by SQLite's write lock.
 
-On open, `PRAGMA busy_timeout=5000` is set so a writer waits (up to 5s) for a competing lock instead of failing immediately with `SQLITE_BUSY`. Every command runs inside a single transaction. Mutating commands (`SET`/`MSET`, `GETDEL`, `DEL`, `INCR`/`INCRBY`/`DECR`/`DECRBY`, `APPEND`, `LPUSH`/`RPUSH`, `LPOP`/`RPOP`, `LREM`, `LSET`/`LTRIM`/`LINSERT`, `SADD`/`SREM`/`SPOP`, `HSET`/`HINCRBY`/`HDEL`, `RENAME`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`, `PERSIST`, `PURGE`, `FLUSHALL`) use `BEGIN IMMEDIATE` so the write lock is taken up front and the whole operation is atomic against other processes; on any error the transaction rolls back, leaving the data unchanged. Read-only commands use a deferred transaction, so a command that issues several queries (expiry check plus data reads, or scans across the per-type tables) sees one consistent snapshot rather than racing a concurrent writer between statements. The type-safety check (below) runs inside the write transaction so it cannot race a concurrent writer. For the TTL mutators, the existence/expiry check and the expiry write are serialized together, so a concurrent writer cannot leave an orphan TTL on a key that was deleted between the check and the write.
+On open, `PRAGMA busy_timeout=5000` is set so a writer waits (up to 5s) for a competing lock instead of failing immediately with `SQLITE_BUSY`. Every command runs inside a single transaction. Mutating commands (`SET`/`MSET`, `GETDEL`, `DEL`, `INCR`/`INCRBY`/`DECR`/`DECRBY`, `APPEND`, `LPUSH`/`RPUSH`, `LPOP`/`RPOP`, `LREM`, `LSET`/`LTRIM`/`LINSERT`, `SADD`/`SREM`/`SPOP`, `HSET`/`HINCRBY`/`HDEL`, `RENAME`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`, `PERSIST`, `PURGE`, `FLUSHALL`) use `BEGIN IMMEDIATE` so the write lock is taken up front and the whole operation is atomic against other processes; on any error the transaction rolls back, leaving the data unchanged. Read-only commands use a deferred transaction, so a command that issues several queries (expiry check plus data reads, or scans across the per-type tables) sees one consistent snapshot rather than racing a concurrent writer between statements. The type-safety check (below) runs inside the write transaction so it cannot race a concurrent writer. For the TTL mutators, the existence/expiry check and the expiry write are serialized together, so a concurrent writer cannot leave an orphan TTL on a key that was deleted between the check and the write.
 
 For CLI usage (one command per invocation), this is sufficient. A long-running server mode (future) would hold a single connection and serialize commands.
 
@@ -568,7 +605,7 @@ For CLI usage (one command per invocation), this is sufficient. A long-running s
 ### Differences from Redis
 
 1. **Persistence is default** — every command writes to disk immediately (via SQLite WAL). There is no in-memory-only mode.
-2. **Lazy expiry only** — expired keys are hidden from reads but not deleted until `PURGE` is called. Redis uses both lazy expiry and an active background sweep. PEXPIRE rounds up to seconds (no millisecond precision in storage).
+2. **Lazy expiry only** — expired keys are hidden from reads but not deleted until `PURGE` is called. Redis uses both lazy expiry and an active background sweep.
 3. **No pub/sub** — no server means no subscribers.
 4. **No transactions (MULTI/EXEC)** — each CLI invocation is implicitly atomic. (Future: a batch/pipe mode could wrap multiple commands in a SQLite transaction.)
 5. **No Lua scripting.**
@@ -577,7 +614,7 @@ For CLI usage (one command per invocation), this is sufficient. A long-running s
 
 A conforming implementation must:
 
-1. Use the exact SQLite schema above (for database file compatibility across implementations).
+1. Use the exact SQLite schema above, keep its invariants, stamp `PRAGMA user_version = 2`, migrate v1 files as described, and refuse files with a newer version (for database file compatibility across implementations).
 2. Set WAL mode and NORMAL synchronous.
 3. Require `--db` / `KLYV_DB` for database path (no default).
 4. Produce output matching the format table above (for script compatibility).

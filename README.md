@@ -166,8 +166,10 @@ klyv --format json get missing
 |---------|-------------|
 | `expire <key> <seconds>` | Set TTL in seconds |
 | `p-expire <key> <ms>` | Set TTL in milliseconds |
-| `expire-at <key> <ts>` | Set expiry at Unix timestamp |
+| `expire-at <key> <ts>` | Set expiry at Unix timestamp (seconds) |
+| `p-expire-at <key> <ms-ts>` | Set expiry at Unix timestamp (milliseconds) |
 | `ttl <key>` | Remaining seconds (-1 no expiry, -2 missing) |
+| `p-ttl <key>` | Remaining milliseconds (-1 no expiry, -2 missing) |
 | `persist <key>` | Remove expiry |
 | `purge` | Delete expired keys from disk |
 
@@ -179,7 +181,7 @@ klyv --format json get missing
 | `exists <key>` | Test existence (1/0) |
 | `type <key>` | string / list / set / hash / none |
 | `rename <key> <newkey>` | Rename key |
-| `db-size` | Total key count |
+| `db-size` | Live key count |
 | `flush-all` | Delete everything |
 
 ## Architecture
@@ -187,6 +189,7 @@ klyv --format json get missing
 - **SQLite WAL mode** for concurrent readers and safe writes; `busy_timeout` plus `BEGIN IMMEDIATE` transactions keep read-modify-write commands atomic across processes
 - **Fractional indexing** for O(1) list push (no reindexing)
 - **Lazy expiry** — expired keys are hidden from reads, treated as absent on write, and stay on disk until `purge`
+- **Schema versioning** — the file records its schema version; a database written by klyv 0.2.0 is migrated in place on first open
 - **Separate tables** per data type for type-specific indexing and constraints; a key holds one type at a time (mismatched commands fail with `WRONGTYPE`, Redis-style)
 
 ## Differences from Redis
