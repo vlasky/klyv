@@ -194,7 +194,6 @@ klyv --format json get missing
 1. Every write persists to disk immediately (no in-memory mode)
 2. Expired keys require explicit `purge` to reclaim space
 3. No pub/sub, transactions (MULTI/EXEC), or Lua scripting
-4. `SET` preserves a still-valid TTL (use `persist` to clear it); a stale one is dropped
 
 ## License
 
