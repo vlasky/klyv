@@ -4,8 +4,8 @@ use rusqlite::{Connection, params};
 
 /// Sets an absolute expiry (Unix ms) on a live key. Returns 0 for a missing
 /// or already-expired key, like Redis.
-fn set_expiry(conn: &Connection, key: &str, at_ms: i64) -> CmdResult {
-    if key_type(conn, key, now_ms())?.is_none() {
+fn set_expiry(conn: &Connection, key: &str, now: i64, at_ms: i64) -> CmdResult {
+    if key_type(conn, key, now)?.is_none() {
         return Ok(Reply::Int(0));
     }
     conn.execute(
@@ -16,23 +16,26 @@ fn set_expiry(conn: &Connection, key: &str, at_ms: i64) -> CmdResult {
 }
 
 pub(crate) fn cmd_expire(conn: &Connection, key: &str, seconds: i64) -> CmdResult {
+    let now = now_ms();
     set_expiry(
         conn,
         key,
-        now_ms().saturating_add(seconds.saturating_mul(1000)),
+        now,
+        now.saturating_add(seconds.saturating_mul(1000)),
     )
 }
 
 pub(crate) fn cmd_pexpire(conn: &Connection, key: &str, milliseconds: i64) -> CmdResult {
-    set_expiry(conn, key, now_ms().saturating_add(milliseconds))
+    let now = now_ms();
+    set_expiry(conn, key, now, now.saturating_add(milliseconds))
 }
 
 pub(crate) fn cmd_expireat(conn: &Connection, key: &str, timestamp: i64) -> CmdResult {
-    set_expiry(conn, key, timestamp.saturating_mul(1000))
+    set_expiry(conn, key, now_ms(), timestamp.saturating_mul(1000))
 }
 
 pub(crate) fn cmd_pexpireat(conn: &Connection, key: &str, timestamp_ms: i64) -> CmdResult {
-    set_expiry(conn, key, timestamp_ms)
+    set_expiry(conn, key, now_ms(), timestamp_ms)
 }
 
 /// Remaining lifetime in ms: Err(-2) missing/expired, Err(-1) no expiry.

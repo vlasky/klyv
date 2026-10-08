@@ -2,7 +2,9 @@
 
 A Redis-compatible embedded key-value store backed by SQLite. This document specifies the storage format, command semantics, and CLI interface to enable compatible implementations in any language.
 
-> **v0.1.1** clarifies type safety (`WRONGTYPE`), cross-type `SET`/`MSET`/`RENAME` overwrite, expiry-on-write and the `<=` expiry boundary, negative-TTL handling, integer-overflow errors, `KEYS` LIKE escaping, the `idx = 0.0` first-element rule, and `BEGIN IMMEDIATE`/`busy_timeout` atomicity. The on-disk schema is unchanged from v0.1.
+> **v0.1.1** clarifies type safety (`WRONGTYPE`), cross-type `SET`/`MSET`/`RENAME` overwrite, expiry-on-write and the `<=` expiry boundary, negative-TTL handling, integer-overflow errors, `KEYS` LIKE escaping, the `idx = 0.0` first-element rule, and `BEGIN IMMEDIATE`/`busy_timeout` atomicity.
+>
+> **Schema v2** (klyv 0.3) adds the `keyspace` catalogue and millisecond expiry, with an in-place migration from v1 files; see [Schema](#schema) and [Migration](#migration-from-schema-v1).
 
 ## Overview
 
@@ -86,7 +88,9 @@ PRAGMA user_version = 2;
 
 The insert order reproduces the v1 type-lookup precedence for a key that illegally existed in several tables. Expiry rows with no data (orphans) are dropped. A database whose `user_version` is **newer** than the implementation supports must be refused, not opened.
 
-**Downgrade guard.** Every v2 file (fresh or migrated) also carries a VIEW named `expiry`:
+The catalogue population and reconciliation steps are idempotent and also run whenever a v1-style `expiry` **table** is found in a v2 file — that only happens if a pre-v2 binary wrote to the file after migration — so such a file is repaired on the next open: stray payload rows are catalogued, the table's expiries folded in and the table dropped, and catalogue rows without payload removed.
+
+**Downgrade guard.** Every v2 file (fresh or migrated) also carries a VIEW named `expiry`, re-created if missing on every open:
 
 ```sql
 CREATE VIEW IF NOT EXISTS expiry AS
@@ -99,7 +103,7 @@ Its only purpose is to make pre-v2 implementations fail loudly: a v1 binary runs
 
 - **Catalogue plus per-type payload tables.** The `keyspace` table makes "does this key exist, what type is it, has it expired" one indexed read, and gives `KEYS`, `EXISTS`, `TYPE`, `DBSIZE` and every TTL command a single table to consult. Payload stays in per-type tables for type-specific indexing and constraints. The one-type-per-key invariant is kept by the catalogue (see [Type Safety](#type-safety)).
 - **`idx REAL` for lists** uses fractional indexing. LPUSH inserts at `MIN(idx) - 1.0`, RPUSH at `MAX(idx) + 1.0`, and LINSERT at the midpoint between the pivot and its neighbour. This avoids O(n) reindexing on pushes and mid-list inserts. An empty list starts at `idx = 0.0`. (See LINSERT for the renumbering fallback when midpoint precision runs out.)
-- **BLOB storage** for values and members. All values are stored as-is. Numeric operations parse the blob as UTF-8 text then as an integer.
+- **Value storage class.** Columns are declared BLOB; a value that is valid UTF-8 is stored as TEXT and any other byte string as BLOB (deterministic, so SQL equality on values is consistent). Readers accept either. Numeric operations parse the bytes as UTF-8 text then as an integer.
 - **Expiry in the catalogue** as an absolute Unix timestamp in **milliseconds** (`NULL` = never), so `PEXPIRE`/`PTTL` have real millisecond precision and a key's TTL cannot outlive the key.
 - **Lazy expiry** — expired keys are filtered on read (return nil/empty) but not deleted from disk until `PURGE` is called explicitly. This keeps read operations as reads and avoids surprise writes.
 
@@ -461,8 +465,6 @@ Return all keys matching a Redis-style glob: `*` matches any sequence, `?` one c
 
 Implementation note: SQLite's `GLOB` operator has these exact semantics except for escaping (it has no escape character; a literal special is written as a one-character class such as `[*]`), so a pattern translates by rewriting `\*`, `\?`, `\[` to `[*]`, `[?]`, `[[]` and dropping other backslashes. Do **not** use SQL `LIKE`: it ignores ASCII case.
 
-Implementation: translate `*` to `%` and `?` to `_` for SQL LIKE, escaping any literal `%`, `_`, or `\` in the pattern (via `ESCAPE '\'`) so they match themselves. Query all four tables and deduplicate.
-
 **Output:** Numbered lines or `(empty list)`.
 
 #### EXISTS key
@@ -599,7 +601,7 @@ The table above describes the default `human` format, which is the normative out
 | HGETALL | alternating field/value lines | object `{"field":"value"}` |
 | Empty collection | (nothing) | `[]` / `{}` |
 
-`raw` matches `redis-cli --raw` conventions, including its ambiguities (nil vs empty string). `json` is the unambiguous machine-readable format. Ports must implement `human`; `raw` and `json` are recommended but optional.
+`raw` matches `redis-cli --raw` conventions, including its ambiguities (nil vs empty string), and is the only byte-exact format. `json` is the unambiguous machine-readable format for text values; a value that is not valid UTF-8 is rendered lossily (invalid sequences become U+FFFD). Ports must implement `human`; `raw` and `json` are recommended but optional.
 
 ## Concurrency
 

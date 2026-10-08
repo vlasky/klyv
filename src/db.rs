@@ -64,30 +64,52 @@ const CREATE_V2: &str = "
     );
 ";
 
+/// Catalogue rows for any payload rows that lack one. Run for a version-0
+/// (v1) file and whenever a v1-style `expiry` table is present — the latter
+/// means a pre-v2 binary wrote to this file after migration (it recreates the
+/// table and writes payload around the catalogue), and this folds its writes
+/// back in. `INSERT OR IGNORE` in this order gives a key that illegally
+/// exists in several tables the type the v1 lookup order would have reported.
+const POPULATE_CATALOGUE: &str = "
+    INSERT OR IGNORE INTO keyspace (key, type) SELECT key, 'string' FROM strings;
+    INSERT OR IGNORE INTO keyspace (key, type) SELECT DISTINCT key, 'list' FROM list_items;
+    INSERT OR IGNORE INTO keyspace (key, type) SELECT DISTINCT key, 'set' FROM set_members;
+    INSERT OR IGNORE INTO keyspace (key, type) SELECT DISTINCT key, 'hash' FROM hash_fields;
+";
+
+/// Folds a v1 `expiry` table (whole seconds) into the catalogue as
+/// milliseconds, clamped so the multiplication cannot overflow into a REAL,
+/// and only for keys the table mentions, so other keys keep their expiry.
+const FOLD_V1_EXPIRY: &str = "
+    UPDATE keyspace SET expires_at = (
+        SELECT CASE
+            WHEN e.expires_at >  9223372036854775 THEN  9223372036854775807
+            WHEN e.expires_at < -9223372036854775 THEN -9223372036854775808
+            ELSE e.expires_at * 1000
+        END FROM expiry e WHERE e.key = keyspace.key)
+    WHERE key IN (SELECT key FROM expiry);
+    DROP TABLE expiry;
+";
+
+/// Restores the catalogue invariants after population: payload in the wrong
+/// table for its type goes, and catalogue rows with no payload go.
+const RECONCILE: &str = "
+    DELETE FROM strings     WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'string');
+    DELETE FROM list_items  WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'list');
+    DELETE FROM set_members WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'set');
+    DELETE FROM hash_fields WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'hash');
+    DELETE FROM keyspace WHERE
+        (type = 'string' AND key NOT IN (SELECT key FROM strings)) OR
+        (type = 'list'   AND key NOT IN (SELECT key FROM list_items)) OR
+        (type = 'set'    AND key NOT IN (SELECT key FROM set_members)) OR
+        (type = 'hash'   AND key NOT IN (SELECT key FROM hash_fields));
+";
+
 /// See the module docs: makes pre-v2 binaries fail to open the file.
 const DOWNGRADE_GUARD: &str = "
     CREATE VIEW IF NOT EXISTS expiry AS
         SELECT key, expires_at / 1000 AS expires_at FROM keyspace
         WHERE expires_at IS NOT NULL;
-";
-
-/// Builds the catalogue from the v1 data tables and folds the seconds-based
-/// `expiry` table into it as milliseconds. `INSERT OR IGNORE` in this order
-/// gives a key that (illegally) existed in several tables the same type the
-/// v1 lookup order would have reported; its rows in other tables are then
-/// dropped so the v2 invariant holds.
-const MIGRATE_V1_TO_V2: &str = "
-    INSERT OR IGNORE INTO keyspace (key, type) SELECT key, 'string' FROM strings;
-    INSERT OR IGNORE INTO keyspace (key, type) SELECT DISTINCT key, 'list' FROM list_items;
-    INSERT OR IGNORE INTO keyspace (key, type) SELECT DISTINCT key, 'set' FROM set_members;
-    INSERT OR IGNORE INTO keyspace (key, type) SELECT DISTINCT key, 'hash' FROM hash_fields;
-    UPDATE keyspace SET expires_at =
-        (SELECT expires_at * 1000 FROM expiry WHERE expiry.key = keyspace.key);
-    DROP TABLE expiry;
-    DELETE FROM strings     WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'string');
-    DELETE FROM list_items  WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'list');
-    DELETE FROM set_members WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'set');
-    DELETE FROM hash_fields WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'hash');
 ";
 
 pub(crate) fn open_db(path: &Path) -> Result<Connection, Box<dyn std::error::Error>> {
@@ -101,31 +123,32 @@ pub(crate) fn open_db(path: &Path) -> Result<Connection, Box<dyn std::error::Err
     // database at once cannot both try to migrate it.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    match version {
-        0 => {
-            let has_v1 = tx
-                .query_row(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'expiry'",
-                    [],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some();
-            tx.execute_batch(CREATE_V2)?;
-            if has_v1 {
-                tx.execute_batch(MIGRATE_V1_TO_V2)?;
-            }
-            // After any v1 `expiry` table is gone, so the view can take its name.
-            tx.execute_batch(DOWNGRADE_GUARD)?;
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    if version > SCHEMA_VERSION {
+        return Err(format!(
+            "schema version {version} is newer than this klyv supports ({SCHEMA_VERSION})"
+        )
+        .into());
+    }
+    tx.execute_batch(CREATE_V2)?;
+    let has_v1_expiry = tx
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'expiry'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if version < SCHEMA_VERSION || has_v1_expiry {
+        tx.execute_batch(POPULATE_CATALOGUE)?;
+        if has_v1_expiry {
+            tx.execute_batch(FOLD_V1_EXPIRY)?;
         }
-        SCHEMA_VERSION => {}
-        newer => {
-            return Err(format!(
-                "schema version {newer} is newer than this klyv supports ({SCHEMA_VERSION})"
-            )
-            .into());
-        }
+        tx.execute_batch(RECONCILE)?;
+    }
+    // Idempotent, and only possible once any v1 table of that name is gone.
+    tx.execute_batch(DOWNGRADE_GUARD)?;
+    if version != SCHEMA_VERSION {
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     tx.commit()?;
     Ok(conn)

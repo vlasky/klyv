@@ -96,7 +96,7 @@ klyv --format json get missing
 # null
 ```
 
-`raw` prints bare values one per line (nil is an empty line, like `redis-cli --raw`). `json` prints a single JSON value: strings, integers as numbers, nil as `null`, list/set results as arrays, `h-get-all` as an object. JSON is the unambiguous choice for scripts — in the other formats a stored value of `(nil)` or an empty string is indistinguishable from a missing key. Errors go to stderr with exit code 1 in every format.
+`raw` prints bare values one per line (nil is an empty line, like `redis-cli --raw`). `json` prints a single JSON value: strings, integers as numbers, nil as `null`, list/set results as arrays, `h-get-all` as an object. JSON is the unambiguous choice for scripts — in the other formats a stored value of `(nil)` or an empty string is indistinguishable from a missing key. (`raw` is the only byte-exact format; `json` and `human` render invalid UTF-8 lossily.) Errors go to stderr with exit code 1 in every format.
 
 ### Strings
 
