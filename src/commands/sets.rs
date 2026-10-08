@@ -2,11 +2,28 @@ use crate::db::*;
 use crate::reply::*;
 use rusqlite::{Connection, OptionalExtension, params};
 
-// --- Set commands ---
+const KIND: &str = "set";
+
+fn empty() -> Reply {
+    Reply::Array(vec![], Empty::Set)
+}
+
+fn members(
+    conn: &Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> rusqlite::Result<Reply> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows: Vec<Vec<u8>> = stmt
+        .query_map(params, |row| bytes_col(row, 0))?
+        .collect::<Result<_, _>>()?;
+    Ok(Reply::Array(rows, Empty::Set))
+}
 
 pub(crate) fn cmd_sadd(conn: &Connection, key: &str, members: &[String]) -> CmdResult {
-    ensure_type(conn, key, "set")?;
-    drop_if_expired(conn, key)?;
+    let now = now_ms();
+    ensure_type(conn, key, KIND, now)?;
+    drop_if_expired(conn, key, now)?;
     let mut count = 0i64;
     for member in members {
         let inserted = conn.execute(
@@ -15,12 +32,14 @@ pub(crate) fn cmd_sadd(conn: &Connection, key: &str, members: &[String]) -> CmdR
         )?;
         count += inserted as i64;
     }
+    claim(conn, key, KIND)?;
     Ok(Reply::Int(count))
 }
 
 pub(crate) fn cmd_srem(conn: &Connection, key: &str, members: &[String]) -> CmdResult {
-    ensure_type(conn, key, "set")?;
-    drop_if_expired(conn, key)?;
+    let now = now_ms();
+    ensure_type(conn, key, KIND, now)?;
+    drop_if_expired(conn, key, now)?;
     let mut count = 0i64;
     for member in members {
         let deleted = conn.execute(
@@ -30,26 +49,24 @@ pub(crate) fn cmd_srem(conn: &Connection, key: &str, members: &[String]) -> CmdR
         count += deleted as i64;
     }
     if count > 0 {
-        drop_expiry_if_empty(conn, key)?;
+        release_if_empty(conn, key, KIND)?;
     }
     Ok(Reply::Int(count))
 }
 
 pub(crate) fn cmd_smembers(conn: &Connection, key: &str) -> CmdResult {
-    ensure_type(conn, key, "set")?;
-    if is_expired(conn, key)? {
-        return Ok(Reply::Array(vec![], Empty::Set));
+    if !check_type(conn, key, KIND, now_ms())? {
+        return Ok(empty());
     }
-    let mut stmt = conn.prepare("SELECT member FROM set_members WHERE key = ?1")?;
-    let rows: Vec<String> = stmt
-        .query_map(params![key], |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
-    Ok(Reply::Array(rows, Empty::Set))
+    Ok(members(
+        conn,
+        "SELECT member FROM set_members WHERE key = ?1",
+        &[&key],
+    )?)
 }
 
 pub(crate) fn cmd_sismember(conn: &Connection, key: &str, member: &str) -> CmdResult {
-    ensure_type(conn, key, "set")?;
-    if is_expired(conn, key)? {
+    if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Int(0));
     }
     let exists = conn
@@ -64,8 +81,7 @@ pub(crate) fn cmd_sismember(conn: &Connection, key: &str, member: &str) -> CmdRe
 }
 
 pub(crate) fn cmd_scard(conn: &Connection, key: &str) -> CmdResult {
-    ensure_type(conn, key, "set")?;
-    if is_expired(conn, key)? {
+    if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Int(0));
     }
     let count: i64 = conn.query_row(
@@ -77,138 +93,110 @@ pub(crate) fn cmd_scard(conn: &Connection, key: &str) -> CmdResult {
 }
 
 pub(crate) fn cmd_spop(conn: &Connection, key: &str) -> CmdResult {
-    ensure_type(conn, key, "set")?;
-    drop_if_expired(conn, key)?;
-    let picked: Option<(i64, String)> = conn
+    let now = now_ms();
+    ensure_type(conn, key, KIND, now)?;
+    drop_if_expired(conn, key, now)?;
+    let picked: Option<(i64, Vec<u8>)> = conn
         .query_row(
             "SELECT rowid, member FROM set_members WHERE key = ?1 ORDER BY RANDOM() LIMIT 1",
             params![key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, bytes_col(row, 1)?)),
         )
         .optional()?;
     match picked {
         Some((rowid, member)) => {
             conn.execute("DELETE FROM set_members WHERE rowid = ?1", params![rowid])?;
-            drop_expiry_if_empty(conn, key)?;
+            release_if_empty(conn, key, KIND)?;
             Ok(Reply::Bulk(member))
         }
         None => Ok(Reply::Nil),
     }
 }
 
-pub(crate) fn cmd_sunion(conn: &Connection, keys: &[String]) -> CmdResult {
+/// Type-checks every input key (WRONGTYPE on any mismatch) and returns the
+/// ones that are live; missing/expired input sets are treated as empty.
+fn live_sets<'a>(
+    conn: &Connection,
+    keys: &'a [String],
+    now: i64,
+) -> Result<Vec<&'a String>, CmdError> {
+    let mut live = Vec::with_capacity(keys.len());
     for k in keys {
-        ensure_type(conn, k, "set")?;
-    }
-    // Expired input sets are treated as empty and contribute nothing.
-    let mut live: Vec<&String> = Vec::with_capacity(keys.len());
-    for k in keys {
-        if !is_expired(conn, k)? {
+        if check_type(conn, k, KIND, now)? {
             live.push(k);
         }
     }
+    Ok(live)
+}
+
+fn placeholders(n: usize, start: usize) -> String {
+    (0..n)
+        .map(|i| format!("?{}", i + start))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(crate) fn cmd_sunion(conn: &Connection, keys: &[String]) -> CmdResult {
+    let live = live_sets(conn, keys, now_ms())?;
     if live.is_empty() {
-        return Ok(Reply::Array(vec![], Empty::Set));
+        return Ok(empty());
     }
-    let placeholders: Vec<String> = live
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 1))
-        .collect();
     let sql = format!(
         "SELECT DISTINCT member FROM set_members WHERE key IN ({})",
-        placeholders.join(", ")
+        placeholders(live.len(), 1)
     );
-    let mut stmt = conn.prepare(&sql)?;
     let params: Vec<&dyn rusqlite::ToSql> =
         live.iter().map(|k| *k as &dyn rusqlite::ToSql).collect();
-    let rows: Vec<String> = stmt
-        .query_map(params.as_slice(), |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
-    Ok(Reply::Array(rows, Empty::Set))
+    Ok(members(conn, &sql, &params)?)
 }
 
 pub(crate) fn cmd_sinter(conn: &Connection, keys: &[String]) -> CmdResult {
-    for k in keys {
-        ensure_type(conn, k, "set")?;
-    }
     if keys.is_empty() {
-        return Ok(Reply::Array(vec![], Empty::Set));
+        return Ok(empty());
     }
-    // Any expired/missing input set makes the intersection empty.
-    for k in keys {
-        if is_expired(conn, k)? {
-            return Ok(Reply::Array(vec![], Empty::Set));
-        }
+    // Any missing/expired input set makes the intersection empty.
+    let live = live_sets(conn, keys, now_ms())?;
+    if live.len() != keys.len() {
+        return Ok(empty());
     }
     // Dedup keys so repeated args don't break the COUNT(DISTINCT key) test.
-    let mut keys: Vec<&String> = keys.iter().collect();
+    let mut keys: Vec<&String> = live;
     keys.sort();
     keys.dedup();
-    let num_keys = keys.len();
-    let placeholders: Vec<String> = keys
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 1))
-        .collect();
+    let n = keys.len();
     let sql = format!(
         "SELECT member FROM set_members WHERE key IN ({}) GROUP BY member HAVING COUNT(DISTINCT key) = ?{}",
-        placeholders.join(", "),
-        num_keys + 1
+        placeholders(n, 1),
+        n + 1
     );
-    let mut stmt = conn.prepare(&sql)?;
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = keys
-        .iter()
-        .map(|k| Box::new((*k).clone()) as Box<dyn rusqlite::ToSql>)
-        .collect();
-    params.push(Box::new(num_keys as i64));
-    let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let rows: Vec<String> = stmt
-        .query_map(params_ref.as_slice(), |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
-    Ok(Reply::Array(rows, Empty::Set))
+    let count = n as i64;
+    let mut params: Vec<&dyn rusqlite::ToSql> =
+        keys.iter().map(|k| *k as &dyn rusqlite::ToSql).collect();
+    params.push(&count);
+    Ok(members(conn, &sql, &params)?)
 }
 
 pub(crate) fn cmd_sdiff(conn: &Connection, keys: &[String]) -> CmdResult {
-    for k in keys {
-        ensure_type(conn, k, "set")?;
+    let Some((first, rest)) = keys.split_first() else {
+        return Ok(empty());
+    };
+    let now = now_ms();
+    if !check_type(conn, first, KIND, now)? {
+        // Still type-check the others so a wrong-type argument is an error.
+        live_sets(conn, rest, now)?;
+        return Ok(empty());
     }
-    if keys.is_empty() {
-        return Ok(Reply::Array(vec![], Empty::Set));
-    }
-    let first = &keys[0];
-    if is_expired(conn, first)? {
-        return Ok(Reply::Array(vec![], Empty::Set));
-    }
-    if keys.len() == 1 {
-        return cmd_smembers(conn, first);
-    }
-    // Expired "other" sets subtract nothing, so drop them.
-    let mut rest: Vec<&String> = Vec::with_capacity(keys.len() - 1);
-    for k in &keys[1..] {
-        if !is_expired(conn, k)? {
-            rest.push(k);
-        }
-    }
+    // Missing/expired "other" sets subtract nothing, so drop them.
+    let rest = live_sets(conn, rest, now)?;
     if rest.is_empty() {
         return cmd_smembers(conn, first);
     }
-    let placeholders: Vec<String> = rest
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 2))
-        .collect();
     let sql = format!(
-        "SELECT member FROM set_members WHERE key = ?1 AND member NOT IN (SELECT member FROM set_members WHERE key IN ({}))",
-        placeholders.join(", ")
+        "SELECT member FROM set_members WHERE key = ?1 AND member NOT IN (
+            SELECT member FROM set_members WHERE key IN ({}))",
+        placeholders(rest.len(), 2)
     );
-    let mut stmt = conn.prepare(&sql)?;
     let mut params: Vec<&dyn rusqlite::ToSql> = vec![first as &dyn rusqlite::ToSql];
-    for k in &rest {
-        params.push(*k as &dyn rusqlite::ToSql);
-    }
-    let rows: Vec<String> = stmt
-        .query_map(params.as_slice(), |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
-    Ok(Reply::Array(rows, Empty::Set))
+    params.extend(rest.iter().map(|k| *k as &dyn rusqlite::ToSql));
+    Ok(members(conn, &sql, &params)?)
 }

@@ -15,9 +15,8 @@
 //!   differ (e.g. Redis appends "or out of range" to integer-parse errors).
 //! - Unordered replies (sets, keys, hashes) are sorted on both sides.
 //!
-//! Deliberate klyv deviations documented in SPEC.md are not exercised here:
-//! db-size counting unpurged expired keys, purge itself, and p-expire
-//! second-rounding.
+//! Not exercised here: purge (klyv-only) and db-size (Redis may briefly count
+//! a logically expired key until its active sweep runs, so results can race).
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -641,6 +640,22 @@ fn scenarios() -> Vec<(&'static str, Vec<Step>)> {
                     Exact,
                 ),
                 step(&["exists", "k"], &["EXISTS", "k"], Exact),
+                step(&["p-ttl", "missing"], &["PTTL", "missing"], Exact),
+                step(&["persist", "k"], &["PERSIST", "k"], Exact),
+                step(&["p-ttl", "k"], &["PTTL", "k"], Exact),
+                step(
+                    &["p-expire-at", "k", "9999999999999"],
+                    &["PEXPIREAT", "k", "9999999999999"],
+                    Exact,
+                ),
+                step(
+                    &["p-expire-at", "missing", "9999999999999"],
+                    &["PEXPIREAT", "missing", "9999999999999"],
+                    Exact,
+                ),
+                step(&["p-expire", "k", "0"], &["PEXPIRE", "k", "0"], Exact),
+                step(&["exists", "k"], &["EXISTS", "k"], Exact),
+                step(&["ttl", "k"], &["TTL", "k"], Exact),
             ],
         ),
         (

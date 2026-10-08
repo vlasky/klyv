@@ -9,7 +9,7 @@ use cli::{Cli, dispatch};
 use db::open_db;
 use reply::{CmdError, render};
 use shell::{pipe, repl};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 
 fn main() {
     let cli = Cli::parse();
@@ -22,7 +22,9 @@ fn main() {
     };
     match cli.command {
         Some(command) => match dispatch(&mut conn, command) {
-            Ok(reply) => print!("{}", render(&reply, cli.format)),
+            Ok(reply) => {
+                let _ = std::io::stdout().write_all(&render(&reply, cli.format));
+            }
             Err(CmdError(msg)) => {
                 eprintln!("{msg}");
                 std::process::exit(1);

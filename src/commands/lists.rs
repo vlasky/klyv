@@ -3,13 +3,14 @@ use crate::db::*;
 use crate::reply::*;
 use rusqlite::{Connection, OptionalExtension, params};
 
-// --- List commands ---
+const KIND: &str = "list";
+
+fn empty() -> Reply {
+    Reply::Array(vec![], Empty::List)
+}
 
 // Returns (element count, min idx, max idx) for a list in one query.
-pub(crate) fn list_bounds(
-    conn: &Connection,
-    key: &str,
-) -> Result<(i64, Option<f64>, Option<f64>), rusqlite::Error> {
+fn list_bounds(conn: &Connection, key: &str) -> rusqlite::Result<(i64, Option<f64>, Option<f64>)> {
     conn.query_row(
         "SELECT COUNT(*), MIN(idx), MAX(idx) FROM list_items WHERE key = ?1",
         params![key],
@@ -17,52 +18,52 @@ pub(crate) fn list_bounds(
     )
 }
 
-pub(crate) fn cmd_lpush(conn: &Connection, key: &str, values: &[String]) -> CmdResult {
-    ensure_type(conn, key, "list")?;
-    drop_if_expired(conn, key)?;
-    let (count, min_idx, _) = list_bounds(conn, key)?;
-    let mut idx = min_idx.map_or(0.0, |m| m - 1.0);
+fn push(conn: &Connection, key: &str, values: &[String], head: bool) -> CmdResult {
+    let now = now_ms();
+    ensure_type(conn, key, KIND, now)?;
+    drop_if_expired(conn, key, now)?;
+    let (count, min_idx, max_idx) = list_bounds(conn, key)?;
+    let (mut idx, step) = if head {
+        (min_idx.map_or(0.0, |m| m - 1.0), -1.0)
+    } else {
+        (max_idx.map_or(0.0, |m| m + 1.0), 1.0)
+    };
     for value in values {
         conn.execute(
             "INSERT INTO list_items (key, idx, value) VALUES (?1, ?2, ?3)",
             params![key, idx, value],
         )?;
-        idx -= 1.0;
+        idx += step;
     }
+    claim(conn, key, KIND)?;
     Ok(Reply::Int(count + values.len() as i64))
+}
+
+pub(crate) fn cmd_lpush(conn: &Connection, key: &str, values: &[String]) -> CmdResult {
+    push(conn, key, values, true)
 }
 
 pub(crate) fn cmd_rpush(conn: &Connection, key: &str, values: &[String]) -> CmdResult {
-    ensure_type(conn, key, "list")?;
-    drop_if_expired(conn, key)?;
-    let (count, _, max_idx) = list_bounds(conn, key)?;
-    let mut idx = max_idx.map_or(0.0, |m| m + 1.0);
-    for value in values {
-        conn.execute(
-            "INSERT INTO list_items (key, idx, value) VALUES (?1, ?2, ?3)",
-            params![key, idx, value],
-        )?;
-        idx += 1.0;
-    }
-    Ok(Reply::Int(count + values.len() as i64))
+    push(conn, key, values, false)
 }
 
 pub(crate) fn cmd_pop(conn: &Connection, key: &str, order: &str) -> CmdResult {
-    ensure_type(conn, key, "list")?;
-    drop_if_expired(conn, key)?;
-    let result: Option<(i64, String)> = conn
+    let now = now_ms();
+    ensure_type(conn, key, KIND, now)?;
+    drop_if_expired(conn, key, now)?;
+    let result: Option<(i64, Vec<u8>)> = conn
         .query_row(
             &format!(
                 "SELECT rowid, value FROM list_items WHERE key = ?1 ORDER BY idx {order} LIMIT 1"
             ),
             params![key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, bytes_col(row, 1)?)),
         )
         .optional()?;
     match result {
         Some((rowid, value)) => {
             conn.execute("DELETE FROM list_items WHERE rowid = ?1", params![rowid])?;
-            drop_expiry_if_empty(conn, key)?;
+            release_if_empty(conn, key, KIND)?;
             Ok(Reply::Bulk(value))
         }
         None => Ok(Reply::Nil),
@@ -72,7 +73,7 @@ pub(crate) fn cmd_pop(conn: &Connection, key: &str, order: &str) -> CmdResult {
 // Redis range normalization: a negative start clamps to the head, but a stop
 // that is still negative after adding len means the range ends before the
 // head — the caller must treat s > e as empty, not clamp e back to 0.
-pub(crate) fn normalize_range(start: i64, stop: i64, len: i64) -> (i64, i64) {
+fn normalize_range(start: i64, stop: i64, len: i64) -> (i64, i64) {
     let s = if start < 0 {
         (len + start).max(0)
     } else {
@@ -87,45 +88,32 @@ pub(crate) fn normalize_range(start: i64, stop: i64, len: i64) -> (i64, i64) {
 }
 
 pub(crate) fn cmd_lrange(conn: &Connection, key: &str, start: i64, stop: i64) -> CmdResult {
-    ensure_type(conn, key, "list")?;
-    if is_expired(conn, key)? {
-        return Ok(Reply::Array(vec![], Empty::List));
+    if !check_type(conn, key, KIND, now_ms())? {
+        return Ok(empty());
     }
-    let len: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM list_items WHERE key = ?1",
-        params![key],
-        |row| row.get(0),
-    )?;
-
+    let (len, _, _) = list_bounds(conn, key)?;
     if len == 0 {
-        return Ok(Reply::Array(vec![], Empty::List));
+        return Ok(empty());
     }
-
     let (s, e) = normalize_range(start, stop, len);
     if s > e {
-        return Ok(Reply::Array(vec![], Empty::List));
+        return Ok(empty());
     }
-
     let limit = e - s + 1;
     let mut stmt = conn.prepare(
         "SELECT value FROM list_items WHERE key = ?1 ORDER BY idx ASC LIMIT ?2 OFFSET ?3",
     )?;
-    let rows: Vec<String> = stmt
-        .query_map(params![key, limit, s], |row| row.get(0))?
+    let rows: Vec<Vec<u8>> = stmt
+        .query_map(params![key, limit, s], |row| bytes_col(row, 0))?
         .collect::<Result<_, _>>()?;
     Ok(Reply::Array(rows, Empty::List))
 }
 
 pub(crate) fn cmd_llen(conn: &Connection, key: &str) -> CmdResult {
-    ensure_type(conn, key, "list")?;
-    if is_expired(conn, key)? {
+    if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Int(0));
     }
-    let len: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM list_items WHERE key = ?1",
-        params![key],
-        |row| row.get(0),
-    )?;
+    let (len, _, _) = list_bounds(conn, key)?;
     Ok(Reply::Int(len))
 }
 
@@ -135,9 +123,9 @@ pub(crate) fn cmd_lrem(conn: &Connection, key: &str, count: i64, value: &str) ->
         std::cmp::Ordering::Less => ("DESC", count.unsigned_abs() as usize),
         std::cmp::Ordering::Equal => ("ASC", usize::MAX),
     };
-
-    ensure_type(conn, key, "list")?;
-    drop_if_expired(conn, key)?;
+    let now = now_ms();
+    ensure_type(conn, key, KIND, now)?;
+    drop_if_expired(conn, key, now)?;
     let sql =
         format!("SELECT rowid FROM list_items WHERE key = ?1 AND value = ?2 ORDER BY idx {order}");
     let rowids: Vec<i64> = {
@@ -146,20 +134,18 @@ pub(crate) fn cmd_lrem(conn: &Connection, key: &str, count: i64, value: &str) ->
             .take(limit)
             .collect::<Result<_, _>>()?
     };
-
     let removed = rowids.len() as i64;
     for rowid in &rowids {
         conn.execute("DELETE FROM list_items WHERE rowid = ?1", params![rowid])?;
     }
     if removed > 0 {
-        drop_expiry_if_empty(conn, key)?;
+        release_if_empty(conn, key, KIND)?;
     }
     Ok(Reply::Int(removed))
 }
 
 pub(crate) fn cmd_lpos(conn: &Connection, key: &str, value: &str) -> CmdResult {
-    ensure_type(conn, key, "list")?;
-    if is_expired(conn, key)? {
+    if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Nil);
     }
     let mut stmt = conn.prepare("SELECT value FROM list_items WHERE key = ?1 ORDER BY idx ASC")?;
@@ -167,7 +153,7 @@ pub(crate) fn cmd_lpos(conn: &Connection, key: &str, value: &str) -> CmdResult {
     let mut rows = stmt.query(params![key])?;
     let mut pos: i64 = 0;
     while let Some(row) = rows.next()? {
-        if row.get::<_, String>(0)? == value {
+        if bytes_col(row, 0)? == value.as_bytes() {
             return Ok(Reply::Int(pos));
         }
         pos += 1;
@@ -176,36 +162,33 @@ pub(crate) fn cmd_lpos(conn: &Connection, key: &str, value: &str) -> CmdResult {
 }
 
 // Normalizes a possibly-negative list index to 0-based; None if out of range.
-pub(crate) fn normalize_index(index: i64, len: i64) -> Option<i64> {
+fn normalize_index(index: i64, len: i64) -> Option<i64> {
     let i = if index < 0 { len + index } else { index };
     (0..len).contains(&i).then_some(i)
 }
 
 pub(crate) fn cmd_lindex(conn: &Connection, key: &str, index: i64) -> CmdResult {
-    ensure_type(conn, key, "list")?;
-    if is_expired(conn, key)? {
+    if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Nil);
     }
     let (len, _, _) = list_bounds(conn, key)?;
     let Some(i) = normalize_index(index, len) else {
         return Ok(Reply::Nil);
     };
-    let value: Option<String> = conn
+    let value: Option<Vec<u8>> = conn
         .query_row(
             "SELECT value FROM list_items WHERE key = ?1 ORDER BY idx ASC LIMIT 1 OFFSET ?2",
             params![key, i],
-            |row| row.get(0),
+            |row| bytes_col(row, 0),
         )
         .optional()?;
-    Ok(match value {
-        Some(v) => Reply::Bulk(v),
-        None => Reply::Nil,
-    })
+    Ok(value.map_or(Reply::Nil, Reply::Bulk))
 }
 
 pub(crate) fn cmd_lset(conn: &Connection, key: &str, index: i64, value: &str) -> CmdResult {
-    ensure_type(conn, key, "list")?;
-    drop_if_expired(conn, key)?;
+    let now = now_ms();
+    ensure_type(conn, key, KIND, now)?;
+    drop_if_expired(conn, key, now)?;
     let (len, _, _) = list_bounds(conn, key)?;
     if len == 0 {
         return Err(CmdError::new("ERR no such key"));
@@ -224,8 +207,9 @@ pub(crate) fn cmd_lset(conn: &Connection, key: &str, index: i64, value: &str) ->
 }
 
 pub(crate) fn cmd_ltrim(conn: &Connection, key: &str, start: i64, stop: i64) -> CmdResult {
-    ensure_type(conn, key, "list")?;
-    drop_if_expired(conn, key)?;
+    let now = now_ms();
+    ensure_type(conn, key, KIND, now)?;
+    drop_if_expired(conn, key, now)?;
     let (len, _, _) = list_bounds(conn, key)?;
     if len == 0 {
         return Ok(Reply::Simple("OK"));
@@ -233,8 +217,7 @@ pub(crate) fn cmd_ltrim(conn: &Connection, key: &str, start: i64, stop: i64) -> 
     let (s, e) = normalize_range(start, stop, len);
     if s > e {
         // Everything trimmed away: the key ceases to exist.
-        conn.execute("DELETE FROM list_items WHERE key = ?1", params![key])?;
-        conn.execute("DELETE FROM expiry WHERE key = ?1", params![key])?;
+        remove_key(conn, key)?;
         return Ok(Reply::Simple("OK"));
     }
     // Delete rows outside positions [s, e] by rank.
@@ -255,7 +238,7 @@ pub(crate) fn cmd_ltrim(conn: &Connection, key: &str, start: i64, stop: i64) -> 
 
 // Rewrites a list's fractional indexes as sequential integers. Called when
 // repeated LINSERTs into the same gap exhaust f64 midpoint precision.
-pub(crate) fn renumber_list(conn: &Connection, key: &str) -> Result<(), rusqlite::Error> {
+fn renumber_list(conn: &Connection, key: &str) -> rusqlite::Result<()> {
     let rowids: Vec<i64> = {
         let mut stmt =
             conn.prepare("SELECT rowid FROM list_items WHERE key = ?1 ORDER BY idx ASC")?;
@@ -278,8 +261,9 @@ pub(crate) fn cmd_linsert(
     pivot: &str,
     value: &str,
 ) -> CmdResult {
-    ensure_type(conn, key, "list")?;
-    drop_if_expired(conn, key)?;
+    let now = now_ms();
+    ensure_type(conn, key, KIND, now)?;
+    drop_if_expired(conn, key, now)?;
     let (len, _, _) = list_bounds(conn, key)?;
     if len == 0 {
         return Ok(Reply::Int(0));

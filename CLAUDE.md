@@ -78,9 +78,11 @@ h-len <key>                         Number of fields
 ### TTL / Expiry
 ```
 expire <key> <seconds>          Set TTL in seconds
-p-expire <key> <milliseconds>   Set TTL in ms (rounds up to seconds)
-expire-at <key> <timestamp>     Set expiry at Unix timestamp
-ttl <key>                       Remaining seconds (-1=no expiry, -2=missing/expired)
+p-expire <key> <milliseconds>   Set TTL in milliseconds
+expire-at <key> <timestamp>     Set expiry at Unix timestamp (seconds)
+p-expire-at <key> <ms-ts>       Set expiry at Unix timestamp (milliseconds)
+ttl <key>                       Remaining seconds, rounded to nearest (-1=no expiry, -2=missing/expired)
+p-ttl <key>                     Remaining milliseconds (-1=no expiry, -2=missing/expired)
 persist <key>                   Remove expiry
 purge                           Delete all expired keys from disk, report count
 ```
@@ -93,8 +95,8 @@ keys [pattern]          List keys (Redis glob: * ? [abc] [^a] [a-z], \ escapes; 
 exists <key>            Test existence (1/0, respects expiry)
 type <key>              string | list | set | hash | none
 rename <key> <newkey>   Rename (overwrites target, preserves TTL)
-db-size                 Total key count (includes expired; purge first for accuracy)
-flush-all               Delete everything including expiry data
+db-size                 Live key count (expired keys excluded)
+flush-all               Delete everything
 ```
 
 ## Build
@@ -120,11 +122,11 @@ Module layout under `src/`:
 - `main.rs` — entry point only: open the DB, then one-shot `dispatch` or hand off to the shell.
 - `cli.rs` — clap definitions (`Cli`, `Command`, `OutputFormat`), `is_write`, and the transactional `dispatch`/`run` that routes a `Command` to its implementation.
 - `reply.rs` — the typed `Reply`/`CmdError` and the human/raw/json renderers.
-- `db.rs` — schema creation and the key/expiry helpers every command shares (`key_type`, `ensure_type`, `is_expired`, `drop_if_expired`, …).
+- `db.rs` — schema creation and the v1→v2 migration, plus the catalogue helpers every command shares (`lookup`, `key_type`, `check_type`/`ensure_type`, `drop_if_expired`, `claim`, `release_if_empty`, `remove_key`).
 - `shell.rs` — REPL and pipe mode (`split_line`, `run_line`, `repl`, `pipe`).
 - `commands/{strings,lists,sets,hashes,keys,ttl}.rs` — one module per type family; each `cmd_*` takes a `&Connection` already inside the dispatcher's transaction.
 
-All state in one SQLite database with five tables: `strings`, `list_items`, `set_members`, `hash_fields`, `expiry`. Lists use fractional indexing (REAL column) for O(1) push. Expiry uses lazy filtering (reads check `expiry` table, `purge` does physical deletion). WAL mode for concurrent reads.
+All state in one SQLite database, schema v2 (`PRAGMA user_version = 2`): a `keyspace` catalogue (key, type, expires_at in Unix ms) that is the single source of truth for existence/type/expiry, plus four payload tables `strings`, `list_items`, `set_members`, `hash_fields`. Invariants: payload in exactly the table for the catalogue type; catalogue row iff payload rows (`claim` on create, `release_if_empty` after removals). Lists use fractional indexing (REAL column) for O(1) push. Expiry uses lazy filtering (`purge` does physical deletion). v1 files (klyv ≤ 0.2.0) migrate in place on first open. WAL mode for concurrent reads.
 
 See SPEC.md for the full portable specification.
 

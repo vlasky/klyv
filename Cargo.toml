@@ -11,4 +11,5 @@ clap = { version = "4", features = ["derive", "env"] }
 rustyline = "18.0.1"
 
 [dev-dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
 tempfile = "3"
