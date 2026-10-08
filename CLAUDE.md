@@ -16,8 +16,9 @@ Run with no command to enter the interactive shell (rustyline REPL when stdin is
 
 ### Strings
 ```
-set <key> <value> [--nx] [--ex <s> | --px <ms>]
-                              Store a value (--nx: only if missing; --ex/--px: TTL, atomic)
+set <key> <value> [--nx] [--ex <s> | --px <ms> | --keep-ttl]
+                              Store a value (--nx: only if missing; --ex/--px: TTL, atomic;
+                              plain SET discards any TTL like Redis, --keep-ttl retains it)
 get <key>                     Retrieve a value (prints "(nil)" if missing)
 get-del <key>                 Retrieve a value and delete the key atomically
 del <key> [key ...]           Delete keys (any type), returns number of keys deleted
@@ -88,7 +89,7 @@ Expired keys are hidden from reads (lazy expiry) but remain on disk until `purge
 
 ### Key operations
 ```
-keys [pattern]          List keys (* and ? glob, excludes expired)
+keys [pattern]          List keys (Redis glob: * ? [abc] [^a] [a-z], \ escapes; case-sensitive)
 exists <key>            Test existence (1/0, respects expiry)
 type <key>              string | list | set | hash | none
 rename <key> <newkey>   Rename (overwrites target, preserves TTL)

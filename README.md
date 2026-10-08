@@ -102,7 +102,7 @@ klyv --format json get missing
 
 | Command | Description |
 |---------|-------------|
-| `set <key> <value> [--nx] [--ex <s> \| --px <ms>]` | Store a value (optionally only-if-missing, with TTL) |
+| `set <key> <value> [--nx] [--ex <s> \| --px <ms> \| --keep-ttl]` | Store a value (only-if-missing, with TTL, or keeping the existing TTL) |
 | `get <key>` | Retrieve a value |
 | `get-del <key>` | Retrieve a value and delete the key atomically |
 | `del <key> [key ...]` | Delete keys (any type) |
@@ -175,7 +175,7 @@ klyv --format json get missing
 
 | Command | Description |
 |---------|-------------|
-| `keys [pattern]` | List keys (glob: `*` and `?`) |
+| `keys [pattern]` | List keys (Redis glob: `*`, `?`, `[abc]`, `[^a]`, `[a-z]`, `\` escapes) |
 | `exists <key>` | Test existence (1/0) |
 | `type <key>` | string / list / set / hash / none |
 | `rename <key> <newkey>` | Rename key |
@@ -195,7 +195,6 @@ klyv --format json get missing
 2. Expired keys require explicit `purge` to reclaim space
 3. No pub/sub, transactions (MULTI/EXEC), or Lua scripting
 4. `SET` preserves a still-valid TTL (use `persist` to clear it); a stale one is dropped
-5. Pattern matching uses SQL LIKE (no `[abc]` character classes); `%`, `_`, `\` are escaped to match literally
 
 ## License
 

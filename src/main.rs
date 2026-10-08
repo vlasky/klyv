@@ -77,6 +77,12 @@ enum Command {
             help = "Set TTL in milliseconds (rounds up to seconds)"
         )]
         px: Option<i64>,
+        #[arg(
+            long,
+            conflicts_with_all = ["ex", "px"],
+            help = "Keep the key's existing TTL (by default SET clears it, like Redis)"
+        )]
+        keep_ttl: bool,
     },
     #[command(about = "Get a string value (prints '(nil)' if not found)")]
     Get { key: String },
@@ -214,7 +220,9 @@ enum Command {
     #[command(about = "Get number of fields in a hash")]
     HLen { key: String },
 
-    #[command(about = "List keys matching glob pattern (* and ? supported, omit for all)")]
+    #[command(
+        about = "List keys matching a Redis glob (* ? [abc] [^a] [a-z], \\ escapes; omit for all)"
+    )]
     Keys { pattern: Option<String> },
     #[command(about = "Test if key exists (any type, returns 1 or 0)")]
     Exists { key: String },
@@ -628,6 +636,7 @@ fn run(conn: &Connection, cmd: Command) -> CmdResult {
             nx,
             ex,
             px,
+            keep_ttl,
         } => {
             // --px rounds up to whole seconds, like p-expire.
             let ttl_seconds = match (ex, px) {
@@ -639,7 +648,7 @@ fn run(conn: &Connection, cmd: Command) -> CmdResult {
                 }),
                 (None, None) => None,
             };
-            cmd_set(conn, &key, &value, nx, ttl_seconds)
+            cmd_set(conn, &key, &value, nx, ttl_seconds, keep_ttl)
         }
         Command::Get { key } => cmd_get(conn, &key),
         Command::GetDel { key } => cmd_getdel(conn, &key),
@@ -929,6 +938,7 @@ fn cmd_set(
     value: &str,
     nx: bool,
     ttl_seconds: Option<i64>,
+    keep_ttl: bool,
 ) -> CmdResult {
     if let Some(secs) = ttl_seconds
         && secs <= 0
@@ -942,9 +952,10 @@ fn cmd_set(
     conn.execute("DELETE FROM list_items WHERE key = ?1", params![key])?;
     conn.execute("DELETE FROM set_members WHERE key = ?1", params![key])?;
     conn.execute("DELETE FROM hash_fields WHERE key = ?1", params![key])?;
-    // Drop a stale (already-expired) expiry so the new value isn't hidden.
-    // A live TTL is intentionally preserved (see test_set_overwrites_clears_expiry_not).
-    if is_expired(conn, key)? {
+    // Like Redis, SET discards any existing TTL unless --keep-ttl is given;
+    // even then a stale (already-expired) expiry row goes, so the new value
+    // isn't hidden.
+    if !keep_ttl || is_expired(conn, key)? {
         conn.execute("DELETE FROM expiry WHERE key = ?1", params![key])?;
     }
     conn.execute(
@@ -1055,9 +1066,8 @@ fn cmd_mset(conn: &Connection, pairs: &[String]) -> CmdResult {
         conn.execute("DELETE FROM list_items WHERE key = ?1", params![chunk[0]])?;
         conn.execute("DELETE FROM set_members WHERE key = ?1", params![chunk[0]])?;
         conn.execute("DELETE FROM hash_fields WHERE key = ?1", params![chunk[0]])?;
-        if is_expired(conn, &chunk[0])? {
-            conn.execute("DELETE FROM expiry WHERE key = ?1", params![chunk[0]])?;
-        }
+        // Like Redis, MSET discards any existing TTL.
+        conn.execute("DELETE FROM expiry WHERE key = ?1", params![chunk[0]])?;
         conn.execute(
             "INSERT OR REPLACE INTO strings (key, value) VALUES (?1, ?2)",
             params![chunk[0], chunk[1]],
@@ -1781,34 +1791,45 @@ fn cmd_hlen(conn: &Connection, key: &str) -> CmdResult {
 
 // --- Key commands ---
 
-fn cmd_keys(conn: &Connection, pattern: Option<&str>) -> CmdResult {
-    let pat = pattern.unwrap_or("*");
-    // Translate Redis glob (* and ?) into a SQL LIKE pattern, escaping the
-    // LIKE metacharacters % and _ (and the escape char itself) so they match
-    // literally.
-    let mut like = String::new();
-    for ch in pat.chars() {
-        match ch {
-            '*' => like.push('%'),
-            '?' => like.push('_'),
-            '%' | '_' | '\\' => {
-                like.push('\\');
-                like.push(ch);
+/// Translates a Redis glob into an SQLite GLOB pattern. The two agree on
+/// `*`, `?`, `[abc]`, `[^abc]` and `[a-z]`, and both are case-sensitive
+/// (unlike SQL LIKE, which ignores ASCII case). The one difference is
+/// escaping: Redis uses `\x`; SQLite has no escape character and instead
+/// spells a literal special as a one-character class.
+fn redis_glob_to_sqlite(pat: &str) -> String {
+    let mut out = String::with_capacity(pat.len());
+    let mut chars = pat.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some(e @ ('*' | '?' | '[')) => {
+                out.push('[');
+                out.push(e);
+                out.push(']');
             }
-            c => like.push(c),
+            Some(e) => out.push(e),
+            None => out.push('\\'),
         }
     }
+    out
+}
+
+fn cmd_keys(conn: &Connection, pattern: Option<&str>) -> CmdResult {
+    let glob = redis_glob_to_sqlite(pattern.unwrap_or("*"));
 
     let mut all_keys: Vec<String> = Vec::new();
     for sql in [
-        "SELECT key FROM strings WHERE key LIKE ?1 ESCAPE '\\'",
-        "SELECT DISTINCT key FROM list_items WHERE key LIKE ?1 ESCAPE '\\'",
-        "SELECT DISTINCT key FROM set_members WHERE key LIKE ?1 ESCAPE '\\'",
-        "SELECT DISTINCT key FROM hash_fields WHERE key LIKE ?1 ESCAPE '\\'",
+        "SELECT key FROM strings WHERE key GLOB ?1",
+        "SELECT DISTINCT key FROM list_items WHERE key GLOB ?1",
+        "SELECT DISTINCT key FROM set_members WHERE key GLOB ?1",
+        "SELECT DISTINCT key FROM hash_fields WHERE key GLOB ?1",
     ] {
         let mut stmt = conn.prepare(sql)?;
         let keys: Vec<String> = stmt
-            .query_map(params![like], |row| row.get(0))?
+            .query_map(params![glob], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
         all_keys.extend(keys);
     }

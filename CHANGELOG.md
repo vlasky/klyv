@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed
+
+- **`set` now discards any existing TTL, like Redis.** Previously a live TTL survived `set`/`m-set`, a deviation that stemmed from a mistaken belief (recorded in the original test) that Redis behaves that way. New `--keep-ttl` flag (Redis `KEEPTTL`) retains it; `m-set` always clears, as in Redis.
+
+### Fixed
+
+- **`keys` was case-insensitive** (SQLite `LIKE` ignores ASCII case): `keys 'user:*'` matched `User:2`. Now uses SQLite `GLOB`, which is case-sensitive and implements Redis glob semantics natively, so `[abc]`, `[^a]` and `[a-z]` classes work and `\` is the escape character exactly as in Redis. Removes two documented deviations.
+
 ### Added
 
 - Interactive shell (REPL): `klyv --db <PATH>` with no command opens a `redis-cli`-style shell with line editing and in-session history (rustyline). `help` lists commands; `exit`/`quit`/Ctrl-D leaves; errors are shown and the session continues.
