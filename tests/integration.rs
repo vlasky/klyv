@@ -2613,3 +2613,93 @@ fn test_raw_output_is_binary_safe_for_stored_text() {
     let (out, _, _) = klyv_fmt(&db, "raw", &["get", "k"]);
     assert_eq!(out, "caf\u{e9} \u{1F600}\n");
 }
+
+#[test]
+fn test_collection_writes_require_values() {
+    let db = fresh_db();
+    for args in [
+        vec!["l-push", "k"],
+        vec!["r-push", "k"],
+        vec!["s-add", "k"],
+        vec!["h-set", "k"],
+        vec!["h-del", "k"],
+        vec!["s-rem", "k"],
+        vec!["del"],
+        vec!["m-set"],
+        vec!["m-get"],
+        vec!["s-union"],
+    ] {
+        let (_, _, ok) = klyv(&db, &args);
+        assert!(!ok, "{args:?} should be rejected");
+    }
+    // Nothing was registered in the catalogue.
+    let (out, _, _) = klyv(&db, &["exists", "k"]);
+    assert_eq!(out.trim(), "(integer) 0");
+    let (out, _, _) = klyv(&db, &["db-size"]);
+    assert_eq!(out.trim(), "(integer) 0");
+}
+
+#[test]
+fn test_split_brain_file_is_repaired_on_open() {
+    let db = fresh_db();
+    klyv(&db, &["set", "a", "1"]);
+    klyv(&db, &["r-push", "l", "x"]);
+    {
+        // Simulate what a pre-v2 binary would do if it got past the guard:
+        // recreate the expiry table and write payload around the catalogue.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DROP VIEW expiry;
+             CREATE TABLE expiry (key TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+             INSERT INTO strings VALUES ('stray', 'v');
+             INSERT INTO expiry VALUES ('a', 9999999999);
+             DELETE FROM list_items WHERE key = 'l';",
+        )
+        .unwrap();
+    }
+    // Next open reconciles: stray payload catalogued, expiry folded in,
+    // the emptied list's catalogue row removed, the guard restored.
+    let (out, _, _) = klyv(&db, &["get", "stray"]);
+    assert_eq!(out.trim(), "v");
+    assert!(ttl_of(&db, "p-ttl", "a") > 1_000_000_000);
+    let (out, _, _) = klyv(&db, &["exists", "l"]);
+    assert_eq!(out.trim(), "(integer) 0");
+    assert_v1_binary_cannot_open(&db);
+}
+
+#[test]
+fn test_v1_file_without_expiry_table_is_catalogued() {
+    let db = fresh_db();
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE strings (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+             INSERT INTO strings VALUES ('s', 'hello');",
+        )
+        .unwrap();
+    let (out, _, _) = klyv(&db, &["get", "s"]);
+    assert_eq!(out.trim(), "hello");
+    let (out, _, _) = klyv(&db, &["db-size"]);
+    assert_eq!(out.trim(), "(integer) 1");
+}
+
+#[test]
+fn test_migration_clamps_extreme_v1_expiry() {
+    let db = fresh_db();
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE strings (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+             CREATE TABLE expiry (key TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+             INSERT INTO strings VALUES ('far', 'v'), ('past', 'v');
+             INSERT INTO expiry VALUES ('far', 9223372036854775807), ('past', -9223372036854775807);",
+        )
+        .unwrap();
+    // No database error: the conversion clamps instead of overflowing to REAL.
+    let (out, _, ok) = klyv(&db, &["get", "far"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "v");
+    let (out, _, ok) = klyv(&db, &["get", "past"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(nil)");
+}

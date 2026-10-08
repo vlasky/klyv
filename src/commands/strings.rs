@@ -135,7 +135,7 @@ pub(crate) fn cmd_strlen(conn: &Connection, key: &str) -> CmdResult {
 }
 
 pub(crate) fn cmd_mset(conn: &Connection, pairs: &[String]) -> CmdResult {
-    if !pairs.len().is_multiple_of(2) {
+    if pairs.is_empty() || !pairs.len().is_multiple_of(2) {
         return Err(CmdError::new(
             "ERR wrong number of arguments for 'mset' command",
         ));

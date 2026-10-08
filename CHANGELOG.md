@@ -18,6 +18,10 @@
 ### Added
 
 - `p-ttl` (remaining TTL in milliseconds) and `p-expire-at` (absolute expiry in milliseconds).
+
+### Fixed
+
+- `l-push`/`r-push`/`s-add`/`h-set`/`h-del`/`s-rem`/`del`/`m-set`/`m-get` and the set-algebra commands now require their variadic arguments (Redis "wrong number of arguments"); previously `l-push key` with no values was accepted and, under schema v2, would have registered a key with no contents.
 - Interactive shell (REPL): `klyv --db <PATH>` with no command opens a `redis-cli`-style shell with line editing and in-session history (rustyline). `help` lists commands; `exit`/`quit`/Ctrl-D leaves; errors are shown and the session continues.
 - Pipe mode: the same no-command invocation with stdin not a terminal executes commands one per line over a single connection — one process and one database open for the whole batch. Shell-style quoting (single/double quotes, backslash escapes; `#` is ordinary data, never a comment); a failing line reports to stderr and processing continues; exit code 1 if any line failed. `--format` applies to the whole session.
 - Differential test harness (`tests/differential.rs`): runs ~190 identical command steps through klyv and a real Redis server and diffs the replies. Self-skips when redis is not installed; CI runs it in a dedicated ubuntu job.

@@ -21,6 +21,11 @@ fn members(
 }
 
 pub(crate) fn cmd_sadd(conn: &Connection, key: &str, members: &[String]) -> CmdResult {
+    if members.is_empty() {
+        return Err(CmdError::new(
+            "ERR wrong number of arguments for 'sadd' command",
+        ));
+    }
     let now = now_ms();
     ensure_type(conn, key, KIND, now)?;
     drop_if_expired(conn, key, now)?;
@@ -189,7 +194,11 @@ pub(crate) fn cmd_sdiff(conn: &Connection, keys: &[String]) -> CmdResult {
     // Missing/expired "other" sets subtract nothing, so drop them.
     let rest = live_sets(conn, rest, now)?;
     if rest.is_empty() {
-        return cmd_smembers(conn, first);
+        return Ok(members(
+            conn,
+            "SELECT member FROM set_members WHERE key = ?1",
+            &[&first],
+        )?);
     }
     let sql = format!(
         "SELECT member FROM set_members WHERE key = ?1 AND member NOT IN (

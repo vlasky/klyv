@@ -19,6 +19,12 @@ fn list_bounds(conn: &Connection, key: &str) -> rusqlite::Result<(i64, Option<f6
 }
 
 fn push(conn: &Connection, key: &str, values: &[String], head: bool) -> CmdResult {
+    if values.is_empty() {
+        let name = if head { "lpush" } else { "rpush" };
+        return Err(CmdError::new(format!(
+            "ERR wrong number of arguments for '{name}' command"
+        )));
+    }
     let now = now_ms();
     ensure_type(conn, key, KIND, now)?;
     drop_if_expired(conn, key, now)?;
