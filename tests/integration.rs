@@ -2703,3 +2703,26 @@ fn test_migration_clamps_extreme_v1_expiry() {
     assert!(ok);
     assert_eq!(out.trim(), "(nil)");
 }
+
+#[test]
+fn test_split_brain_type_change_adopts_old_binary_write() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "l", "a", "b"]);
+    {
+        // An old binary did SET over a list: v1 deletes the list rows and
+        // writes a strings row, leaving the catalogue saying 'list'.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DROP VIEW expiry;
+             CREATE TABLE expiry (key TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+             DELETE FROM list_items WHERE key = 'l';
+             INSERT INTO strings VALUES ('l', 'now-a-string');",
+        )
+        .unwrap();
+    }
+    // Repair must adopt the write (re-catalogue as string), not discard it.
+    let (out, _, _) = klyv(&db, &["type", "l"]);
+    assert_eq!(out.trim(), "string");
+    let (out, _, _) = klyv(&db, &["get", "l"]);
+    assert_eq!(out.trim(), "now-a-string");
+}
