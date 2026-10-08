@@ -92,7 +92,10 @@ pub(crate) enum Command {
     #[command(about = "Get a string value and delete the key atomically")]
     GetDel { key: String },
     #[command(about = "Delete one or more keys (any type)")]
-    Del { keys: Vec<String> },
+    Del {
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
     #[command(about = "Increment integer value by 1 (creates key at 0 if missing)")]
     Incr { key: String },
     #[command(about = "Decrement integer value by 1 (creates key at 0 if missing)")]
@@ -113,16 +116,30 @@ pub(crate) enum Command {
     Strlen { key: String },
     #[command(about = "Set multiple key-value pairs atomically")]
     MSet {
-        #[arg(help = "Alternating key value pairs: key1 val1 key2 val2 ...")]
+        #[arg(
+            required = true,
+            help = "Alternating key value pairs: key1 val1 key2 val2 ..."
+        )]
         pairs: Vec<String>,
     },
     #[command(about = "Get multiple values (prints one per line, '(nil)' for missing)")]
-    MGet { keys: Vec<String> },
+    MGet {
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
 
     #[command(about = "Push values to head of list (leftmost)")]
-    LPush { key: String, values: Vec<String> },
+    LPush {
+        key: String,
+        #[arg(required = true)]
+        values: Vec<String>,
+    },
     #[command(about = "Push values to tail of list (rightmost)")]
-    RPush { key: String, values: Vec<String> },
+    RPush {
+        key: String,
+        #[arg(required = true)]
+        values: Vec<String>,
+    },
     #[command(about = "Remove and return element from head of list")]
     LPop { key: String },
     #[command(about = "Remove and return element from tail of list")]
@@ -175,9 +192,17 @@ pub(crate) enum Command {
     },
 
     #[command(about = "Add members to set (ignores duplicates)")]
-    SAdd { key: String, members: Vec<String> },
+    SAdd {
+        key: String,
+        #[arg(required = true)]
+        members: Vec<String>,
+    },
     #[command(about = "Remove members from set")]
-    SRem { key: String, members: Vec<String> },
+    SRem {
+        key: String,
+        #[arg(required = true)]
+        members: Vec<String>,
+    },
     #[command(about = "List all members of set")]
     SMembers { key: String },
     #[command(about = "Test if member exists in set (returns 1 or 0)")]
@@ -187,16 +212,28 @@ pub(crate) enum Command {
     #[command(about = "Remove and return a random member from set")]
     SPop { key: String },
     #[command(about = "Return union of multiple sets")]
-    SUnion { keys: Vec<String> },
+    SUnion {
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
     #[command(about = "Return intersection of multiple sets")]
-    SInter { keys: Vec<String> },
+    SInter {
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
     #[command(about = "Return members in first set not in any other sets")]
-    SDiff { keys: Vec<String> },
+    SDiff {
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
 
     #[command(about = "Set field-value pairs in a hash")]
     HSet {
         key: String,
-        #[arg(help = "Alternating field value pairs: field1 val1 field2 val2 ...")]
+        #[arg(
+            required = true,
+            help = "Alternating field value pairs: field1 val1 field2 val2 ..."
+        )]
         pairs: Vec<String>,
     },
     #[command(about = "Get a field's value from a hash")]
@@ -213,7 +250,11 @@ pub(crate) enum Command {
         amount: i64,
     },
     #[command(about = "Delete fields from a hash")]
-    HDel { key: String, fields: Vec<String> },
+    HDel {
+        key: String,
+        #[arg(required = true)]
+        fields: Vec<String>,
+    },
     #[command(about = "Get all field-value pairs (alternating lines: field, value)")]
     HGetAll { key: String },
     #[command(about = "List all field names in a hash")]

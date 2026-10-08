@@ -14,7 +14,7 @@ fn field_value(conn: &Connection, key: &str, field: &str) -> rusqlite::Result<Op
 }
 
 pub(crate) fn cmd_hset(conn: &Connection, key: &str, pairs: &[String]) -> CmdResult {
-    if !pairs.len().is_multiple_of(2) {
+    if pairs.is_empty() || !pairs.len().is_multiple_of(2) {
         return Err(CmdError::new(
             "ERR wrong number of arguments for 'hset' command",
         ));
