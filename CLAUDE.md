@@ -111,7 +111,7 @@ cargo build --release
 cargo test
 ```
 
-`tests/differential.rs` runs the same command sequences through klyv and a real Redis server (started ephemerally on a free port) and diffs the replies — the authoritative check for Redis compatibility. It self-skips when `redis-server`/`redis-cli` are not on PATH (`brew install redis`); CI runs it in a dedicated ubuntu job. When adding or changing a command, add differential steps for it, and mind the comparator notes at the top of that file (error-code-only comparison, empty-array quirk, sorted modes for unordered replies).
+`tests/differential.rs` runs the same command sequences through klyv and a real Redis server (started ephemerally on a free port) and diffs the replies — the authoritative check for Redis compatibility. It self-skips when `redis-server`/`redis-cli` are not on PATH (`brew install redis`); CI runs it in a dedicated ubuntu job. When adding or changing a command, add differential steps for it, and mind the comparator notes at the top of that file (error-code-only comparison, empty-array quirk, sorted modes for unordered replies). The same file also has a randomised layer (`differential_random_sequences`): seeded command sequences over an awkward alphabet (mixed-case and empty keys, unicode, hyphen-leading values, boundary indexes, overflowing integers), three seeds of 250 steps by default. A failure prints the seed and recent history; replay with `KLYV_DIFF_SEED=<seed>`, lengthen with `KLYV_DIFF_STEPS=<n>`. New commands with deterministic replies should be added to `random_step` too.
 
 Values beginning with a hyphen need the standard `--` escape on the CLI (`klyv append -- k -value`); keep that in mind when writing tests.
 

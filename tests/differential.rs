@@ -727,3 +727,270 @@ fn differential_vs_real_redis() {
         }
     }
 }
+
+// === Randomised sequences ===
+//
+// The hand-written scenarios above share their author's blind spots (the
+// case-insensitive KEYS bug survived them because every key was lowercase).
+// This layer draws long command sequences from a deliberately awkward
+// alphabet and checks every reply against Redis. A failure prints the seed
+// and the recent history; set KLYV_DIFF_SEED to replay one, KLYV_DIFF_STEPS
+// to lengthen a run.
+
+/// xorshift64*: tiny, deterministic, good enough for sequence generation.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+        &xs[self.below(xs.len())]
+    }
+    fn chance(&mut self, one_in: u64) -> bool {
+        self.next().is_multiple_of(one_in)
+    }
+}
+
+const KEYS: &[&str] = &["k", "K", "key:1", "key:2", "a-b", "x y", "ключ", "", "k[1]"];
+const VALUES: &[&str] = &[
+    "v",
+    "",
+    "hello world",
+    "-dash",
+    "ünïcödé",
+    "0",
+    "42",
+    "-7",
+    "9223372036854775807",
+    "#hash",
+    "a*b",
+    "\"quoted\"",
+    "tab\there",
+];
+const FIELDS: &[&str] = &["f", "F", "field-1", ""];
+const AMOUNTS: &[&str] = &[
+    "-3",
+    "0",
+    "1",
+    "7",
+    "9223372036854775807",
+    "-9223372036854775808",
+];
+const INDEXES: &[&str] = &["-100", "-3", "-1", "0", "1", "2", "5", "100"];
+const COUNTS: &[&str] = &["-2", "-1", "0", "1", "2"];
+const PATTERNS: &[&str] = &["*", "k*", "K*", "key:?", "[kK]*", "*-*", "k\\[1\\]", "?"];
+
+struct Gen {
+    klyv: Vec<String>,
+    redis: Vec<String>,
+    /// How to compare replies when neither side errors.
+    ok_cmp: Cmp,
+}
+
+fn g(klyv: &[&str], redis: &[&str], ok_cmp: Cmp) -> Gen {
+    Gen {
+        klyv: klyv.iter().map(|s| s.to_string()).collect(),
+        redis: redis.iter().map(|s| s.to_string()).collect(),
+        ok_cmp,
+    }
+}
+
+fn random_step(rng: &mut Rng) -> Gen {
+    use Cmp::*;
+    let k = *rng.pick(KEYS);
+    let k2 = *rng.pick(KEYS);
+    let k3 = *rng.pick(KEYS);
+    let v = *rng.pick(VALUES);
+    let v2 = *rng.pick(VALUES);
+    let f = *rng.pick(FIELDS);
+    let f2 = *rng.pick(FIELDS);
+    let n = *rng.pick(AMOUNTS);
+    let i = *rng.pick(INDEXES);
+    let j = *rng.pick(INDEXES);
+    let c = *rng.pick(COUNTS);
+    let pat = *rng.pick(PATTERNS);
+    match rng.below(44) {
+        0..=2 => g(&["set", "--", k, v], &["SET", k, v], Exact),
+        3 => g(&["set", "--nx", "--", k, v], &["SET", k, v, "NX"], Exact),
+        4 => g(
+            &["set", "--keep-ttl", "--", k, v],
+            &["SET", k, v, "KEEPTTL"],
+            Exact,
+        ),
+        5 | 6 => g(&["get", "--", k], &["GET", k], Exact),
+        7 => g(&["get-del", "--", k], &["GETDEL", k], Exact),
+        8 => g(&["del", "--", k, k2], &["DEL", k, k2], Exact),
+        9 => g(&["incr", "--", k], &["INCR", k], Exact),
+        10 => g(&["incr-by", "--", k, n], &["INCRBY", k, n], Exact),
+        11 => g(&["append", "--", k, v], &["APPEND", k, v], Exact),
+        12 => g(&["strlen", "--", k], &["STRLEN", k], Exact),
+        13 => g(
+            &["m-set", "--", k, v, k2, v2],
+            &["MSET", k, v, k2, v2],
+            Exact,
+        ),
+        14 => g(&["m-get", "--", k, k2, k3], &["MGET", k, k2, k3], Exact),
+        15 | 16 => g(&["r-push", "--", k, v, v2], &["RPUSH", k, v, v2], Exact),
+        17 => g(&["l-push", "--", k, v], &["LPUSH", k, v], Exact),
+        18 => g(&["l-pop", "--", k], &["LPOP", k], Exact),
+        19 => g(&["r-pop", "--", k], &["RPOP", k], Exact),
+        20 => g(&["l-range", "--", k, i, j], &["LRANGE", k, i, j], Exact),
+        21 => g(&["l-len", "--", k], &["LLEN", k], Exact),
+        22 => g(&["l-rem", "--", k, c, v], &["LREM", k, c, v], Exact),
+        23 => g(&["l-pos", "--", k, v], &["LPOS", k, v], Exact),
+        24 => g(&["l-index", "--", k, i], &["LINDEX", k, i], Exact),
+        25 => g(&["l-set", "--", k, i, v], &["LSET", k, i, v], Exact),
+        26 => g(&["l-trim", "--", k, i, j], &["LTRIM", k, i, j], Exact),
+        27 => g(
+            &["l-insert", "--", k, "before", v, v2],
+            &["LINSERT", k, "BEFORE", v, v2],
+            Exact,
+        ),
+        28 | 29 => g(&["s-add", "--", k, v, v2], &["SADD", k, v, v2], Exact),
+        30 => g(&["s-rem", "--", k, v], &["SREM", k, v], Exact),
+        31 => g(&["s-members", "--", k], &["SMEMBERS", k], Sorted),
+        32 => g(&["s-is-member", "--", k, v], &["SISMEMBER", k, v], Exact),
+        33 => g(&["s-card", "--", k], &["SCARD", k], Exact),
+        34 => g(&["s-union", "--", k, k2], &["SUNION", k, k2], Sorted),
+        35 => g(&["s-inter", "--", k, k2], &["SINTER", k, k2], Sorted),
+        36 => g(&["s-diff", "--", k, k2], &["SDIFF", k, k2], Sorted),
+        37 | 38 => g(
+            &["h-set", "--", k, f, v, f2, v2],
+            &["HSET", k, f, v, f2, v2],
+            Exact,
+        ),
+        39 => g(&["h-get", "--", k, f], &["HGET", k, f], Exact),
+        40 => g(&["h-incr-by", "--", k, f, n], &["HINCRBY", k, f, n], Exact),
+        41 => g(&["h-get-all", "--", k], &["HGETALL", k], PairSorted),
+        42 => match rng.below(10) {
+            0 => g(&["h-exists", "--", k, f], &["HEXISTS", k, f], Exact),
+            1 => g(&["h-del", "--", k, f], &["HDEL", k, f], Exact),
+            2 => g(&["h-keys", "--", k], &["HKEYS", k], Sorted),
+            3 => g(&["h-vals", "--", k], &["HVALS", k], Sorted),
+            4 => g(&["h-len", "--", k], &["HLEN", k], Exact),
+            5 => g(&["exists", "--", k], &["EXISTS", k], Exact),
+            6 => g(&["type", "--", k], &["TYPE", k], Exact),
+            7 => g(&["rename", "--", k, k2], &["RENAME", k, k2], Exact),
+            8 => g(&["keys", "--", pat], &["KEYS", pat], Sorted),
+            _ => g(&["persist", "--", k], &["PERSIST", k], Exact),
+        },
+        _ => {
+            // Expiry with deterministic outcomes only: far future or past.
+            // (ttl/p-ttl values, s-pop and db-size are timing- or
+            // randomness-dependent and are covered by the fixed scenarios.)
+            if rng.chance(3) {
+                g(&["expire-at", "--", k, "1"], &["EXPIREAT", k, "1"], Exact)
+            } else {
+                g(
+                    &["expire-at", "--", k, "9999999999"],
+                    &["EXPIREAT", k, "9999999999"],
+                    Exact,
+                )
+            }
+        }
+    }
+}
+
+fn is_redis_error(out: &str) -> bool {
+    out.starts_with("WRONGTYPE ") || out.starts_with("ERR ")
+}
+
+fn check_generated(db: &str, port: u16, g: &Gen, ctx: &dyn Fn() -> String) {
+    let kargs: Vec<&str> = g.klyv.iter().map(String::as_str).collect();
+    let rargs: Vec<&str> = g.redis.iter().map(String::as_str).collect();
+    let (k_out, k_err, k_ok) = run_klyv(db, &kargs);
+    let r_out = run_redis(port, &rargs);
+    let detail = || {
+        format!(
+            "{}\n  klyv {:?}\n  redis {:?}\n  klyv stdout: {k_out:?}\n  klyv stderr: {k_err:?}\n  redis stdout: {r_out:?}",
+            ctx(),
+            g.klyv,
+            g.redis
+        )
+    };
+    let r_err = is_redis_error(&r_out);
+    assert_eq!(
+        !k_ok,
+        r_err,
+        "one side errored and the other did not\n{}",
+        detail()
+    );
+    if !k_ok {
+        assert_eq!(
+            first_token(&k_err),
+            first_token(&r_out),
+            "error code mismatch\n{}",
+            detail()
+        );
+        return;
+    }
+    match g.ok_cmp {
+        Cmp::Exact => {
+            let equal = k_out == r_out || (r_out == "\n" && k_out.is_empty());
+            assert!(equal, "output mismatch\n{}", detail());
+        }
+        Cmp::Sorted => assert_eq!(
+            sorted_lines(&k_out),
+            sorted_lines(&r_out),
+            "sorted mismatch\n{}",
+            detail()
+        ),
+        Cmp::PairSorted => assert_eq!(
+            sorted_pairs(&k_out),
+            sorted_pairs(&r_out),
+            "pair mismatch\n{}",
+            detail()
+        ),
+        Cmp::Error => unreachable!("generated steps never pre-declare an error"),
+    }
+}
+
+#[test]
+fn differential_random_sequences() {
+    if !have("redis-server") || !have("redis-cli") {
+        eprintln!("skipping differential test: redis-server/redis-cli not on PATH");
+        return;
+    }
+    let steps: usize = std::env::var("KLYV_DIFF_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(250);
+    let seeds: Vec<u64> = match std::env::var("KLYV_DIFF_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(seed) => vec![seed],
+        None => vec![0x5EED_0001, 0x5EED_0002, 0x5EED_0003],
+    };
+    let redis = start_redis();
+    let dir = tempfile::tempdir().unwrap();
+
+    for seed in seeds {
+        let db = dir.path().join(format!("random-{seed:x}.db"));
+        let db = db.to_str().unwrap();
+        run_redis(redis.port, &["FLUSHALL"]);
+        let mut rng = Rng(seed);
+        let mut history: Vec<String> = Vec::new();
+        for i in 0..steps {
+            let g = random_step(&mut rng);
+            history.push(format!("{i:>4}: {}", g.klyv.join(" ")));
+            let ctx = || {
+                let from = history.len().saturating_sub(15);
+                format!(
+                    "seed {seed:#x} step {i} (replay with KLYV_DIFF_SEED={seed}); recent history:\n{}",
+                    history[from..].join("\n")
+                )
+            };
+            check_generated(db, redis.port, &g, &ctx);
+        }
+    }
+}
