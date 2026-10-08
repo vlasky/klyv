@@ -77,7 +77,7 @@ pub(crate) enum Command {
             long,
             value_name = "MILLISECONDS",
             allow_hyphen_values = true,
-            help = "Set TTL in milliseconds (rounds up to seconds)"
+            help = "Set TTL in milliseconds"
         )]
         px: Option<i64>,
         #[arg(
@@ -250,14 +250,21 @@ pub(crate) enum Command {
         allow_hyphen_values = true
     )]
     ExpireAt { key: String, timestamp: i64 },
+    #[command(
+        about = "Set key expiry at Unix timestamp (milliseconds)",
+        allow_hyphen_values = true
+    )]
+    PExpireAt { key: String, timestamp_ms: i64 },
     #[command(about = "Get remaining TTL in seconds (-1=no expiry, -2=key missing)")]
     Ttl { key: String },
+    #[command(about = "Get remaining TTL in milliseconds (-1=no expiry, -2=key missing)")]
+    PTtl { key: String },
     #[command(about = "Remove expiry from key")]
     Persist { key: String },
     #[command(about = "Delete all expired keys and report count")]
     Purge,
 
-    #[command(about = "Count total number of keys across all types")]
+    #[command(about = "Count live keys (expired keys are not counted)")]
     DbSize,
     #[command(about = "Delete all data from all tables")]
     FlushAll,
@@ -295,6 +302,7 @@ pub(crate) fn is_write(cmd: &Command) -> bool {
             | Command::Expire { .. }
             | Command::PExpire { .. }
             | Command::ExpireAt { .. }
+            | Command::PExpireAt { .. }
             | Command::Persist { .. }
             | Command::Purge
             | Command::FlushAll
@@ -326,17 +334,12 @@ pub(crate) fn run(conn: &Connection, cmd: Command) -> CmdResult {
             px,
             keep_ttl,
         } => {
-            // --px rounds up to whole seconds, like p-expire.
-            let ttl_seconds = match (ex, px) {
-                (Some(s), _) => Some(s),
-                (None, Some(ms)) => Some(if ms <= 0 {
-                    ms
-                } else {
-                    ms.saturating_add(999) / 1000
-                }),
+            let ttl_ms = match (ex, px) {
+                (Some(s), _) => Some(s.saturating_mul(1000)),
+                (None, Some(ms)) => Some(ms),
                 (None, None) => None,
             };
-            cmd_set(conn, &key, &value, nx, ttl_seconds, keep_ttl)
+            cmd_set(conn, &key, &value, nx, ttl_ms, keep_ttl)
         }
         Command::Get { key } => cmd_get(conn, &key),
         Command::GetDel { key } => cmd_getdel(conn, &key),
@@ -399,17 +402,11 @@ pub(crate) fn run(conn: &Connection, cmd: Command) -> CmdResult {
         Command::Rename { key, newkey } => cmd_rename(conn, &key, &newkey),
 
         Command::Expire { key, seconds } => cmd_expire(conn, &key, seconds),
-        Command::PExpire { key, milliseconds } => {
-            // Round up to whole seconds; non-positive TTLs expire immediately.
-            let seconds = if milliseconds <= 0 {
-                0
-            } else {
-                milliseconds.saturating_add(999) / 1000
-            };
-            cmd_expire(conn, &key, seconds)
-        }
+        Command::PExpire { key, milliseconds } => cmd_pexpire(conn, &key, milliseconds),
         Command::ExpireAt { key, timestamp } => cmd_expireat(conn, &key, timestamp),
+        Command::PExpireAt { key, timestamp_ms } => cmd_pexpireat(conn, &key, timestamp_ms),
         Command::Ttl { key } => cmd_ttl(conn, &key),
+        Command::PTtl { key } => cmd_pttl(conn, &key),
         Command::Persist { key } => cmd_persist(conn, &key),
         Command::Purge => cmd_purge(conn),
 

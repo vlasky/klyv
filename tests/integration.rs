@@ -2421,3 +2421,170 @@ fn test_keys_sql_like_metacharacters_are_literal() {
     let (out, _, _) = klyv(&db, &["keys", "a_b"]);
     assert_eq!(out.trim(), "1) \"a_b\"");
 }
+
+// === SCHEMA V2: keyspace catalogue, millisecond expiry, migration ===
+
+fn ttl_of(db: &str, cmd: &str, key: &str) -> i64 {
+    let (out, _, _) = klyv(db, &[cmd, key]);
+    out.trim()
+        .strip_prefix("(integer) ")
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn test_pexpire_has_millisecond_precision() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    let (out, _, ok) = klyv(&db, &["p-expire", "k", "1500"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(integer) 1");
+    let pttl = ttl_of(&db, "p-ttl", "k");
+    assert!((1000..=1500).contains(&pttl), "pttl was {pttl}");
+    // TTL rounds the remainder to the nearest second, like Redis.
+    let ttl = ttl_of(&db, "ttl", "k");
+    assert!((1..=2).contains(&ttl), "ttl was {ttl}");
+}
+
+#[test]
+fn test_ttl_rounds_to_nearest_second() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    klyv(&db, &["expire", "k", "100"]);
+    // 99.9xx seconds remain; Redis reports 100, not 99.
+    assert_eq!(ttl_of(&db, "ttl", "k"), 100);
+}
+
+#[test]
+fn test_pttl_codes() {
+    let db = fresh_db();
+    assert_eq!(ttl_of(&db, "p-ttl", "missing"), -2);
+    klyv(&db, &["set", "k", "v"]);
+    assert_eq!(ttl_of(&db, "p-ttl", "k"), -1);
+    klyv(&db, &["expire-at", "k", "0"]);
+    assert_eq!(ttl_of(&db, "p-ttl", "k"), -2);
+}
+
+#[test]
+fn test_pexpireat() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    let (out, _, ok) = klyv(&db, &["p-expire-at", "k", "9999999999999"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "(integer) 1");
+    assert!(ttl_of(&db, "p-ttl", "k") > 0);
+    let (out, _, _) = klyv(&db, &["p-expire-at", "k", "1"]);
+    assert_eq!(out.trim(), "(integer) 1");
+    let (out, _, _) = klyv(&db, &["get", "k"]);
+    assert_eq!(out.trim(), "(nil)");
+    let (out, _, _) = klyv(&db, &["p-expire-at", "missing", "9999999999999"]);
+    assert_eq!(out.trim(), "(integer) 0");
+}
+
+#[test]
+fn test_set_px_is_exact() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v", "--px", "1500"]);
+    let pttl = ttl_of(&db, "p-ttl", "k");
+    assert!((1000..=1500).contains(&pttl), "pttl was {pttl}");
+}
+
+#[test]
+fn test_dbsize_excludes_expired_without_purge() {
+    let db = fresh_db();
+    klyv(&db, &["set", "a", "1"]);
+    klyv(&db, &["set", "b", "2"]);
+    klyv(&db, &["expire-at", "a", "0"]);
+    let (out, _, _) = klyv(&db, &["db-size"]);
+    assert_eq!(out.trim(), "(integer) 1");
+}
+
+#[test]
+fn test_migrates_v1_database_in_place() {
+    let db = fresh_db();
+    {
+        // Fabricate a schema-v1 database exactly as klyv 0.2.0 wrote it:
+        // per-type tables, a seconds-based expiry table, user_version 0.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE strings (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+             CREATE TABLE list_items (key TEXT NOT NULL, idx REAL NOT NULL, value BLOB NOT NULL);
+             CREATE TABLE set_members (key TEXT NOT NULL, member BLOB NOT NULL, UNIQUE(key, member));
+             CREATE TABLE hash_fields (key TEXT NOT NULL, field TEXT NOT NULL, value BLOB NOT NULL, UNIQUE(key, field));
+             CREATE TABLE expiry (key TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+             INSERT INTO strings VALUES ('s', 'hello'), ('gone', 'x');
+             INSERT INTO list_items VALUES ('l', 0.0, 'a'), ('l', 1.0, 'b');
+             INSERT INTO set_members VALUES ('st', 'm');
+             INSERT INTO hash_fields VALUES ('h', 'f', 'v');
+             INSERT INTO expiry VALUES ('s', 9999999999), ('gone', 1), ('orphan', 9999999999);",
+        )
+        .unwrap();
+    }
+
+    // Any command triggers the migration.
+    let (out, _, ok) = klyv(&db, &["get", "s"]);
+    assert!(ok);
+    assert_eq!(out.trim(), "hello");
+    let (out, _, _) = klyv(&db, &["l-range", "l", "0", "-1"]);
+    assert_eq!(
+        out.trim().lines().collect::<Vec<_>>(),
+        ["1) \"a\"", "2) \"b\""]
+    );
+    let (out, _, _) = klyv(&db, &["s-members", "st"]);
+    assert_eq!(out.trim(), "1) \"m\"");
+    let (out, _, _) = klyv(&db, &["h-get", "h", "f"]);
+    assert_eq!(out.trim(), "v");
+    // A seconds-based TTL became milliseconds and is still live.
+    assert!(ttl_of(&db, "p-ttl", "s") > 1_000_000_000);
+    // A key that had already expired stays expired.
+    let (out, _, _) = klyv(&db, &["get", "gone"]);
+    assert_eq!(out.trim(), "(nil)");
+    let (out, _, _) = klyv(&db, &["db-size"]);
+    assert_eq!(out.trim(), "(integer) 4");
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    let has_expiry: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'expiry'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+        > 0;
+    assert!(!has_expiry, "v1 expiry table should be dropped");
+    // The orphan expiry row (no data) did not become a key.
+    let orphan: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM keyspace WHERE key = 'orphan'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphan, 0);
+}
+
+#[test]
+fn test_refuses_newer_schema_version() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 99")
+        .unwrap();
+    let (_, err, ok) = klyv(&db, &["get", "k"]);
+    assert!(!ok);
+    assert!(err.contains("schema version 99 is newer"), "stderr: {err}");
+}
+
+#[test]
+fn test_raw_output_is_binary_safe_for_stored_text() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "caf\u{e9} \u{1F600}"]);
+    let (out, _, _) = klyv_fmt(&db, "raw", &["get", "k"]);
+    assert_eq!(out, "caf\u{e9} \u{1F600}\n");
+}

@@ -4,6 +4,11 @@
 
 ### Changed
 
+- **Schema v2 (automatic in-place migration).** A `keyspace` catalogue table (key, type, expiry) now records every key; the per-type tables hold payload only. Type lookup, `exists`, `type`, `keys`, `db-size` and every TTL command are single indexed reads instead of probes across four tables, and the one-type-per-key invariant is structural rather than per-command. Databases from klyv 0.2.0 are migrated the first time they are opened; files with a newer schema version are refused. Documented in SPEC.md.
+- **Millisecond expiry.** Expiry is stored in Unix milliseconds. `p-expire` and `set --px` no longer round up to whole seconds; `ttl` rounds the remainder to the nearest second like Redis (so `expire k 100` then `ttl k` reports 100, not 99).
+- **`db-size` counts live keys only**; expired-but-unpurged keys are no longer included.
+- Internal: replies carry bytes rather than strings, and raw output is written byte-for-byte, so binary values from a future RESP client will survive the storage and output layers.
+
 - **`set` now discards any existing TTL, like Redis.** Previously a live TTL survived `set`/`m-set`, a deviation that stemmed from a mistaken belief (recorded in the original test) that Redis behaves that way. New `--keep-ttl` flag (Redis `KEEPTTL`) retains it; `m-set` always clears, as in Redis.
 
 ### Fixed
@@ -12,6 +17,7 @@
 
 ### Added
 
+- `p-ttl` (remaining TTL in milliseconds) and `p-expire-at` (absolute expiry in milliseconds).
 - Interactive shell (REPL): `klyv --db <PATH>` with no command opens a `redis-cli`-style shell with line editing and in-session history (rustyline). `help` lists commands; `exit`/`quit`/Ctrl-D leaves; errors are shown and the session continues.
 - Pipe mode: the same no-command invocation with stdin not a terminal executes commands one per line over a single connection — one process and one database open for the whole batch. Shell-style quoting (single/double quotes, backslash escapes; `#` is ordinary data, never a comment); a failing line reports to stderr and processing continues; exit code 1 if any line failed. `--format` applies to the whole session.
 - Differential test harness (`tests/differential.rs`): runs ~190 identical command steps through klyv and a real Redis server and diffs the replies. Self-skips when redis is not installed; CI runs it in a dedicated ubuntu job.

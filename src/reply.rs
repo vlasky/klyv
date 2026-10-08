@@ -1,5 +1,5 @@
 //! Reply: what a command computes, decoupled from how it is rendered, plus the
-//! renderers (human/raw/json) that turn a Reply into output.
+//! renderers (human/raw/json) that turn a Reply into output bytes.
 
 use crate::cli::OutputFormat;
 
@@ -12,19 +12,20 @@ pub(crate) enum Empty {
 }
 
 /// Typed command result. Commands compute a Reply; renderers turn it into
-/// output (today: the human redis-cli format; future: RESP, JSON, raw).
+/// output. Values are bytes: the CLI only ever produces UTF-8, but the
+/// storage layer and a future RESP server are binary-safe.
 pub(crate) enum Reply {
     /// Status line printed bare ("OK", type names).
     Simple(&'static str),
     /// Integer, printed as "(integer) N".
     Int(i64),
     /// A value, printed bare.
-    Bulk(String),
+    Bulk(Vec<u8>),
     /// Missing value, printed as "(nil)".
     Nil,
     /// Items printed as a numbered, quoted list; the Empty kind picks the
     /// "(empty list)"/"(empty set)"/"(empty hash)" placeholder.
-    Array(Vec<String>, Empty),
+    Array(Vec<Vec<u8>>, Empty),
     /// One reply per line without numbering (MGET).
     Lines(Vec<Reply>),
 }
@@ -46,30 +47,34 @@ impl From<rusqlite::Error> for CmdError {
 
 pub(crate) type CmdResult = Result<Reply, CmdError>;
 
-pub(crate) fn render_human(reply: &Reply, out: &mut String) {
+fn push_lossy(out: &mut Vec<u8>, v: &[u8]) {
+    out.extend_from_slice(String::from_utf8_lossy(v).as_bytes());
+}
+
+pub(crate) fn render_human(reply: &Reply, out: &mut Vec<u8>) {
     match reply {
         Reply::Simple(s) => {
-            out.push_str(s);
-            out.push('\n');
+            out.extend_from_slice(s.as_bytes());
+            out.push(b'\n');
         }
-        Reply::Int(n) => {
-            out.push_str(&format!("(integer) {n}\n"));
-        }
+        Reply::Int(n) => out.extend_from_slice(format!("(integer) {n}\n").as_bytes()),
         Reply::Bulk(v) => {
-            out.push_str(v);
-            out.push('\n');
+            push_lossy(out, v);
+            out.push(b'\n');
         }
-        Reply::Nil => out.push_str("(nil)\n"),
+        Reply::Nil => out.extend_from_slice(b"(nil)\n"),
         Reply::Array(items, empty) => {
             if items.is_empty() {
-                out.push_str(match empty {
-                    Empty::List => "(empty list)\n",
-                    Empty::Set => "(empty set)\n",
-                    Empty::Hash => "(empty hash)\n",
+                out.extend_from_slice(match empty {
+                    Empty::List => b"(empty list)\n",
+                    Empty::Set => b"(empty set)\n",
+                    Empty::Hash => b"(empty hash)\n",
                 });
             } else {
                 for (i, item) in items.iter().enumerate() {
-                    out.push_str(&format!("{}) \"{item}\"\n", i + 1));
+                    out.extend_from_slice(format!("{}) \"", i + 1).as_bytes());
+                    push_lossy(out, item);
+                    out.extend_from_slice(b"\"\n");
                 }
             }
         }
@@ -81,25 +86,26 @@ pub(crate) fn render_human(reply: &Reply, out: &mut String) {
     }
 }
 
-pub(crate) fn render_raw(reply: &Reply, out: &mut String) {
+/// Raw mode writes values byte-for-byte, so binary payloads survive a pipe.
+pub(crate) fn render_raw(reply: &Reply, out: &mut Vec<u8>) {
     match reply {
         Reply::Simple(s) => {
-            out.push_str(s);
-            out.push('\n');
+            out.extend_from_slice(s.as_bytes());
+            out.push(b'\n');
         }
         Reply::Int(n) => {
-            out.push_str(&n.to_string());
-            out.push('\n');
+            out.extend_from_slice(n.to_string().as_bytes());
+            out.push(b'\n');
         }
         Reply::Bulk(v) => {
-            out.push_str(v);
-            out.push('\n');
+            out.extend_from_slice(v);
+            out.push(b'\n');
         }
-        Reply::Nil => out.push('\n'),
+        Reply::Nil => out.push(b'\n'),
         Reply::Array(items, _) => {
             for item in items {
-                out.push_str(item);
-                out.push('\n');
+                out.extend_from_slice(item);
+                out.push(b'\n');
             }
         }
         Reply::Lines(replies) => {
@@ -110,72 +116,77 @@ pub(crate) fn render_raw(reply: &Reply, out: &mut String) {
     }
 }
 
-pub(crate) fn push_json_string(s: &str, out: &mut String) {
-    out.push('"');
-    for c in s.chars() {
+fn push_json_string(bytes: &[u8], out: &mut Vec<u8>) {
+    out.push(b'"');
+    for c in String::from_utf8_lossy(bytes).chars() {
         match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+            '"' => out.extend_from_slice(b"\\\""),
+            '\\' => out.extend_from_slice(b"\\\\"),
+            '\n' => out.extend_from_slice(b"\\n"),
+            '\r' => out.extend_from_slice(b"\\r"),
+            '\t' => out.extend_from_slice(b"\\t"),
+            c if (c as u32) < 0x20 => {
+                out.extend_from_slice(format!("\\u{:04x}", c as u32).as_bytes())
+            }
+            c => {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
         }
     }
-    out.push('"');
+    out.push(b'"');
 }
 
-pub(crate) fn render_json(reply: &Reply, out: &mut String) {
+pub(crate) fn render_json(reply: &Reply, out: &mut Vec<u8>) {
     match reply {
-        Reply::Simple(s) => push_json_string(s, out),
-        Reply::Int(n) => out.push_str(&n.to_string()),
+        Reply::Simple(s) => push_json_string(s.as_bytes(), out),
+        Reply::Int(n) => out.extend_from_slice(n.to_string().as_bytes()),
         Reply::Bulk(v) => push_json_string(v, out),
-        Reply::Nil => out.push_str("null"),
+        Reply::Nil => out.extend_from_slice(b"null"),
         // Alternating field/value items (HGETALL) become a JSON object.
         Reply::Array(items, Empty::Hash) => {
-            out.push('{');
+            out.push(b'{');
             for (i, pair) in items.chunks(2).enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    out.push(b',');
                 }
                 push_json_string(&pair[0], out);
-                out.push(':');
-                push_json_string(pair.get(1).map_or("", |v| v), out);
+                out.push(b':');
+                push_json_string(pair.get(1).map_or(&[][..], |v| v), out);
             }
-            out.push('}');
+            out.push(b'}');
         }
         Reply::Array(items, _) => {
-            out.push('[');
+            out.push(b'[');
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    out.push(b',');
                 }
                 push_json_string(item, out);
             }
-            out.push(']');
+            out.push(b']');
         }
         Reply::Lines(replies) => {
-            out.push('[');
+            out.push(b'[');
             for (i, r) in replies.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    out.push(b',');
                 }
                 render_json(r, out);
             }
-            out.push(']');
+            out.push(b']');
         }
     }
 }
 
-pub(crate) fn render(reply: &Reply, format: OutputFormat) -> String {
-    let mut out = String::new();
+pub(crate) fn render(reply: &Reply, format: OutputFormat) -> Vec<u8> {
+    let mut out = Vec::new();
     match format {
         OutputFormat::Human => render_human(reply, &mut out),
         OutputFormat::Raw => render_raw(reply, &mut out),
         OutputFormat::Json => {
             render_json(reply, &mut out);
-            out.push('\n');
+            out.push(b'\n');
         }
     }
     out
