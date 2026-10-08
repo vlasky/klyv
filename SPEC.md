@@ -73,22 +73,47 @@ CREATE TABLE IF NOT EXISTS hash_fields (
 
 ### Migration from schema v1
 
-A v1 database (klyv ≤ 0.2.0: `user_version` 0, no catalogue, a separate `expiry` table in whole seconds) is migrated in place, inside a `BEGIN IMMEDIATE` transaction, the first time it is opened:
+A v1 database (klyv ≤ 0.2.0: `user_version` 0, no catalogue, a separate `expiry` table in whole seconds) is migrated in place, inside a `BEGIN IMMEDIATE` transaction, the first time it is opened. The same steps double as a **repair** and run whenever a v1-style `expiry` *table* is found in a v2 file (which only happens if a pre-v2 binary wrote to the file after migration — it recreates the table and writes payload around the catalogue). In order:
 
 ```sql
+-- 1. Prune catalogue rows whose declared payload is gone (so a key whose type
+--    an old binary changed is re-catalogued from the payload that exists).
+DELETE FROM keyspace WHERE
+    (type = 'string' AND key NOT IN (SELECT key FROM strings)) OR
+    (type = 'list'   AND key NOT IN (SELECT key FROM list_items)) OR
+    (type = 'set'    AND key NOT IN (SELECT key FROM set_members)) OR
+    (type = 'hash'   AND key NOT IN (SELECT key FROM hash_fields));
+
+-- 2. Catalogue any payload that lacks a row. This order reproduces v1's
+--    type-lookup precedence for a key that illegally existed in several tables.
 INSERT OR IGNORE INTO keyspace (key, type) SELECT key, 'string' FROM strings;
 INSERT OR IGNORE INTO keyspace (key, type) SELECT DISTINCT key, 'list' FROM list_items;
 INSERT OR IGNORE INTO keyspace (key, type) SELECT DISTINCT key, 'set' FROM set_members;
 INSERT OR IGNORE INTO keyspace (key, type) SELECT DISTINCT key, 'hash' FROM hash_fields;
-UPDATE keyspace SET expires_at = (SELECT expires_at * 1000 FROM expiry WHERE expiry.key = keyspace.key);
+
+-- 3. Only if an expiry table exists: fold it in as milliseconds, clamped so the
+--    multiplication cannot overflow into a REAL, touching only keys it names
+--    (other keys keep their v2 expiry). Then drop it. Rows for keys with no
+--    payload (orphans) are thereby discarded.
+UPDATE keyspace SET expires_at = (
+    SELECT CASE
+        WHEN e.expires_at >  9223372036854775 THEN  9223372036854775807
+        WHEN e.expires_at < -9223372036854775 THEN -9223372036854775808
+        ELSE e.expires_at * 1000
+    END FROM expiry e WHERE e.key = keyspace.key)
+WHERE key IN (SELECT key FROM expiry);
 DROP TABLE expiry;
--- then delete payload rows whose key is catalogued as another type
+
+-- 4. Delete payload a key holds in tables other than its catalogue type.
+DELETE FROM strings     WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'string');
+DELETE FROM list_items  WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'list');
+DELETE FROM set_members WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'set');
+DELETE FROM hash_fields WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'hash');
+
 PRAGMA user_version = 2;
 ```
 
-The insert order reproduces the v1 type-lookup precedence for a key that illegally existed in several tables. Expiry rows with no data (orphans) are dropped. A database whose `user_version` is **newer** than the implementation supports must be refused, not opened.
-
-The catalogue population and reconciliation steps are idempotent and also run whenever a v1-style `expiry` **table** is found in a v2 file — that only happens if a pre-v2 binary wrote to the file after migration — so such a file is repaired on the next open: stray payload rows are catalogued, the table's expiries folded in and the table dropped, and catalogue rows without payload removed.
+A database whose `user_version` is **newer** than the implementation supports must be refused, not opened. A healthy v2 file (version 2, no `expiry` table) runs none of the steps above on open; the per-open cost is independent of database size.
 
 **Downgrade guard.** Every v2 file (fresh or migrated) also carries a VIEW named `expiry`, re-created if missing on every open:
 
