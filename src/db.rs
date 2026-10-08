@@ -11,6 +11,12 @@
 //! - a key has a catalogue row iff it has data rows (`claim` when creating,
 //!   `release_if_empty` after removing elements);
 //! - expiry lives only in the catalogue (`expires_at`, Unix ms, NULL = none).
+//!
+//! Downgrade protection: a VIEW named `expiry` shadows the v1 table of that
+//! name. klyv <= 0.2.0 runs `CREATE INDEX ... ON expiry` on open, which fails
+//! on a view ("views may not be indexed"), so an old binary refuses a v2 file
+//! outright instead of recreating an empty expiry table and running
+//! split-brain against the catalogue.
 
 use crate::reply::CmdError;
 use rusqlite::types::Value;
@@ -58,6 +64,13 @@ const CREATE_V2: &str = "
     );
 ";
 
+/// See the module docs: makes pre-v2 binaries fail to open the file.
+const DOWNGRADE_GUARD: &str = "
+    CREATE VIEW IF NOT EXISTS expiry AS
+        SELECT key, expires_at / 1000 AS expires_at FROM keyspace
+        WHERE expires_at IS NOT NULL;
+";
+
 /// Builds the catalogue from the v1 data tables and folds the seconds-based
 /// `expiry` table into it as milliseconds. `INSERT OR IGNORE` in this order
 /// gives a key that (illegally) existed in several tables the same type the
@@ -102,6 +115,8 @@ pub(crate) fn open_db(path: &Path) -> Result<Connection, Box<dyn std::error::Err
             if has_v1 {
                 tx.execute_batch(MIGRATE_V1_TO_V2)?;
             }
+            // After any v1 `expiry` table is gone, so the view can take its name.
+            tx.execute_batch(DOWNGRADE_GUARD)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         SCHEMA_VERSION => {}

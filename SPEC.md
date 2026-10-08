@@ -86,6 +86,15 @@ PRAGMA user_version = 2;
 
 The insert order reproduces the v1 type-lookup precedence for a key that illegally existed in several tables. Expiry rows with no data (orphans) are dropped. A database whose `user_version` is **newer** than the implementation supports must be refused, not opened.
 
+**Downgrade guard.** Every v2 file (fresh or migrated) also carries a VIEW named `expiry`:
+
+```sql
+CREATE VIEW IF NOT EXISTS expiry AS
+    SELECT key, expires_at / 1000 AS expires_at FROM keyspace WHERE expires_at IS NOT NULL;
+```
+
+Its only purpose is to make pre-v2 implementations fail loudly: a v1 binary runs `CREATE INDEX IF NOT EXISTS ... ON expiry(...)` on open, which SQLite rejects on a view ("views may not be indexed"), so the old binary exits with an open error instead of recreating an empty `expiry` table and silently writing around the catalogue. Ports must create it too.
+
 ### Design Rationale
 
 - **Catalogue plus per-type payload tables.** The `keyspace` table makes "does this key exist, what type is it, has it expired" one indexed read, and gives `KEYS`, `EXISTS`, `TYPE`, `DBSIZE` and every TTL command a single table to consult. Payload stays in per-type tables for type-specific indexing and constraints. The one-type-per-key invariant is kept by the catalogue (see [Type Safety](#type-safety)).

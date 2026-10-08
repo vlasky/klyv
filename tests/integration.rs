@@ -2550,13 +2550,14 @@ fn test_migrates_v1_database_in_place() {
     assert_eq!(version, 2);
     let has_expiry: bool = conn
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'expiry'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'expiry'",
             [],
             |r| r.get::<_, i64>(0),
         )
         .unwrap()
         > 0;
     assert!(!has_expiry, "v1 expiry table should be dropped");
+    assert_v1_binary_cannot_open(&db);
     // The orphan expiry row (no data) did not become a key.
     let orphan: i64 = conn
         .query_row(
@@ -2566,6 +2567,30 @@ fn test_migrates_v1_database_in_place() {
         )
         .unwrap();
     assert_eq!(orphan, 0);
+}
+
+/// Runs the exact open sequence klyv 0.2.0 executes and asserts it fails, so
+/// an old binary refuses a v2 file instead of running split-brain against it.
+fn assert_v1_binary_cannot_open(db: &str) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let err = conn
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS strings (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+             CREATE TABLE IF NOT EXISTS expiry (key TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+             CREATE INDEX IF NOT EXISTS idx_expiry_at ON expiry(expires_at);",
+        )
+        .expect_err("a v1 binary must fail to open a v2 file");
+    assert!(
+        err.to_string().contains("views may not be indexed"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_v1_binary_cannot_open_fresh_v2_file() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    assert_v1_binary_cannot_open(&db);
 }
 
 #[test]
