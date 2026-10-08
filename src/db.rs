@@ -91,18 +91,26 @@ const FOLD_V1_EXPIRY: &str = "
     DROP TABLE expiry;
 ";
 
-/// Restores the catalogue invariants after population: payload in the wrong
-/// table for its type goes, and catalogue rows with no payload go.
-const RECONCILE: &str = "
-    DELETE FROM strings     WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'string');
-    DELETE FROM list_items  WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'list');
-    DELETE FROM set_members WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'set');
-    DELETE FROM hash_fields WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'hash');
+/// Drops catalogue rows whose declared payload is gone. Runs *before*
+/// repopulation so that a key whose type an old binary changed (e.g. SET over
+/// a list: list rows deleted, a strings row written) is re-catalogued from
+/// the payload that actually exists rather than having that payload deleted
+/// as a wrong-table straggler.
+const PRUNE_EMPTY_CATALOGUE: &str = "
     DELETE FROM keyspace WHERE
         (type = 'string' AND key NOT IN (SELECT key FROM strings)) OR
         (type = 'list'   AND key NOT IN (SELECT key FROM list_items)) OR
         (type = 'set'    AND key NOT IN (SELECT key FROM set_members)) OR
         (type = 'hash'   AND key NOT IN (SELECT key FROM hash_fields));
+";
+
+/// After population every catalogue row has payload of its own type; any
+/// payload a key has in *other* tables is a straggler and goes.
+const RECONCILE: &str = "
+    DELETE FROM strings     WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'string');
+    DELETE FROM list_items  WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'list');
+    DELETE FROM set_members WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'set');
+    DELETE FROM hash_fields WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'hash');
 ";
 
 /// See the module docs: makes pre-v2 binaries fail to open the file.
@@ -139,6 +147,7 @@ pub(crate) fn open_db(path: &Path) -> Result<Connection, Box<dyn std::error::Err
         .optional()?
         .is_some();
     if version < SCHEMA_VERSION || has_v1_expiry {
+        tx.execute_batch(PRUNE_EMPTY_CATALOGUE)?;
         tx.execute_batch(POPULATE_CATALOGUE)?;
         if has_v1_expiry {
             tx.execute_batch(FOLD_V1_EXPIRY)?;
