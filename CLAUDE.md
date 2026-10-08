@@ -115,7 +115,16 @@ Values beginning with a hyphen need the standard `--` escape on the CLI (`klyv a
 
 ## Architecture
 
-Single-file Rust binary. All state in one SQLite database with five tables: `strings`, `list_items`, `set_members`, `hash_fields`, `expiry`. Lists use fractional indexing (REAL column) for O(1) push. Expiry uses lazy filtering (reads check `expiry` table, `purge` does physical deletion). WAL mode for concurrent reads.
+Module layout under `src/`:
+
+- `main.rs` — entry point only: open the DB, then one-shot `dispatch` or hand off to the shell.
+- `cli.rs` — clap definitions (`Cli`, `Command`, `OutputFormat`), `is_write`, and the transactional `dispatch`/`run` that routes a `Command` to its implementation.
+- `reply.rs` — the typed `Reply`/`CmdError` and the human/raw/json renderers.
+- `db.rs` — schema creation and the key/expiry helpers every command shares (`key_type`, `ensure_type`, `is_expired`, `drop_if_expired`, …).
+- `shell.rs` — REPL and pipe mode (`split_line`, `run_line`, `repl`, `pipe`).
+- `commands/{strings,lists,sets,hashes,keys,ttl}.rs` — one module per type family; each `cmd_*` takes a `&Connection` already inside the dispatcher's transaction.
+
+All state in one SQLite database with five tables: `strings`, `list_items`, `set_members`, `hash_fields`, `expiry`. Lists use fractional indexing (REAL column) for O(1) push. Expiry uses lazy filtering (reads check `expiry` table, `purge` does physical deletion). WAL mode for concurrent reads.
 
 See SPEC.md for the full portable specification.
 
