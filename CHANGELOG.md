@@ -4,7 +4,7 @@
 
 ### Changed
 
-- **Schema v2 (automatic in-place migration).** A `keyspace` catalogue table (key, type, expiry) now records every key; the per-type tables hold payload only. Type lookup, `exists`, `type`, `keys`, `db-size` and every TTL command are single indexed reads instead of probes across four tables, and the one-type-per-key invariant is structural rather than per-command. Databases from klyv 0.2.0 are migrated the first time they are opened; files with a newer schema version are refused. Documented in SPEC.md.
+- **Schema v2 (automatic in-place migration).** A `keyspace` catalogue table (key, type, expiry) now records every key; the per-type tables hold payload only. Type lookup, `exists`, `type`, `keys`, `db-size` and every TTL command are single indexed reads instead of probes across four tables, and the one-type-per-key invariant is structural rather than per-command. Databases from klyv 0.2.0 are migrated the first time they are opened; files with a newer schema version are refused, and a v2 file carries a guard (a view named `expiry`) that makes klyv ≤ 0.2.0 fail to open it rather than run split-brain against it. Documented in SPEC.md.
 - **Millisecond expiry.** Expiry is stored in Unix milliseconds. `p-expire` and `set --px` no longer round up to whole seconds; `ttl` rounds the remainder to the nearest second like Redis (so `expire k 100` then `ttl k` reports 100, not 99).
 - **`db-size` counts live keys only**; expired-but-unpurged keys are no longer included.
 - Internal: replies carry bytes rather than strings, and raw output is written byte-for-byte, so binary values from a future RESP client will survive the storage and output layers.
