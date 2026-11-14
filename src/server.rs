@@ -49,6 +49,17 @@ pub(crate) struct ServeArgs {
     /// maximum is also bounded by the process's open-file limit.
     #[arg(long, value_name = "N", default_value_t = 10_000)]
     pub(crate) maxclients: usize,
+
+    /// Require clients to authenticate with this password (AUTH, or HELLO
+    /// ... AUTH). Prefer the environment variable: a command-line argument
+    /// is visible to other users in the process list.
+    #[arg(
+        long,
+        value_name = "PASSWORD",
+        env = "KLYV_REQUIREPASS",
+        hide_env_values = true
+    )]
+    pub(crate) requirepass: Option<String>,
 }
 
 struct Shared {
@@ -57,6 +68,8 @@ struct Shared {
     clients: AtomicUsize,
     max_clients: usize,
     tcp_port: u16,
+    /// The password clients must present, if one is configured.
+    password: Option<Vec<u8>>,
 }
 
 /// Per-connection state.
@@ -65,6 +78,8 @@ struct Session {
     name: Option<Vec<u8>>,
     /// RESP2 until the client asks for RESP3 with HELLO 3.
     proto: Proto,
+    /// False until the client presents the password, if one is configured.
+    authenticated: bool,
     /// `Some` between MULTI and EXEC/DISCARD: the commands queued so far.
     multi: Option<Vec<Vec<Vec<u8>>>>,
     /// A command was rejected while queueing, so EXEC must abort.
@@ -542,28 +557,92 @@ fn bulk(s: impl Into<Vec<u8>>) -> Reply {
     Reply::Bulk(s.into())
 }
 
-fn hello(session: &mut Session, args: &[Arg<'_>]) -> CmdResult {
+fn wrong_pass() -> CmdError {
+    err("WRONGPASS invalid username-password pair or user is disabled.")
+}
+
+/// Compares in time independent of where the two differ, so that response
+/// timing does not reveal how much of a guessed password was right.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Checks a username and password as Redis does for its `default` user,
+/// the only one there is. With no password configured that user accepts any
+/// password.
+fn check_credentials(shared: &Shared, user: &[u8], pass: &[u8]) -> Result<(), CmdError> {
+    if user != b"default" {
+        return Err(wrong_pass());
+    }
+    match &shared.password {
+        Some(expected) if !constant_time_eq(expected, pass) => Err(wrong_pass()),
+        _ => Ok(()),
+    }
+}
+
+/// AUTH password | AUTH username password
+fn auth(session: &mut Session, shared: &Shared, args: &[Arg<'_>]) -> CmdResult {
+    match args {
+        [pass] => {
+            if shared.password.is_none() {
+                return Err(err(
+                    "ERR AUTH <password> called without any password configured for the \
+                     default user. Are you sure your configuration is correct?",
+                ));
+            }
+            check_credentials(shared, b"default", pass.as_bytes())?;
+        }
+        [user, pass] => check_credentials(shared, user.as_bytes(), pass.as_bytes())?,
+        _ => return Err(syntax_error()),
+    }
+    // A failed AUTH above leaves an authenticated connection authenticated.
+    session.authenticated = true;
+    Ok(Reply::Simple("OK"))
+}
+
+/// HELLO [protover [AUTH username password] [SETNAME clientname]]
+fn hello(session: &mut Session, shared: &Shared, args: &[Arg<'_>]) -> CmdResult {
+    let mut proto = session.proto;
+    let mut credentials = None;
+    let mut name = None;
     if let Some(&version) = args.first() {
-        let proto = match int(version)
+        proto = match int(version)
             .map_err(|_| err("ERR Protocol version is not an integer or out of range"))?
         {
             2 => Proto::Resp2,
             3 => Proto::Resp3,
             _ => return Err(err("NOPROTO unsupported protocol version")),
         };
-        // Validate every option before switching, so a rejected HELLO
-        // leaves the connection as it was.
         let mut rest = args[1..].iter().copied();
         while let Some(opt) = rest.next() {
             if is(opt, "AUTH") {
-                return Err(no_password_configured());
+                let user = rest.next().ok_or_else(syntax_error)?;
+                let pass = rest.next().ok_or_else(syntax_error)?;
+                credentials = Some((user, pass));
             } else if is(opt, "SETNAME") {
-                rest.next().ok_or_else(syntax_error)?;
+                name = Some(rest.next().ok_or_else(syntax_error)?);
             } else {
                 return Err(syntax_error());
             }
         }
-        session.proto = proto;
+    }
+    // Everything is validated before anything changes, so a rejected HELLO
+    // leaves the connection exactly as it was.
+    match credentials {
+        Some((user, pass)) => check_credentials(shared, user.as_bytes(), pass.as_bytes())?,
+        None if !session.authenticated => {
+            return Err(err(
+                "NOAUTH HELLO must be called with the client already authenticated, otherwise \
+                 the HELLO <proto> AUTH <user> <pass> option can be used to authenticate the \
+                 client and select the RESP protocol version at the same time",
+            ));
+        }
+        None => {}
+    }
+    session.authenticated = true;
+    session.proto = proto;
+    if let Some(name) = name {
+        session.name = Some(name.as_bytes().to_vec());
     }
     let proto = match session.proto {
         Proto::Resp2 => 2,
@@ -578,13 +657,6 @@ fn hello(session: &mut Session, args: &[Arg<'_>]) -> CmdResult {
         (bulk("role"), bulk("master")),
         (bulk("modules"), Reply::Lines(vec![])),
     ]))
-}
-
-fn no_password_configured() -> CmdError {
-    err(
-        "ERR AUTH <password> called without any password configured for the default \
-         user. Are you sure your configuration is correct?",
-    )
 }
 
 fn client(session: &mut Session, args: &[Arg<'_>]) -> CmdResult {
@@ -674,7 +746,7 @@ fn connection_command(
             Ok(_) => Err(err("ERR DB index is out of range")),
             Err(e) => Err(e),
         },
-        b"HELLO" => hello(session, args),
+        b"HELLO" => hello(session, shared, args),
         b"CLIENT" => client(session, args),
         b"COMMAND" => Ok(match args.first() {
             Some(sub) if is(*sub, "COUNT") => Reply::Int(DATA_COMMANDS.len() as i64),
@@ -695,7 +767,7 @@ fn connection_command(
             }
         }
         b"INFO" => info(conn, shared),
-        b"AUTH" => Err(no_password_configured()),
+        b"AUTH" => auth(session, shared, args),
         _ => unreachable!("arity table and dispatch disagree"),
     };
     Some(Outcome::Reply(result))
@@ -936,6 +1008,12 @@ fn execute(
 ) -> bool {
     let name = raw[0].to_ascii_uppercase();
     let args: Vec<Arg<'_>> = raw[1..].iter().map(|a| Arg(a)).collect();
+    // Until the password has been presented, only the commands that can
+    // present it (or leave) are available.
+    if !session.authenticated && !matches!(name.as_slice(), b"AUTH" | b"HELLO" | b"QUIT") {
+        encode_error("NOAUTH Authentication required.", out);
+        return false;
+    }
     let (result, close) =
         if let Some(result) = transaction_command(conn, session, shared, &name, raw, &args) {
             (result, false)
@@ -1004,6 +1082,7 @@ fn serve_connection(reader: impl Read, writer: impl Write, shared: &Shared, admi
         id: shared.next_id.fetch_add(1, Ordering::Relaxed),
         name: None,
         proto: Proto::Resp2,
+        authenticated: shared.password.is_none(),
         multi: None,
         multi_error: false,
         watched: Vec::new(),
@@ -1143,6 +1222,70 @@ mod unix {
     }
 }
 
+/// File descriptors each client connection holds: its socket, and SQLite's
+/// database, WAL and shared-memory files.
+const FDS_PER_CLIENT: u64 = 4;
+/// Descriptors kept back for everything else: listeners, stdio, the files
+/// SQLite opens briefly, and headroom.
+const FDS_RESERVED: u64 = 32;
+
+/// Raises the open-file limit as far as needed for `wanted` clients, as far
+/// as the system allows, and returns how many clients the result supports.
+/// The default soft limit is often far too low for a server (256 on macOS
+/// allows about 56 clients); the hard limit is usually much higher and a
+/// process may raise its own soft limit up to it. If even that is not
+/// enough the client limit is lowered to fit, with a notice, rather than
+/// have connections fail unpredictably once descriptors run out.
+#[cfg(unix)]
+// rlim_t is u64 on the common platforms but not on all of them.
+#[allow(clippy::unnecessary_cast)]
+fn usable_clients(wanted: usize) -> usize {
+    let needed = (wanted as u64)
+        .saturating_mul(FDS_PER_CLIENT)
+        .saturating_add(FDS_RESERVED);
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes one rlimit struct through a valid pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return wanted;
+    }
+    let mut ceiling = limit.rlim_max as u64;
+    // macOS refuses a soft limit above OPEN_MAX (10240, from
+    // <sys/syslimits.h>) even when it reports the hard limit as unlimited.
+    #[cfg(target_os = "macos")]
+    {
+        ceiling = ceiling.min(10_240);
+    }
+    let mut current = limit.rlim_cur as u64;
+    if current < needed && current < ceiling {
+        let target = needed.min(ceiling);
+        let raised = libc::rlimit {
+            rlim_cur: target as libc::rlim_t,
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: setrlimit reads one rlimit struct through a valid pointer.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            current = target;
+        }
+    }
+    if current >= needed {
+        return wanted;
+    }
+    let usable = (current.saturating_sub(FDS_RESERVED) / FDS_PER_CLIENT).max(1) as usize;
+    eprintln!(
+        "notice: the open-file limit ({current}) allows about {usable} clients, not the \
+         {wanted} requested with --maxclients; raise it with ulimit -n to serve more"
+    );
+    usable
+}
+
+#[cfg(not(unix))]
+fn usable_clients(wanted: usize) -> usize {
+    wanted
+}
+
 /// Runs the server until the process is terminated. Returns an exit code
 /// only on a startup failure.
 pub(crate) fn serve(db: &Path, args: ServeArgs) -> i32 {
@@ -1181,11 +1324,18 @@ fn start(db: &Path, args: ServeArgs) -> Result<Vec<std::thread::JoinHandle<()>>,
         None => None,
     };
 
+    let max_clients = usable_clients(args.maxclients);
+    let password = args.requirepass.clone().map(String::into_bytes);
+    if password.as_ref().is_some_and(Vec::is_empty) {
+        return Err("--requirepass must not be empty".into());
+    }
+    let has_password = password.is_some();
     let shared = Arc::new(Shared {
         db: db.to_path_buf(),
+        password,
         next_id: AtomicU64::new(1),
         clients: AtomicUsize::new(0),
-        max_clients: args.maxclients,
+        max_clients,
         tcp_port: tcp
             .first()
             .and_then(|l| l.local_addr().ok())
@@ -1220,10 +1370,18 @@ fn start(db: &Path, args: ServeArgs) -> Result<Vec<std::thread::JoinHandle<()>>,
     for listener in tcp {
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         if !addr.ip().is_loopback() {
-            eprintln!(
-                "warning: listening on {addr}, which is not a loopback address; klyv has no \
-                 authentication, so anyone who can reach it can read and change the database"
-            );
+            if has_password {
+                eprintln!(
+                    "warning: listening on {addr}, which is not a loopback address; there is \
+                     no TLS, so the password and all data cross the network unencrypted"
+                );
+            } else {
+                eprintln!(
+                    "warning: listening on {addr}, which is not a loopback address, with no \
+                     password (--requirepass): anyone who can reach it can read and change \
+                     the database"
+                );
+            }
         }
         let _ = writeln!(out, "listening on tcp://{addr}");
         let shared = Arc::clone(&shared);
