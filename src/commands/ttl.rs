@@ -15,23 +15,38 @@ fn set_expiry(conn: &Connection, key: &str, now: i64, at_ms: i64) -> CmdResult {
     Ok(Reply::Int(1))
 }
 
+fn invalid_expire(name: &str) -> CmdError {
+    CmdError::new(format!("ERR invalid expire time in '{name}' command"))
+}
+
+/// Seconds to milliseconds. Like Redis, negative values are allowed (they
+/// expire the key at once) but a value whose conversion would overflow is an
+/// error, reported before the key is even looked up.
+fn seconds_to_ms(seconds: i64, name: &str) -> Result<i64, CmdError> {
+    seconds
+        .checked_mul(1000)
+        .ok_or_else(|| invalid_expire(name))
+}
+
+fn after(now: i64, ms: i64, name: &str) -> Result<i64, CmdError> {
+    now.checked_add(ms).ok_or_else(|| invalid_expire(name))
+}
+
 pub(crate) fn cmd_expire(conn: &Connection, key: &str, seconds: i64) -> CmdResult {
     let now = now_ms();
-    set_expiry(
-        conn,
-        key,
-        now,
-        now.saturating_add(seconds.saturating_mul(1000)),
-    )
+    let at = after(now, seconds_to_ms(seconds, "expire")?, "expire")?;
+    set_expiry(conn, key, now, at)
 }
 
 pub(crate) fn cmd_pexpire(conn: &Connection, key: &str, milliseconds: i64) -> CmdResult {
     let now = now_ms();
-    set_expiry(conn, key, now, now.saturating_add(milliseconds))
+    let at = after(now, milliseconds, "pexpire")?;
+    set_expiry(conn, key, now, at)
 }
 
 pub(crate) fn cmd_expireat(conn: &Connection, key: &str, timestamp: i64) -> CmdResult {
-    set_expiry(conn, key, now_ms(), timestamp.saturating_mul(1000))
+    let at = seconds_to_ms(timestamp, "expireat")?;
+    set_expiry(conn, key, now_ms(), at)
 }
 
 pub(crate) fn cmd_pexpireat(conn: &Connection, key: &str, timestamp_ms: i64) -> CmdResult {

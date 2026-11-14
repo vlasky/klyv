@@ -2726,3 +2726,103 @@ fn test_split_brain_type_change_adopts_old_binary_write() {
     let (out, _, _) = klyv(&db, &["get", "l"]);
     assert_eq!(out.trim(), "now-a-string");
 }
+
+// === 0.3.1: open fast path, expiry overflow, glob edge cases ===
+
+#[test]
+fn test_read_does_not_wait_for_a_writer() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    // Another connection holds the write lock for the whole test. Opening an
+    // up-to-date database must not need it; if it did, this read would sit
+    // in the 5 s busy timeout and then fail.
+    let holder = rusqlite::Connection::open(&db).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    let (out, err, ok) = klyv(&db, &["get", "k"]);
+    assert!(ok, "read failed under a held write lock: {err}");
+    assert_eq!(out.trim(), "v");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "read waited for the writer"
+    );
+    holder.execute_batch("ROLLBACK").unwrap();
+}
+
+// A database file the user may not write (but in a directory where SQLite
+// can still create its WAL side files) is readable. A fully read-only
+// directory is not: SQLite cannot open a WAL database there at all.
+#[cfg(unix)]
+#[test]
+fn test_read_only_database_file_is_readable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("ro.db");
+    let db_str = db.to_str().unwrap();
+    klyv(db_str, &["set", "k", "v"]);
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let (out, err, ok) = klyv(db_str, &["get", "k"]);
+    assert!(ok, "read of a read-only database file failed: {err}");
+    assert_eq!(out.trim(), "v");
+    let (_, err, ok) = klyv(db_str, &["set", "k", "w"]);
+    assert!(!ok);
+    assert!(err.contains("readonly"), "got: {err}");
+}
+
+#[test]
+fn test_unknown_catalogue_type_is_an_error_not_a_panic() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("UPDATE keyspace SET type = 'zset' WHERE key = 'k'", [])
+        .unwrap();
+    drop(conn);
+    let (_, err, ok) = klyv(&db, &["get", "k"]);
+    assert!(!ok);
+    assert!(err.starts_with("ERR database error"), "got: {err}");
+    assert!(err.contains("unknown key type"), "got: {err}");
+    assert!(!err.contains("panicked"), "got: {err}");
+}
+
+#[test]
+fn test_expire_overflow_is_rejected() {
+    let db = fresh_db();
+    klyv(&db, &["set", "k", "v"]);
+    for args in [
+        ["expire", "k", "9223372036854775807"],
+        ["expire", "k", "-9223372036854775808"],
+        ["expire", "missing", "9223372036854775807"],
+        ["p-expire", "k", "9223372036854775807"],
+        ["expire-at", "k", "9223372036854776"],
+    ] {
+        let (_, err, ok) = klyv(&db, &args);
+        assert!(!ok, "{args:?} should fail");
+        assert!(
+            err.starts_with("ERR invalid expire time in '"),
+            "{args:?} gave: {err}"
+        );
+    }
+    assert_eq!(
+        ttl_of(&db, "ttl", "k"),
+        -1,
+        "a rejected expiry must change nothing"
+    );
+
+    let (_, err, ok) = klyv(&db, &["set", "k", "v", "--ex", "9223372036854776"]);
+    assert!(!ok);
+    assert_eq!(err.trim(), "ERR invalid expire time in 'set' command");
+}
+
+#[test]
+fn test_keys_malformed_patterns_follow_redis() {
+    let db = fresh_db();
+    klyv(&db, &["m-set", "a", "1", "b", "1", "a-c", "1", "", "1"]);
+    let keys = |pattern: &str| klyv_fmt(&db, "json", &["keys", pattern]).0;
+    assert_eq!(keys("[a").trim(), r#"["a"]"#);
+    assert_eq!(keys("[c-a]").trim(), r#"["a","b"]"#);
+    assert_eq!(keys("[]a]").trim(), "[]");
+    assert_eq!(keys(r"[a\-c]*").trim(), r#"["a","a-c"]"#);
+    // Only a lone `*` matches the empty key.
+    assert_eq!(keys("*").trim(), r#"["","a","a-c","b"]"#);
+    assert_eq!(keys("**").trim(), r#"["a","a-c","b"]"#);
+}

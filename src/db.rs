@@ -122,13 +122,23 @@ const DOWNGRADE_GUARD: &str = "
 
 pub(crate) fn open_db(path: &Path) -> Result<Connection, Box<dyn std::error::Error>> {
     let mut conn = Connection::open(path)?;
+    // busy_timeout first, so it also covers the journal-mode switch.
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    // Fast path: a file that is already at the current schema, in WAL mode
+    // and carrying the downgrade guard needs no setup, so opening it takes
+    // no write lock. That keeps reads from queueing behind a writer and lets
+    // a database on read-only media be read at all.
+    if is_current(&conn)? {
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        return Ok(conn);
+    }
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
-         PRAGMA busy_timeout=5000;",
+         PRAGMA synchronous=NORMAL;",
     )?;
-    // Take the write lock before deciding, so two processes opening a v1
-    // database at once cannot both try to migrate it.
+    // Take the write lock before deciding (and re-read the version under
+    // it), so two processes opening a v1 database at once cannot both try to
+    // migrate it.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
@@ -163,6 +173,29 @@ pub(crate) fn open_db(path: &Path) -> Result<Connection, Box<dyn std::error::Err
     Ok(conn)
 }
 
+/// True if the file needs no schema work: current `user_version`, WAL
+/// journal, and `expiry` present as the downgrade-guard view rather than as
+/// a table (a table means a pre-v2 binary wrote to the file and it needs the
+/// repair pass). Read-only; takes no write lock.
+fn is_current(conn: &Connection) -> rusqlite::Result<bool> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != SCHEMA_VERSION {
+        return Ok(false);
+    }
+    let journal: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if !journal.eq_ignore_ascii_case("wal") {
+        return Ok(false);
+    }
+    let guard: Option<String> = conn
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name = 'expiry'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(guard.as_deref() == Some("view"))
+}
+
 /// Current Unix time in milliseconds. Commands take it once so every
 /// statement in one command agrees on "now".
 pub(crate) fn now_ms() -> i64 {
@@ -195,14 +228,22 @@ pub(crate) fn data_table(kind: &str) -> &'static str {
     }
 }
 
-fn static_kind(kind: &str) -> &'static str {
-    match kind {
+/// Maps a catalogue `type` value to its static name. An unrecognised value
+/// (a corrupted or hand-edited file) is a database error, not a panic.
+fn static_kind(kind: &str) -> rusqlite::Result<&'static str> {
+    Ok(match kind {
         "string" => "string",
         "list" => "list",
         "set" => "set",
         "hash" => "hash",
-        other => unreachable!("unknown key type in catalogue: {other}"),
-    }
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("unknown key type in catalogue: {other:?}").into(),
+            ));
+        }
+    })
 }
 
 /// The catalogue row for a key, expired or not.
@@ -213,7 +254,7 @@ pub(crate) fn lookup(conn: &Connection, key: &str) -> rusqlite::Result<Option<Ke
         |row| {
             let kind: String = row.get(0)?;
             Ok(KeyRow {
-                kind: static_kind(&kind),
+                kind: static_kind(&kind)?,
                 expires_at: row.get(1)?,
             })
         },
