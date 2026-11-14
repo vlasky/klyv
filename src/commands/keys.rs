@@ -110,8 +110,8 @@ fn glob_match_impl(mut p: &[u8], mut s: &[u8], skip_longer: &mut bool, nesting: 
     p.is_empty() && s.is_empty()
 }
 
-pub(crate) fn cmd_keys(conn: &Connection, pattern: Option<&str>) -> CmdResult {
-    let pattern = pattern.unwrap_or("*").as_bytes();
+pub(crate) fn cmd_keys(conn: &Connection, pattern: Option<Arg<'_>>) -> CmdResult {
+    let pattern = pattern.map_or(&b"*"[..], Arg::as_bytes);
     // Redis special-cases a lone `*`, which is why it matches the empty key
     // even though the matcher proper never matches an empty string against
     // a non-empty pattern.
@@ -132,17 +132,17 @@ pub(crate) fn cmd_keys(conn: &Connection, pattern: Option<&str>) -> CmdResult {
     Ok(Reply::Array(keys, Empty::List))
 }
 
-pub(crate) fn cmd_exists(conn: &Connection, key: &str) -> CmdResult {
+pub(crate) fn cmd_exists(conn: &Connection, key: Arg<'_>) -> CmdResult {
     Ok(Reply::Int(key_type(conn, key, now_ms())?.is_some() as i64))
 }
 
-pub(crate) fn cmd_type(conn: &Connection, key: &str) -> CmdResult {
+pub(crate) fn cmd_type(conn: &Connection, key: Arg<'_>) -> CmdResult {
     Ok(Reply::Simple(
         key_type(conn, key, now_ms())?.unwrap_or("none"),
     ))
 }
 
-pub(crate) fn cmd_rename(conn: &Connection, key: &str, newkey: &str) -> CmdResult {
+pub(crate) fn cmd_rename(conn: &Connection, key: Arg<'_>, newkey: Arg<'_>) -> CmdResult {
     let now = now_ms();
     let src = match lookup(conn, key)? {
         Some(r) if r.is_live(now) => r,

@@ -4,7 +4,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 const KIND: &str = "string";
 
-pub(crate) fn get_string(conn: &Connection, key: &str) -> rusqlite::Result<Option<Vec<u8>>> {
+pub(crate) fn get_string(conn: &Connection, key: Arg<'_>) -> rusqlite::Result<Option<Vec<u8>>> {
     conn.query_row(
         "SELECT value FROM strings WHERE key = ?1",
         params![key],
@@ -13,7 +13,7 @@ pub(crate) fn get_string(conn: &Connection, key: &str) -> rusqlite::Result<Optio
     .optional()
 }
 
-fn put_string(conn: &Connection, key: &str, value: Vec<u8>) -> rusqlite::Result<()> {
+fn put_string(conn: &Connection, key: Arg<'_>, value: Vec<u8>) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO strings (key, value) VALUES (?1, ?2)",
         params![key, bind_value(value)],
@@ -23,8 +23,8 @@ fn put_string(conn: &Connection, key: &str, value: Vec<u8>) -> rusqlite::Result<
 
 pub(crate) fn cmd_set(
     conn: &Connection,
-    key: &str,
-    value: &str,
+    key: Arg<'_>,
+    value: Arg<'_>,
     nx: bool,
     ttl_ms: Option<i64>,
     keep_ttl: bool,
@@ -62,7 +62,7 @@ pub(crate) fn cmd_set(
     Ok(Reply::Simple("OK"))
 }
 
-pub(crate) fn cmd_getdel(conn: &Connection, key: &str) -> CmdResult {
+pub(crate) fn cmd_getdel(conn: &Connection, key: Arg<'_>) -> CmdResult {
     let now = now_ms();
     ensure_type(conn, key, KIND, now)?;
     drop_if_expired(conn, key, now)?;
@@ -75,7 +75,7 @@ pub(crate) fn cmd_getdel(conn: &Connection, key: &str) -> CmdResult {
     }
 }
 
-pub(crate) fn cmd_get(conn: &Connection, key: &str) -> CmdResult {
+pub(crate) fn cmd_get(conn: &Connection, key: Arg<'_>) -> CmdResult {
     if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Nil);
     }
@@ -85,10 +85,10 @@ pub(crate) fn cmd_get(conn: &Connection, key: &str) -> CmdResult {
     })
 }
 
-pub(crate) fn cmd_del(conn: &Connection, keys: &[String]) -> CmdResult {
+pub(crate) fn cmd_del(conn: &Connection, keys: &[Arg<'_>]) -> CmdResult {
     let now = now_ms();
     let mut count = 0i64;
-    for key in keys {
+    for &key in keys {
         // Count keys like Redis; an expired key is already logically gone so
         // it doesn't count, but its physical rows are still reclaimed.
         if remove_key(conn, key)?.is_some_and(|r| r.is_live(now)) {
@@ -98,7 +98,7 @@ pub(crate) fn cmd_del(conn: &Connection, keys: &[String]) -> CmdResult {
     Ok(Reply::Int(count))
 }
 
-pub(crate) fn cmd_incrby(conn: &Connection, key: &str, amount: i64) -> CmdResult {
+pub(crate) fn cmd_incrby(conn: &Connection, key: Arg<'_>, amount: i64) -> CmdResult {
     let now = now_ms();
     ensure_type(conn, key, KIND, now)?;
     drop_if_expired(conn, key, now)?;
@@ -114,7 +114,7 @@ pub(crate) fn cmd_incrby(conn: &Connection, key: &str, amount: i64) -> CmdResult
     Ok(Reply::Int(new_val))
 }
 
-pub(crate) fn cmd_append(conn: &Connection, key: &str, value: &str) -> CmdResult {
+pub(crate) fn cmd_append(conn: &Connection, key: Arg<'_>, value: Arg<'_>) -> CmdResult {
     let now = now_ms();
     ensure_type(conn, key, KIND, now)?;
     drop_if_expired(conn, key, now)?;
@@ -126,7 +126,7 @@ pub(crate) fn cmd_append(conn: &Connection, key: &str, value: &str) -> CmdResult
     Ok(Reply::Int(len as i64))
 }
 
-pub(crate) fn cmd_strlen(conn: &Connection, key: &str) -> CmdResult {
+pub(crate) fn cmd_strlen(conn: &Connection, key: Arg<'_>) -> CmdResult {
     if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Int(0));
     }
@@ -134,7 +134,7 @@ pub(crate) fn cmd_strlen(conn: &Connection, key: &str) -> CmdResult {
     Ok(Reply::Int(len as i64))
 }
 
-pub(crate) fn cmd_mset(conn: &Connection, pairs: &[String]) -> CmdResult {
+pub(crate) fn cmd_mset(conn: &Connection, pairs: &[Arg<'_>]) -> CmdResult {
     if pairs.is_empty() || !pairs.len().is_multiple_of(2) {
         return Err(CmdError::new(
             "ERR wrong number of arguments for 'mset' command",
@@ -142,7 +142,7 @@ pub(crate) fn cmd_mset(conn: &Connection, pairs: &[String]) -> CmdResult {
     }
     let now = now_ms();
     for chunk in pairs.chunks(2) {
-        let key = &chunk[0];
+        let key = chunk[0];
         // MSET overwrites each key regardless of its prior type and, like
         // Redis, discards any existing TTL.
         if let Some(r) = lookup(conn, key)?
@@ -160,10 +160,10 @@ pub(crate) fn cmd_mset(conn: &Connection, pairs: &[String]) -> CmdResult {
     Ok(Reply::Simple("OK"))
 }
 
-pub(crate) fn cmd_mget(conn: &Connection, keys: &[String]) -> CmdResult {
+pub(crate) fn cmd_mget(conn: &Connection, keys: &[Arg<'_>]) -> CmdResult {
     let now = now_ms();
     let mut replies = Vec::with_capacity(keys.len());
-    for key in keys {
+    for &key in keys {
         // Redis MGET yields nil for missing and wrong-type keys alike.
         let value = if key_type(conn, key, now)? == Some(KIND) {
             get_string(conn, key)?

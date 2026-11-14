@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS hash_fields (
 2. A key has a catalogue row **iff** it has payload rows. Writes that create a key insert the catalogue row (`INSERT OR IGNORE`); writes that remove the last element of a list/set/hash delete it (and with it any TTL).
 3. Expiry lives only in `keyspace.expires_at`.
 
-**Value storage class:** a value that is valid UTF-8 is stored as TEXT, anything else as BLOB. The rule is deterministic per byte string so SQL equality comparisons on values (`LREM`, `LPOS`, set membership) stay consistent; readers accept either class.
+**Storage class (keys, fields, members and values alike):** a byte string that is valid UTF-8 is stored as TEXT, anything else as BLOB, whatever the column's declared type. The rule is deterministic per byte string, which matters because SQLite never treats a BLOB as equal to a TEXT of the same bytes: every lookup and comparison (key lookup, `LREM`, `LPOS`, set membership, hash fields) must bind its argument by the same rule, and readers must accept either class. An implementation that binds byte strings as BLOB unconditionally will fail to find keys written as text. A string with an embedded NUL is valid UTF-8 and is stored as TEXT with its full length.
 
 ### Migration from schema v1
 
