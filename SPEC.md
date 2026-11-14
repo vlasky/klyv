@@ -1,4 +1,6 @@
-# klyv Specification v0.1.1
+# klyv Specification
+
+Describes klyv 0.5.0: on-disk schema version 3, the CLI, and server mode.
 
 A Redis-compatible embedded key-value store backed by SQLite. This document specifies the storage format, command semantics, and CLI interface to enable compatible implementations in any language.
 

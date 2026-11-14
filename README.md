@@ -1,6 +1,6 @@
 # klyv
 
-[![Version](https://img.shields.io/badge/version-0.4.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.5.0-blue)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Redis-compatible embedded key-value store backed by SQLite. No server or daemon is needed: it is a CLI and a file. When you do want one, `klyv serve` speaks the Redis wire protocol, so ordinary Redis clients can use the same file.
@@ -69,7 +69,7 @@ Run `klyv` with no command to enter a `redis-cli`-style shell with line editing 
 
 ```
 $ klyv --db my.db
-klyv 0.4.0 — 'help' lists commands, 'exit' or Ctrl-D quits
+klyv 0.5.0 — 'help' lists commands, 'exit' or Ctrl-D quits
 klyv> set greeting "hello world"
 OK
 klyv> get greeting
