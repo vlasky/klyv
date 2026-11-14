@@ -23,6 +23,9 @@ pub(crate) enum Reply {
     Int(i64),
     /// A value, printed bare.
     Bulk(Vec<u8>),
+    /// Human-readable text (INFO). A bulk string everywhere except RESP3,
+    /// where Redis marks such replies as verbatim text.
+    Verbatim(Vec<u8>),
     /// Missing value, printed as "(nil)".
     Nil,
     /// Items printed as a numbered, quoted list; the Empty kind picks the
@@ -64,7 +67,7 @@ pub(crate) fn render_human(reply: &Reply, out: &mut Vec<u8>) {
             out.push(b'\n');
         }
         Reply::Int(n) => out.extend_from_slice(format!("(integer) {n}\n").as_bytes()),
-        Reply::Bulk(v) => {
+        Reply::Bulk(v) | Reply::Verbatim(v) => {
             push_lossy(out, v);
             out.push(b'\n');
         }
@@ -109,7 +112,7 @@ pub(crate) fn render_raw(reply: &Reply, out: &mut Vec<u8>) {
             out.extend_from_slice(n.to_string().as_bytes());
             out.push(b'\n');
         }
-        Reply::Bulk(v) => {
+        Reply::Bulk(v) | Reply::Verbatim(v) => {
             out.extend_from_slice(v);
             out.push(b'\n');
         }
@@ -159,7 +162,7 @@ pub(crate) fn render_json(reply: &Reply, out: &mut Vec<u8>) {
     match reply {
         Reply::Simple(s) => push_json_string(s.as_bytes(), out),
         Reply::Int(n) => out.extend_from_slice(n.to_string().as_bytes()),
-        Reply::Bulk(v) => push_json_string(v, out),
+        Reply::Bulk(v) | Reply::Verbatim(v) => push_json_string(v, out),
         Reply::Nil => out.extend_from_slice(b"null"),
         // Alternating field/value items (HGETALL) become a JSON object.
         Reply::Array(items, Empty::Hash) => {

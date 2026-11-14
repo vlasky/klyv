@@ -72,6 +72,8 @@ enum Value {
     Set(Vec<Value>),
     /// RESP3 map (`%`).
     Map(Vec<(Value, Value)>),
+    /// RESP3 verbatim string (`=`), including its `txt:` prefix.
+    Verbatim(String),
 }
 
 fn bulk(s: &str) -> Value {
@@ -154,6 +156,13 @@ impl<S: Read + Write> Client<S> {
                 Value::Array((0..n).map(|_| self.read()).collect())
             }
             "_" => Value::Null,
+            "=" => {
+                let len: usize = rest.parse().unwrap();
+                let mut buf = vec![0u8; len + 2];
+                self.reader.read_exact(&mut buf).unwrap();
+                buf.truncate(len);
+                Value::Verbatim(String::from_utf8(buf).unwrap())
+            }
             "~" => {
                 let n: i64 = rest.parse().unwrap();
                 Value::Set((0..n).map(|_| self.read()).collect())
@@ -788,4 +797,89 @@ mod unix {
         }
         assert_eq!(std::fs::read(path.join("plain")).unwrap(), b"data");
     }
+}
+
+// A mistyped modifier must be refused, not treated as "flush anyway".
+#[test]
+fn flush_rejects_unknown_arguments_without_flushing() {
+    let server = start();
+    let mut c = Client::connect(&server);
+    c.cmd(&["SET", "k", "v"]);
+    assert_eq!(c.error(&["FLUSHALL", "typo"]), "ERR syntax error");
+    assert_eq!(c.error(&["FLUSHDB", "ASYNC", "extra"]), "ERR syntax error");
+    assert_eq!(c.cmd(&["GET", "k"]), bulk("v"));
+    assert_eq!(c.cmd(&["FLUSHDB", "sync"]), ok());
+    assert_eq!(c.cmd(&["DBSIZE"]), Value::Int(0));
+    c.cmd(&["SET", "k", "v"]);
+    assert_eq!(c.cmd(&["FLUSHALL", "ASYNC"]), ok());
+    assert_eq!(c.cmd(&["DBSIZE"]), Value::Int(0));
+}
+
+// One whole command plus the start of the next: the first reply must arrive
+// without waiting for the second command to be completed.
+#[test]
+fn a_partial_pipelined_command_does_not_hold_back_earlier_replies() {
+    let server = start();
+    let mut c = Client::connect(&server);
+    c.send_raw(b"PING\r\n*2\r\n$4\r\nECHO\r\n$5\r\nhe");
+    assert_eq!(c.read(), Value::Simple("PONG".into()));
+    c.send_raw(b"llo\r\n");
+    assert_eq!(c.read(), bulk("hello"));
+}
+
+#[test]
+fn inline_escapes_reach_the_command_as_bytes() {
+    let server = start();
+    let mut c = Client::connect(&server);
+    c.send_raw(b"SET k \"\\x00\\xff\\n\"\r\n");
+    assert_eq!(c.read(), ok());
+    assert_eq!(c.cmd(&["GET", "k"]), Value::Bulk(vec![0x00, 0xff, b'\n']));
+    c.send_raw(b"ECHO \"a\"b\r\n");
+    assert_eq!(
+        c.read(),
+        Value::Error("ERR Protocol error: unbalanced quotes in request".into())
+    );
+    assert!(c.closed());
+}
+
+#[test]
+fn info_is_verbatim_text_in_resp3() {
+    let server = start();
+    let mut c = Client::connect(&server);
+    assert!(matches!(c.cmd(&["INFO"]), Value::Bulk(_)));
+    c.cmd(&["HELLO", "3"]);
+    let Value::Verbatim(info) = c.cmd(&["INFO"]) else {
+        panic!("INFO should be a verbatim string in RESP3");
+    };
+    assert!(info.starts_with("txt:# Server\r\nredis_version:"), "{info}");
+}
+
+#[test]
+fn connections_beyond_maxclients_are_refused() {
+    let server = start_with(tempfile::tempdir().unwrap(), &["--maxclients", "2"], 1);
+    let mut a = Client::connect(&server);
+    let mut b = Client::connect(&server);
+    // A reply from each proves both are established and counted.
+    assert_eq!(a.cmd(&["PING"]), Value::Simple("PONG".into()));
+    assert_eq!(b.cmd(&["PING"]), Value::Simple("PONG".into()));
+    let mut extra = Client::connect(&server);
+    assert_eq!(
+        extra.read(),
+        Value::Error("ERR max number of clients reached".into())
+    );
+    assert!(extra.closed());
+    // Closing one frees a slot (the server notices on its next read).
+    assert_eq!(a.cmd(&["QUIT"]), ok());
+    assert!(a.closed());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut again = Client::connect(&server);
+        again.send_raw(b"PING\r\n");
+        if again.read() == Value::Simple("PONG".into()) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "slot was never freed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(b.cmd(&["PING"]), Value::Simple("PONG".into()));
 }
