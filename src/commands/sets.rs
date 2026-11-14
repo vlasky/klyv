@@ -37,7 +37,7 @@ pub(crate) fn cmd_sadd(conn: &Connection, key: Arg<'_>, members: &[Arg<'_>]) -> 
         )?;
         count += inserted as i64;
     }
-    claim(conn, key, KIND)?;
+    grow(conn, key, KIND, count)?;
     Ok(Reply::Int(count))
 }
 
@@ -53,9 +53,7 @@ pub(crate) fn cmd_srem(conn: &Connection, key: Arg<'_>, members: &[Arg<'_>]) -> 
         )?;
         count += deleted as i64;
     }
-    if count > 0 {
-        release_if_empty(conn, key, KIND)?;
-    }
+    shrink(conn, key, count)?;
     Ok(Reply::Int(count))
 }
 
@@ -86,15 +84,9 @@ pub(crate) fn cmd_sismember(conn: &Connection, key: Arg<'_>, member: Arg<'_>) ->
 }
 
 pub(crate) fn cmd_scard(conn: &Connection, key: Arg<'_>) -> CmdResult {
-    if !check_type(conn, key, KIND, now_ms())? {
-        return Ok(Reply::Int(0));
-    }
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM set_members WHERE key = ?1",
-        params![key],
-        |row| row.get(0),
-    )?;
-    Ok(Reply::Int(count))
+    Ok(Reply::Int(
+        live_len(conn, key, KIND, now_ms())?.unwrap_or(0),
+    ))
 }
 
 pub(crate) fn cmd_spop(conn: &Connection, key: Arg<'_>) -> CmdResult {
@@ -111,7 +103,7 @@ pub(crate) fn cmd_spop(conn: &Connection, key: Arg<'_>) -> CmdResult {
     match picked {
         Some((rowid, member)) => {
             conn.execute("DELETE FROM set_members WHERE rowid = ?1", params![rowid])?;
-            release_if_empty(conn, key, KIND)?;
+            shrink(conn, key, 1)?;
             Ok(Reply::Bulk(member))
         }
         None => Ok(Reply::Nil),

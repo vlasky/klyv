@@ -37,7 +37,7 @@ pub(crate) fn cmd_hset(conn: &Connection, key: Arg<'_>, pairs: &[Arg<'_>]) -> Cm
             count += 1;
         }
     }
-    claim(conn, key, KIND)?;
+    grow(conn, key, KIND, count)?;
     Ok(Reply::Int(count))
 }
 
@@ -64,7 +64,9 @@ pub(crate) fn cmd_hincrby(
     let now = now_ms();
     ensure_type(conn, key, KIND, now)?;
     drop_if_expired(conn, key, now)?;
-    let val = match field_value(conn, key, field)? {
+    let existing = field_value(conn, key, field)?;
+    let is_new = existing.is_none();
+    let val = match existing {
         Some(v) => {
             parse_int(&v).ok_or_else(|| CmdError::new("ERR hash value is not an integer"))?
         }
@@ -77,7 +79,8 @@ pub(crate) fn cmd_hincrby(
         "INSERT OR REPLACE INTO hash_fields (key, field, value) VALUES (?1, ?2, ?3)",
         params![key, field, new_val.to_string()],
     )?;
-    claim(conn, key, KIND)?;
+    // INSERT OR REPLACE added a row only if the field was not there.
+    grow(conn, key, KIND, is_new as i64)?;
     Ok(Reply::Int(new_val))
 }
 
@@ -93,9 +96,7 @@ pub(crate) fn cmd_hdel(conn: &Connection, key: Arg<'_>, fields: &[Arg<'_>]) -> C
         )?;
         count += deleted as i64;
     }
-    if count > 0 {
-        release_if_empty(conn, key, KIND)?;
-    }
+    shrink(conn, key, count)?;
     Ok(Reply::Int(count))
 }
 
@@ -141,13 +142,7 @@ pub(crate) fn cmd_hvals(conn: &Connection, key: Arg<'_>) -> CmdResult {
 }
 
 pub(crate) fn cmd_hlen(conn: &Connection, key: Arg<'_>) -> CmdResult {
-    if !check_type(conn, key, KIND, now_ms())? {
-        return Ok(Reply::Int(0));
-    }
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM hash_fields WHERE key = ?1",
-        params![key],
-        |row| row.get(0),
-    )?;
-    Ok(Reply::Int(count))
+    Ok(Reply::Int(
+        live_len(conn, key, KIND, now_ms())?.unwrap_or(0),
+    ))
 }

@@ -721,6 +721,20 @@ fn scenarios() -> Vec<(&'static str, Vec<Step>)> {
             ],
         ),
         (
+            // SPOP picks at random, so only its deterministic cases can be
+            // compared: a single-member set, and a missing key.
+            "spop",
+            vec![
+                step(&["s-add", "s", "only"], &["SADD", "s", "only"], Exact),
+                step(&["s-pop", "s"], &["SPOP", "s"], Exact),
+                step(&["s-pop", "s"], &["SPOP", "s"], Exact),
+                step(&["exists", "s"], &["EXISTS", "s"], Exact),
+                step(&["s-card", "s"], &["SCARD", "s"], Exact),
+                step(&["set", "str", "v"], &["SET", "str", "v"], Exact),
+                step(&["s-pop", "str"], &["SPOP", "str"], Error),
+            ],
+        ),
+        (
             "keys-glob-malformed",
             vec![
                 step(
@@ -824,6 +838,9 @@ fn differential_vs_real_redis() {
 
         for (j, s) in steps.iter().enumerate() {
             check_step(db, redis.port, name, j, s);
+            assert_len_invariant(std::path::Path::new(db), &|| {
+                format!("scenario '{name}' after step {j}: {:?}", s.klyv)
+            });
         }
     }
 }
@@ -935,7 +952,10 @@ fn random_step(rng: &mut Rng) -> Gen {
     let c = *rng.pick(COUNTS);
     let pat = *rng.pick(PATTERNS);
     let x = *rng.pick(EXPIRIES);
-    match rng.below(46) {
+    // 42 and 46..=53 share one arm: its ten commands were each drawn about
+    // once in 460 steps, too rarely for a run of the default length to hit,
+    // say, an HDEL that actually deletes a field.
+    match rng.below(54) {
         0..=2 => g(&["set", "--", k, v], &["SET", k, v], Exact),
         3 => g(&["set", "--nx", "--", k, v], &["SET", k, v, "NX"], Exact),
         4 => g(
@@ -988,7 +1008,7 @@ fn random_step(rng: &mut Rng) -> Gen {
         39 => g(&["h-get", "--", k, f], &["HGET", k, f], Exact),
         40 => g(&["h-incr-by", "--", k, f, n], &["HINCRBY", k, f, n], Exact),
         41 => g(&["h-get-all", "--", k], &["HGETALL", k], PairSorted),
-        42 => match rng.below(10) {
+        42 | 46..=53 => match rng.below(10) {
             0 => g(&["h-exists", "--", k, f], &["HEXISTS", k, f], Exact),
             1 => g(&["h-del", "--", k, f], &["HDEL", k, f], Exact),
             2 => g(&["h-keys", "--", k], &["HKEYS", k], Sorted),
@@ -1029,6 +1049,38 @@ fn random_step(rng: &mut Rng) -> Gen {
             }
         }
     }
+}
+
+/// The schema-v3 invariant on a klyv database: the catalogue's stored length
+/// equals the real number of payload rows for every list, set and hash, is
+/// NULL for strings, and no key is catalogued with nothing in it. Redis
+/// agreeing on LLEN/SCARD/HLEN only proves the lengths that were asked for;
+/// this proves all of them, after arbitrary command sequences.
+fn assert_len_invariant(db: &std::path::Path, ctx: &dyn Fn() -> String) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    let bad: Vec<String> = conn
+        .prepare(
+            "SELECT quote(key) || ' ' || type || ' len=' || coalesce(len, 'NULL') || ' rows=' || n
+             FROM (SELECT key, type, len, CASE type
+                     WHEN 'list' THEN (SELECT COUNT(*) FROM list_items  WHERE key = k.key)
+                     WHEN 'set'  THEN (SELECT COUNT(*) FROM set_members WHERE key = k.key)
+                     WHEN 'hash' THEN (SELECT COUNT(*) FROM hash_fields WHERE key = k.key)
+                     ELSE (SELECT COUNT(*) FROM strings WHERE key = k.key)
+                   END AS n FROM keyspace k)
+             WHERE n = 0 OR (type = 'string' AND len IS NOT NULL)
+                OR (type != 'string' AND len IS NOT n)",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        bad.is_empty(),
+        "length invariant broken: {bad:?}\n{}",
+        ctx()
+    );
 }
 
 fn is_redis_error(out: &str) -> bool {
@@ -1122,6 +1174,9 @@ fn differential_random_sequences() {
                 )
             };
             check_generated(db, redis.port, &g, &ctx);
+            if i % 25 == 24 || i + 1 == steps {
+                assert_len_invariant(std::path::Path::new(db), &ctx);
+            }
         }
     }
 }
@@ -1319,7 +1374,8 @@ fn server_scenarios(resp3: bool) {
     }
     let redis = start_redis();
     let dir = tempfile::tempdir().unwrap();
-    let server = start_klyv_server(&dir.path().join("server.db"));
+    let db_path = dir.path().join("server.db");
+    let server = start_klyv_server(&db_path);
     let mut k = WireClient::connect(server.port, resp3);
     let mut r = WireClient::connect(redis.port, resp3);
 
@@ -1340,6 +1396,12 @@ fn server_scenarios(resp3: bool) {
                     "expected an error: {r_out:?}"
                 );
             }
+            assert_len_invariant(&db_path, &|| {
+                format!(
+                    "scenario '{name}' after step {j} (resp3={resp3}): {:?}",
+                    s.redis
+                )
+            });
         }
     }
 }
@@ -1375,7 +1437,8 @@ fn server_random(resp3: bool) {
     };
     let redis = start_redis();
     let dir = tempfile::tempdir().unwrap();
-    let server = start_klyv_server(&dir.path().join("server-random.db"));
+    let db_path = dir.path().join("server-random.db");
+    let server = start_klyv_server(&db_path);
     let mut k = WireClient::connect(server.port, resp3);
     let mut r = WireClient::connect(redis.port, resp3);
 
@@ -1390,12 +1453,21 @@ fn server_random(resp3: bool) {
             history.push(format!("{i:>4}: {}", g.redis.join(" ")));
             let k_out = canonical(k.cmd(&args), g.ok_cmp);
             let r_out = canonical(r.cmd(&args), g.ok_cmp);
-            if k_out != r_out {
+            let recent = || {
                 let from = history.len().saturating_sub(15);
-                panic!(
-                    "seed {seed:#x} step {i} resp3={resp3} (replay with KLYV_DIFF_SEED={seed}); recent history:\n{}\n  klyv server: {k_out:?}\n  redis:       {r_out:?}",
+                format!(
+                    "seed {seed:#x} step {i} resp3={resp3} (replay with KLYV_DIFF_SEED={seed}); recent history:\n{}",
                     history[from..].join("\n")
+                )
+            };
+            if k_out != r_out {
+                panic!(
+                    "{}\n  klyv server: {k_out:?}\n  redis:       {r_out:?}",
+                    recent()
                 );
+            }
+            if i % 50 == 49 || i + 1 == steps {
+                assert_len_invariant(&db_path, &recent);
             }
         }
     }

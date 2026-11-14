@@ -5,6 +5,8 @@ A Redis-compatible embedded key-value store backed by SQLite. This document spec
 > **v0.1.1** clarifies type safety (`WRONGTYPE`), cross-type `SET`/`MSET`/`RENAME` overwrite, expiry-on-write and the `<=` expiry boundary, negative-TTL handling, integer-overflow errors, `KEYS` LIKE escaping, the `idx = 0.0` first-element rule, and `BEGIN IMMEDIATE`/`busy_timeout` atomicity.
 >
 > **Schema v2** (klyv 0.3) adds the `keyspace` catalogue and millisecond expiry, with an in-place migration from v1 files; see [Schema](#schema) and [Migration](#migration-from-schema-v1).
+>
+> **Schema v3** adds an element count (`len`) to the catalogue, so `LLEN`, `SCARD`, `HLEN` and the length returned by `LPUSH`/`RPUSH` no longer count rows. v1 and v2 files migrate in place.
 
 ## Overview
 
@@ -28,13 +30,14 @@ WAL mode enables concurrent readers and improves write performance. `NORMAL` syn
 
 ### Schema
 
-Schema version **2**, recorded in `PRAGMA user_version = 2`. A `keyspace` catalogue holds one row per key — its type and expiry — and is the single source of truth for whether a key exists, what type it is and when it expires; the four per-type data tables hold only payload.
+Schema version **3**, recorded in `PRAGMA user_version = 3`. A `keyspace` catalogue holds one row per key — its type, its expiry and, for a list, set or hash, its element count — and is the single source of truth for whether a key exists, what type it is, when it expires and how long it is; the four per-type data tables hold only payload.
 
 ```sql
 CREATE TABLE IF NOT EXISTS keyspace (
     key TEXT PRIMARY KEY,
     type TEXT NOT NULL,          -- 'string' | 'list' | 'set' | 'hash'
-    expires_at INTEGER           -- Unix time in milliseconds; NULL = no expiry
+    expires_at INTEGER,          -- Unix time in milliseconds; NULL = no expiry
+    len INTEGER                  -- element count of a list/set/hash; NULL for a string
 );
 CREATE INDEX IF NOT EXISTS idx_keyspace_expires
     ON keyspace(expires_at) WHERE expires_at IS NOT NULL;
@@ -70,12 +73,15 @@ CREATE TABLE IF NOT EXISTS hash_fields (
 1. A key has payload rows in exactly one data table — the one for its catalogue `type`.
 2. A key has a catalogue row **iff** it has payload rows. Writes that create a key insert the catalogue row (`INSERT OR IGNORE`); writes that remove the last element of a list/set/hash delete it (and with it any TTL).
 3. Expiry lives only in `keyspace.expires_at`.
+4. For a list, set or hash, `len` equals the number of its payload rows; for a string it is NULL. Every command that inserts or deletes elements adjusts `len` by the number of rows it *actually* changed, in the same transaction: `SADD` of a member already present adds 0, `HSET`/`HINCRBY` count only fields that did not exist, `LREM`/`LTRIM`/`SREM`/`HDEL` subtract the rows they removed. A command that changes a key's type (`SET`/`MSET` over a list, set or hash) resets `len` to NULL; `RENAME` carries it with the row. `len` reaching 0 is invariant 2's "last element removed": the catalogue row is deleted.
+
+`len` is what makes length queries cheap. `LLEN`, `SCARD` and `HLEN` are one catalogue read (the same read that checks existence, type and expiry), and `LPUSH`/`RPUSH` return the updated `len` rather than counting. An implementation must never answer these from `COUNT(*)` on a healthy file, and must never let `len` drift: the reference test suite compares `len` with the real row count for every key after each step of its scenarios and throughout long random command sequences.
 
 **Storage class (keys, fields, members and values alike):** a byte string that is valid UTF-8 is stored as TEXT, anything else as BLOB, whatever the column's declared type. The rule is deterministic per byte string, which matters because SQLite never treats a BLOB as equal to a TEXT of the same bytes: every lookup and comparison (key lookup, `LREM`, `LPOS`, set membership, hash fields) must bind its argument by the same rule, and readers must accept either class. An implementation that binds byte strings as BLOB unconditionally will fail to find keys written as text. A string with an embedded NUL is valid UTF-8 and is stored as TEXT with its full length.
 
-### Migration from schema v1
+### Migration from schema v1 and v2
 
-A v1 database (klyv ≤ 0.2.0: `user_version` 0, no catalogue, a separate `expiry` table in whole seconds) is migrated in place, inside a `BEGIN IMMEDIATE` transaction, the first time it is opened. The same steps double as a **repair** and run whenever a v1-style `expiry` *table* is found in a v2 file (which only happens if a pre-v2 binary wrote to the file after migration — it recreates the table and writes payload around the catalogue). In order:
+An older database is migrated in place, inside a `BEGIN IMMEDIATE` transaction, the first time it is opened: a v1 database (klyv ≤ 0.2.0: `user_version` 0, no catalogue, a separate `expiry` table in whole seconds) or a v2 database (klyv 0.3.x–0.4.0: a catalogue without `len`). First, if the `keyspace` table exists without a `len` column, add it: `ALTER TABLE keyspace ADD COLUMN len INTEGER`. Then run the steps below; for a v2 file steps 1–4 find nothing to do and step 5 fills in the counts. The same steps double as a **repair** and run whenever a v1-style `expiry` *table* is found in a current file (which only happens if a pre-v2 binary wrote to the file after migration — it recreates the table and writes payload around the catalogue). In order:
 
 ```sql
 -- 1. Prune catalogue rows whose declared payload is gone (so a key whose type
@@ -112,12 +118,20 @@ DELETE FROM list_items  WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 
 DELETE FROM set_members WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'set');
 DELETE FROM hash_fields WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'hash');
 
-PRAGMA user_version = 2;
+-- 5. Set every key's len from its actual payload rows (NULL for strings).
+UPDATE keyspace SET len = CASE type
+    WHEN 'list' THEN (SELECT COUNT(*) FROM list_items  WHERE key = keyspace.key)
+    WHEN 'set'  THEN (SELECT COUNT(*) FROM set_members WHERE key = keyspace.key)
+    WHEN 'hash' THEN (SELECT COUNT(*) FROM hash_fields WHERE key = keyspace.key)
+    ELSE NULL
+END;
+
+PRAGMA user_version = 3;
 ```
 
-A database whose `user_version` is **newer** than the implementation supports must be refused, not opened. A healthy v2 file (version 2, no `expiry` table) runs none of the steps above on open; the per-open cost is independent of database size.
+A database whose `user_version` is **newer** than the implementation supports must be refused, not opened. A healthy current file (version 3, no `expiry` table) runs none of the steps above on open; the per-open cost is independent of database size. Implementations of schema v2 (klyv 0.3.x–0.4.0) refuse a v3 file by this rule, so they cannot write to it without maintaining `len`.
 
-**Downgrade guard.** Every v2 file (fresh or migrated) also carries a VIEW named `expiry`, re-created if missing on every open:
+**Downgrade guard.** Every v2 or later file (fresh or migrated) also carries a VIEW named `expiry`, re-created if missing on every open:
 
 ```sql
 CREATE VIEW IF NOT EXISTS expiry AS
@@ -249,7 +263,9 @@ Get multiple values.
 
 ### List Commands
 
-Lists are ordered sequences. Items are stored with a floating-point index (`idx`) that determines order. This allows O(1) push to either end without reindexing.
+Lists are ordered sequences. Items are stored with a floating-point index (`idx`) that determines order. This allows a push to either end without reindexing: one index seek for the current `MIN(idx)` or `MAX(idx)` (query them separately; a lone `MIN` or `MAX` over the `(key, idx)` index is a seek, while combining them with `COUNT(*)` forces a scan), the inserts, and an update of `len`.
+
+Commands that address an element by position (`LINDEX`, `LSET`, `LRANGE`) reach it by walking the index, so their cost is the distance walked. Since the length is known from the catalogue, walk from whichever end is nearer: for 0-based position `i` of `len` elements, read ascending with offset `i` when `i <= len / 2`, otherwise descending with offset `len - 1 - i`; for a range, start from the end the range is nearer to and reverse the rows if that was the tail. Order by `(idx, rowid)` so that the descending order is the exact mirror of the ascending one. This gives the same cost profile as Redis's lists, where these commands are also linear from the nearer end.
 
 #### LPUSH key value [value ...]
 
@@ -682,7 +698,7 @@ For CLI usage (one command per invocation), this is sufficient. Server mode uses
 
 A conforming implementation must:
 
-1. Use the exact SQLite schema above, keep its invariants, stamp `PRAGMA user_version = 2`, migrate v1 files as described, and refuse files with a newer version (for database file compatibility across implementations).
+1. Use the exact SQLite schema above, keep its invariants, stamp `PRAGMA user_version = 3`, migrate v1 and v2 files as described, and refuse files with a newer version (for database file compatibility across implementations).
 2. Set WAL mode and NORMAL synchronous.
 3. Require `--db` / `KLYV_DB` for database path (no default).
 4. Produce output matching the format table above (for script compatibility).

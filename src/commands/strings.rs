@@ -66,8 +66,9 @@ pub(crate) fn cmd_set(
         None => None,
     };
     conn.execute(
-        "INSERT INTO keyspace (key, type, expires_at) VALUES (?1, 'string', ?2)
-         ON CONFLICT(key) DO UPDATE SET type = 'string', expires_at = excluded.expires_at",
+        "INSERT INTO keyspace (key, type, expires_at, len) VALUES (?1, 'string', ?2, NULL)
+         ON CONFLICT(key) DO UPDATE
+             SET type = 'string', expires_at = excluded.expires_at, len = NULL",
         params![key, expires_at],
     )?;
     put_string(conn, key, value.as_bytes().to_vec())?;
@@ -123,7 +124,7 @@ pub(crate) fn cmd_incrby(conn: &Connection, key: Arg<'_>, amount: i64) -> CmdRes
         .checked_add(amount)
         .ok_or_else(|| CmdError::new("ERR increment or decrement would overflow"))?;
     put_string(conn, key, new_val.to_string().into_bytes())?;
-    claim(conn, key, KIND)?;
+    claim_string(conn, key)?;
     Ok(Reply::Int(new_val))
 }
 
@@ -135,7 +136,7 @@ pub(crate) fn cmd_append(conn: &Connection, key: Arg<'_>, value: Arg<'_>) -> Cmd
     new_val.extend_from_slice(value.as_bytes());
     let len = new_val.len();
     put_string(conn, key, new_val)?;
-    claim(conn, key, KIND)?;
+    claim_string(conn, key)?;
     Ok(Reply::Int(len as i64))
 }
 
@@ -164,8 +165,8 @@ pub(crate) fn cmd_mset(conn: &Connection, pairs: &[Arg<'_>]) -> CmdResult {
             clear_data(conn, key, r.kind)?;
         }
         conn.execute(
-            "INSERT INTO keyspace (key, type, expires_at) VALUES (?1, 'string', NULL)
-             ON CONFLICT(key) DO UPDATE SET type = 'string', expires_at = NULL",
+            "INSERT INTO keyspace (key, type, expires_at, len) VALUES (?1, 'string', NULL, NULL)
+             ON CONFLICT(key) DO UPDATE SET type = 'string', expires_at = NULL, len = NULL",
             params![key],
         )?;
         put_string(conn, key, chunk[1].as_bytes().to_vec())?;

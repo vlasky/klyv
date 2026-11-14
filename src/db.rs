@@ -1,15 +1,21 @@
 //! Schema, connection setup and migration, plus the keyspace helpers every
 //! command shares.
 //!
-//! Schema v2 adds a `keyspace` catalogue: one row per key holding its type
-//! and (millisecond) expiry. It is the single source of truth for whether a
-//! key exists, what type it is, and when it expires; the per-type data
-//! tables only hold payload. Invariants every command must keep:
+//! The `keyspace` catalogue has one row per key holding its type, its
+//! (millisecond) expiry and, for a list, set or hash, its element count. It
+//! is the single source of truth for whether a key exists, what type it is,
+//! when it expires and how long it is; the per-type data tables only hold
+//! payload. (The catalogue arrived in schema v2; v3 added the count, which
+//! makes LLEN/SCARD/HLEN and the length LPUSH/RPUSH return O(1) instead of a
+//! COUNT over the key's rows.) Invariants every command must keep:
 //!
 //! - a key has data rows in exactly one data table, the one for its
 //!   catalogue type (`data_table`);
 //! - a key has a catalogue row iff it has data rows (`claim` when creating,
-//!   `release_if_empty` after removing elements);
+//!   `shrink` after removing elements);
+//! - `len` equals the number of payload rows for a list, set or hash and is
+//!   NULL for a string: every insert goes through `grow`, every delete
+//!   through `shrink`, with the number of rows actually changed;
 //! - expiry lives only in the catalogue (`expires_at`, Unix ms, NULL = none).
 //!
 //! Downgrade protection: a VIEW named `expiry` shadows the v1 table of that
@@ -24,16 +30,18 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Current on-disk schema version, stored in `PRAGMA user_version`. A v1
-/// database (user_version 0, separate `expiry` table in whole seconds) is
-/// migrated in place on first open.
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+/// Current on-disk schema version, stored in `PRAGMA user_version`. Older
+/// files are migrated in place on first open: v1 (user_version 0, no
+/// catalogue, a separate `expiry` table in whole seconds) and v2 (catalogue
+/// without the `len` column).
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 
-const CREATE_V2: &str = "
+const CREATE_SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS keyspace (
         key TEXT PRIMARY KEY,
         type TEXT NOT NULL,
-        expires_at INTEGER
+        expires_at INTEGER,
+        len INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_keyspace_expires
         ON keyspace(expires_at) WHERE expires_at IS NOT NULL;
@@ -113,6 +121,19 @@ const RECONCILE: &str = "
     DELETE FROM hash_fields WHERE key NOT IN (SELECT key FROM keyspace WHERE type = 'hash');
 ";
 
+/// Sets every key's `len` from its actual payload rows (NULL for strings).
+/// Runs after the catalogue has been populated and reconciled, for any file
+/// that is being migrated or repaired, so the counts start out true whatever
+/// wrote the file before.
+const RECOUNT: &str = "
+    UPDATE keyspace SET len = CASE type
+        WHEN 'list' THEN (SELECT COUNT(*) FROM list_items  WHERE key = keyspace.key)
+        WHEN 'set'  THEN (SELECT COUNT(*) FROM set_members WHERE key = keyspace.key)
+        WHEN 'hash' THEN (SELECT COUNT(*) FROM hash_fields WHERE key = keyspace.key)
+        ELSE NULL
+    END;
+";
+
 /// See the module docs: makes pre-v2 binaries fail to open the file.
 const DOWNGRADE_GUARD: &str = "
     CREATE VIEW IF NOT EXISTS expiry AS
@@ -147,7 +168,14 @@ pub(crate) fn open_db(path: &Path) -> Result<Connection, Box<dyn std::error::Err
         )
         .into());
     }
-    tx.execute_batch(CREATE_V2)?;
+    tx.execute_batch(CREATE_SCHEMA)?;
+    // A v2 file already has a catalogue, created without `len`.
+    let has_len = tx
+        .prepare("SELECT 1 FROM pragma_table_info('keyspace') WHERE name = 'len'")?
+        .exists([])?;
+    if !has_len {
+        tx.execute_batch("ALTER TABLE keyspace ADD COLUMN len INTEGER;")?;
+    }
     let has_v1_expiry = tx
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'expiry'",
@@ -163,6 +191,7 @@ pub(crate) fn open_db(path: &Path) -> Result<Connection, Box<dyn std::error::Err
             tx.execute_batch(FOLD_V1_EXPIRY)?;
         }
         tx.execute_batch(RECONCILE)?;
+        tx.execute_batch(RECOUNT)?;
     }
     // Idempotent, and only possible once any v1 table of that name is gone.
     tx.execute_batch(DOWNGRADE_GUARD)?;
@@ -209,6 +238,8 @@ pub(crate) fn now_ms() -> i64 {
 pub(crate) struct KeyRow {
     pub(crate) kind: &'static str,
     pub(crate) expires_at: Option<i64>,
+    /// Element count of a list, set or hash; 0 for a string.
+    pub(crate) len: i64,
 }
 
 impl KeyRow {
@@ -249,13 +280,14 @@ fn static_kind(kind: &str) -> rusqlite::Result<&'static str> {
 /// The catalogue row for a key, expired or not.
 pub(crate) fn lookup(conn: &Connection, key: Arg<'_>) -> rusqlite::Result<Option<KeyRow>> {
     conn.query_row(
-        "SELECT type, expires_at FROM keyspace WHERE key = ?1",
+        "SELECT type, expires_at, len FROM keyspace WHERE key = ?1",
         params![key],
         |row| {
             let kind: String = row.get(0)?;
             Ok(KeyRow {
                 kind: static_kind(&kind)?,
                 expires_at: row.get(1)?,
+                len: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
             })
         },
     )
@@ -288,6 +320,24 @@ pub(crate) fn check_type(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
         None => Ok(false),
+    }
+}
+
+/// The element count of a live list, set or hash of type `want`: `None` if
+/// the key is missing or expired, WRONGTYPE if it holds another type. One
+/// catalogue read answers existence, type and length together.
+pub(crate) fn live_len(
+    conn: &Connection,
+    key: Arg<'_>,
+    want: &str,
+    now: i64,
+) -> Result<Option<i64>, CmdError> {
+    match lookup(conn, key)?.filter(|r| r.is_live(now)) {
+        Some(r) if r.kind == want => Ok(Some(r.len)),
+        Some(_) => Err(CmdError::new(
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
+        )),
+        None => Ok(None),
     }
 }
 
@@ -331,36 +381,57 @@ pub(crate) fn drop_if_expired(conn: &Connection, key: Arg<'_>, now: i64) -> rusq
     Ok(())
 }
 
-/// Registers a key as `kind` with no expiry if it has no catalogue row yet.
+/// Registers a string key with no expiry if it has no catalogue row yet.
 /// Callers have already type-checked and dropped any expired row, so an
-/// existing row is necessarily the same type and is left untouched.
-pub(crate) fn claim(conn: &Connection, key: Arg<'_>, kind: &str) -> rusqlite::Result<()> {
+/// existing row is necessarily a string too and is left untouched. (Lists,
+/// sets and hashes register through `grow`, which also counts.)
+pub(crate) fn claim_string(conn: &Connection, key: Arg<'_>) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO keyspace (key, type, expires_at) VALUES (?1, ?2, NULL)",
-        params![key, kind],
+        "INSERT OR IGNORE INTO keyspace (key, type, expires_at, len) VALUES (?1, 'string', NULL, NULL)",
+        params![key],
     )?;
     Ok(())
 }
 
-/// Removing the last element of a list/set/hash deletes the key: the
-/// catalogue row (and with it any TTL) must go too, or a later SET of the
-/// same name would inherit a stale expiry.
-pub(crate) fn release_if_empty(
+/// Records that `added` elements were inserted into a list, set or hash,
+/// registering the key (with no expiry) if this created it. Returns the new
+/// length. Callers have already type-checked and dropped any expired row, so
+/// an existing row is necessarily of the same type.
+///
+/// `added` must be the number of rows actually inserted. It may be 0 for an
+/// existing key (SADD of members already present), never for a new one: a
+/// catalogue row with no payload would break the invariant.
+pub(crate) fn grow(
     conn: &Connection,
     key: Arg<'_>,
     kind: &str,
-) -> rusqlite::Result<()> {
-    let has_rows = conn
-        .query_row(
-            &format!("SELECT 1 FROM {} WHERE key = ?1 LIMIT 1", data_table(kind)),
-            params![key],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if !has_rows {
-        conn.execute("DELETE FROM keyspace WHERE key = ?1", params![key])?;
+    added: i64,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "INSERT INTO keyspace (key, type, expires_at, len) VALUES (?1, ?2, NULL, ?3)
+         ON CONFLICT(key) DO UPDATE SET len = len + excluded.len
+         RETURNING len",
+        params![key, kind, added],
+        |row| row.get(0),
+    )
+}
+
+/// Records that `removed` elements were deleted from a list, set or hash.
+/// Removing the last element deletes the key: the catalogue row (and with it
+/// any TTL) goes too, or a later SET of the same name would inherit a stale
+/// expiry. `removed` must be the number of rows actually deleted.
+pub(crate) fn shrink(conn: &Connection, key: Arg<'_>, removed: i64) -> rusqlite::Result<()> {
+    if removed == 0 {
+        return Ok(());
     }
+    conn.execute(
+        "UPDATE keyspace SET len = len - ?2 WHERE key = ?1",
+        params![key, removed],
+    )?;
+    conn.execute(
+        "DELETE FROM keyspace WHERE key = ?1 AND len <= 0",
+        params![key],
+    )?;
     Ok(())
 }
 
