@@ -253,6 +253,9 @@ pub(crate) fn getex_expiry(unit: GetExUnit, n: i64) -> Result<GetEx, CmdError> {
         GetExUnit::Millis | GetExUnit::UnixMillis => n,
     };
     Ok(GetEx::At(match unit {
+        // Saturating, as for SET: Redis accepts a relative time so large
+        // that `now + ttl` overflows, but its sum wraps and the key expires
+        // on the spot, which is not copied.
         GetExUnit::Seconds | GetExUnit::Millis => now_ms().saturating_add(ms),
         GetExUnit::UnixSeconds | GetExUnit::UnixMillis => ms,
     }))
