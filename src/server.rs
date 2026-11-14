@@ -561,10 +561,22 @@ fn wrong_pass() -> CmdError {
     err("WRONGPASS invalid username-password pair or user is disabled.")
 }
 
-/// Compares in time independent of where the two differ, so that response
-/// timing does not reveal how much of a guessed password was right.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+/// Compares a presented password with the expected one in time that depends
+/// only on the length of what was presented: not on where the two differ,
+/// and not on how long the expected password is, so response timing reveals
+/// neither how much of a guess was right nor the password's length.
+fn constant_time_eq(expected: &[u8], presented: &[u8]) -> bool {
+    let mut diff = expected.len() ^ presented.len();
+    for (i, byte) in presented.iter().enumerate() {
+        // Cycles through the expected bytes; a length mismatch is already
+        // recorded in `diff`, so what these compare against cannot rescue it.
+        let other = expected
+            .get(i % expected.len().max(1))
+            .copied()
+            .unwrap_or(0);
+        diff |= usize::from(byte ^ other);
+    }
+    diff == 0
 }
 
 /// Checks a username and password as Redis does for its `default` user,
@@ -620,7 +632,7 @@ fn hello(session: &mut Session, shared: &Shared, args: &[Arg<'_>]) -> CmdResult 
                 let pass = rest.next().ok_or_else(syntax_error)?;
                 credentials = Some((user, pass));
             } else if is(opt, "SETNAME") {
-                name = Some(rest.next().ok_or_else(syntax_error)?);
+                name = Some(client_name(rest.next().ok_or_else(syntax_error)?)?);
             } else {
                 return Err(syntax_error());
             }
@@ -642,7 +654,7 @@ fn hello(session: &mut Session, shared: &Shared, args: &[Arg<'_>]) -> CmdResult 
     session.authenticated = true;
     session.proto = proto;
     if let Some(name) = name {
-        session.name = Some(name.as_bytes().to_vec());
+        session.name = name;
     }
     let proto = match session.proto {
         Proto::Resp2 => 2,
@@ -659,10 +671,22 @@ fn hello(session: &mut Session, shared: &Shared, args: &[Arg<'_>]) -> CmdResult 
     ]))
 }
 
+/// Redis's rule for client names: printable ASCII without spaces (they are
+/// shown in space-separated CLIENT LIST output). An empty name clears it.
+fn client_name(name: Arg<'_>) -> Result<Option<Vec<u8>>, CmdError> {
+    let bytes = name.as_bytes();
+    if !bytes.iter().all(|b| (b'!'..=b'~').contains(b)) {
+        return Err(err(
+            "ERR Client names cannot contain spaces, newlines or special characters.",
+        ));
+    }
+    Ok((!bytes.is_empty()).then(|| bytes.to_vec()))
+}
+
 fn client(session: &mut Session, args: &[Arg<'_>]) -> CmdResult {
     let sub = args[0];
     if is(sub, "SETNAME") && args.len() == 2 {
-        session.name = Some(args[1].as_bytes().to_vec());
+        session.name = client_name(args[1])?;
         Ok(Reply::Simple("OK"))
     } else if is(sub, "GETNAME") && args.len() == 1 {
         Ok(session.name.clone().map_or(Reply::Nil, Reply::Bulk))
@@ -1073,7 +1097,10 @@ fn serve_connection(reader: impl Read, writer: impl Write, shared: &Shared, admi
     let mut conn = match open_db(&shared.db) {
         Ok(conn) => conn,
         Err(e) => {
-            fail(&format!("ERR failed to open database: {e}"));
+            // The detail (paths, SQLite and schema diagnostics) goes to the
+            // server's log, not to a client that has not even authenticated.
+            eprintln!("error: cannot open the database for a client: {e}");
+            fail("ERR the server cannot open its database");
             let _ = writer.borrow_mut().flush();
             return;
         }
@@ -1224,9 +1251,11 @@ mod unix {
 
 /// File descriptors each client connection holds: its socket, and SQLite's
 /// database, WAL and shared-memory files.
+#[cfg(unix)]
 const FDS_PER_CLIENT: u64 = 4;
 /// Descriptors kept back for everything else: listeners, stdio, the files
 /// SQLite opens briefly, and headroom.
+#[cfg(unix)]
 const FDS_RESERVED: u64 = 32;
 
 /// Raises the open-file limit as far as needed for `wanted` clients, as far
@@ -1251,13 +1280,11 @@ fn usable_clients(wanted: usize) -> usize {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
         return wanted;
     }
-    let mut ceiling = limit.rlim_max as u64;
+    let ceiling = limit.rlim_max as u64;
     // macOS refuses a soft limit above OPEN_MAX (10240, from
     // <sys/syslimits.h>) even when it reports the hard limit as unlimited.
     #[cfg(target_os = "macos")]
-    {
-        ceiling = ceiling.min(10_240);
-    }
+    let ceiling = ceiling.min(10_240);
     let mut current = limit.rlim_cur as u64;
     if current < needed && current < ceiling {
         let target = needed.min(ceiling);
@@ -1439,5 +1466,31 @@ mod tests {
         assert!(arity_ok(-2, 2));
         assert!(arity_ok(-2, 9));
         assert!(!arity_ok(-2, 1));
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn password_comparison() {
+        assert!(constant_time_eq(b"s3cret", b"s3cret"));
+        assert!(constant_time_eq(b"", b""));
+        for wrong in [
+            &b""[..],
+            b"s",
+            b"s3cre",
+            b"s3cret!",
+            b"S3cret",
+            b"s3crets3cret",
+            b"s3cret\0",
+            b"xxxxxx",
+        ] {
+            assert!(!constant_time_eq(b"s3cret", wrong), "{wrong:?} accepted");
+        }
+        // An empty expected password matches nothing but the empty one.
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(!constant_time_eq(b"", b"\0"));
     }
 }
