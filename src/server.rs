@@ -765,6 +765,12 @@ fn watch(conn: &mut Connection, session: &mut Session, keys: &[Arg<'_>]) -> CmdR
     let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
     let now = crate::db::now_ms();
     for key in keys {
+        // Watching a key again keeps the first fingerprint: what matters is
+        // its state when it was first watched, and repeats must not grow the
+        // list without bound.
+        if session.watched.iter().any(|(k, _)| k == key.as_bytes()) {
+            continue;
+        }
         let state = fingerprint(&tx, *key, now)?;
         session.watched.push((key.as_bytes().to_vec(), state));
     }
@@ -856,6 +862,21 @@ fn transaction_command(
     // Arity first: `MULTI x` must not open a transaction on its way to
     // being rejected.
     if matches!(name, b"MULTI" | b"EXEC" | b"DISCARD") && !args.is_empty() {
+        // Like any other command rejected inside MULTI, a malformed one
+        // spoils the transaction. A malformed EXEC is still an EXEC: Redis
+        // ends the transaction there and says why.
+        if session.multi.is_some() {
+            if name == b"EXEC" {
+                session.multi = None;
+                session.multi_error = false;
+                session.watched.clear();
+                return Some(Err(err(
+                    "EXECABORT Transaction discarded because of: wrong number of arguments \
+                     for 'exec' command",
+                )));
+            }
+            session.multi_error = true;
+        }
         return Some(Err(wrong_arity(name)));
     }
     Some(match name {
@@ -872,8 +893,14 @@ fn transaction_command(
             Ok(Reply::Simple("OK"))
         }
         b"DISCARD" => Err(err("ERR DISCARD without MULTI")),
+        // Arity is checked first, and like any arity error inside MULTI it
+        // spoils the transaction.
+        b"WATCH" if args.is_empty() => {
+            session.multi_error |= session.multi.is_some();
+            Err(wrong_arity(name))
+        }
+        // Refused, but (as in Redis) without spoiling the transaction.
         b"WATCH" if session.multi.is_some() => Err(err("ERR WATCH inside MULTI is not allowed")),
-        b"WATCH" if args.is_empty() => Err(wrong_arity(name)),
         b"WATCH" => watch(conn, session, args),
         // QUIT ends the connection whether or not a MULTI is open.
         b"QUIT" => return None,

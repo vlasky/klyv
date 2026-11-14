@@ -159,13 +159,28 @@ pub(crate) fn cmd_rename(conn: &Connection, key: Arg<'_>, newkey: Arg<'_>) -> Cm
     if key == newkey {
         return Ok(Reply::Simple("OK"));
     }
-    // The target is overwritten whatever its type; the source's catalogue
-    // row (and so its TTL) moves with its data.
-    remove_key(conn, newkey)?;
-    conn.execute(
-        "UPDATE keyspace SET key = ?2 WHERE key = ?1",
-        params![key, newkey],
-    )?;
+    // The target is overwritten whatever its type, and takes the source's
+    // type, TTL and length along with its data.
+    //
+    // If the target already exists its catalogue row is updated in place
+    // and the source's row deleted, rather than the other way round: a row's
+    // rowid is the SCAN cursor position, and a key that exists throughout an
+    // iteration (here, the target) must not move behind the cursor.
+    if let Some(target) = lookup(conn, newkey)? {
+        clear_data(conn, newkey, target.kind)?;
+        conn.execute(
+            "UPDATE keyspace SET (type, expires_at, len) =
+                 (SELECT type, expires_at, len FROM keyspace WHERE key = ?1)
+             WHERE key = ?2",
+            params![key, newkey],
+        )?;
+        conn.execute("DELETE FROM keyspace WHERE key = ?1", params![key])?;
+    } else {
+        conn.execute(
+            "UPDATE keyspace SET key = ?2 WHERE key = ?1",
+            params![key, newkey],
+        )?;
+    }
     conn.execute(
         &format!(
             "UPDATE {} SET key = ?2 WHERE key = ?1",
@@ -214,11 +229,17 @@ pub(crate) fn cmd_copy(conn: &Connection, src: Arg<'_>, dst: Arg<'_>, replace: b
     if key_type(conn, dst, now)?.is_some() && !replace {
         return Ok(Reply::Int(0));
     }
-    // Whatever is there (live and being replaced, or expired) goes first.
-    remove_key(conn, dst)?;
+    // Whatever payload is there (live and being replaced, or expired) goes
+    // first; the catalogue row is updated in place if there is one, so an
+    // existing destination keeps its position in a SCAN.
+    if let Some(old) = lookup(conn, dst)? {
+        clear_data(conn, dst, old.kind)?;
+    }
     conn.execute(
         "INSERT INTO keyspace (key, type, expires_at, len)
-         SELECT ?2, type, expires_at, len FROM keyspace WHERE key = ?1",
+         SELECT ?2, type, expires_at, len FROM keyspace WHERE key = ?1
+         ON CONFLICT(key) DO UPDATE SET
+             type = excluded.type, expires_at = excluded.expires_at, len = excluded.len",
         params![src, dst],
     )?;
     let columns = match row.kind {
@@ -293,8 +314,12 @@ pub(crate) fn cmd_scan(
         if expires_at.is_some_and(|t| t <= now) {
             continue;
         }
+        // Type names are matched without regard to case, as in Redis.
         if let Some(kind) = kind
-            && row.get_ref(2)?.as_bytes().ok() != Some(kind.as_bytes())
+            && !row
+                .get_ref(2)?
+                .as_bytes()
+                .is_ok_and(|t| t.eq_ignore_ascii_case(kind.as_bytes()))
         {
             continue;
         }

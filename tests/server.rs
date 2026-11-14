@@ -1258,3 +1258,96 @@ fn scan_family_pages_filters_and_edge_cases() {
     assert_eq!(c.cmd(&["LPOP", "nokey", "2"]), Value::Null);
     assert_eq!(c.cmd(&["SPOP", "set", "0"]), Value::Set(vec![]));
 }
+
+// Overwriting an existing key by RENAME or COPY ... REPLACE must not move it
+// behind a SCAN cursor: it existed before, during and after.
+#[test]
+fn scan_does_not_lose_a_key_overwritten_by_rename_or_copy() {
+    for overwrite in [&["RENAME", "a", "b"][..], &["COPY", "a", "b", "REPLACE"]] {
+        let server = start();
+        let mut c = Client::connect(&server);
+        c.cmd(&["SET", "a", "x"]);
+        c.cmd(&["SET", "b", "y"]);
+        let Value::Array(page) = c.cmd(&["SCAN", "0", "COUNT", "1"]) else {
+            panic!("scan page should be an array");
+        };
+        assert_eq!(page[1], strs(&["a"]));
+        let Value::Bulk(cursor) = &page[0] else {
+            panic!("cursor should be a bulk string");
+        };
+        let cursor = String::from_utf8(cursor.clone()).unwrap();
+        c.cmd(overwrite);
+        let mut rest = Vec::new();
+        let mut cursor = cursor;
+        while cursor != "0" {
+            let Value::Array(page) = c.cmd(&["SCAN", &cursor, "COUNT", "1"]) else {
+                panic!("scan page should be an array");
+            };
+            if let (Value::Bulk(next), Value::Array(items)) = (&page[0], &page[1]) {
+                rest.extend(items.iter().cloned());
+                cursor = String::from_utf8(next.clone()).unwrap();
+            }
+        }
+        assert!(
+            rest.contains(&bulk("b")),
+            "{overwrite:?} hid b from the scan"
+        );
+        assert_eq!(c.cmd(&["GET", "b"]), bulk("x"));
+    }
+}
+
+// A client that rewrites each field as it receives it must still finish:
+// updating a field must not move it ahead of the cursor.
+#[test]
+fn hscan_terminates_when_fields_are_updated_during_the_iteration() {
+    let server = start();
+    let mut c = Client::connect(&server);
+    c.cmd(&["HSET", "h", "a", "1", "b", "2", "c", "3"]);
+    let mut cursor = String::from("0");
+    let mut seen = Vec::new();
+    for round in 0.. {
+        assert!(round < 20, "HSCAN is not terminating: {seen:?}");
+        let Value::Array(page) = c.cmd(&["HSCAN", "h", &cursor, "COUNT", "1"]) else {
+            panic!("scan page should be an array");
+        };
+        let (Value::Bulk(next), Value::Array(items)) = (&page[0], &page[1]) else {
+            panic!("scan page should be [cursor, items]");
+        };
+        for pair in items.chunks(2) {
+            let Value::Bulk(field) = &pair[0] else {
+                panic!("field should be a bulk string");
+            };
+            let field = String::from_utf8(field.clone()).unwrap();
+            // Rewrite it, both ways a field's value can change.
+            assert_eq!(c.cmd(&["HSET", "h", &field, "rewritten"]), Value::Int(0));
+            c.cmd(&["HSET", "h", &field, "10"]);
+            assert_eq!(c.cmd(&["HINCRBY", "h", &field, "1"]), Value::Int(11));
+            seen.push(field);
+        }
+        cursor = String::from_utf8(next.clone()).unwrap();
+        if cursor == "0" {
+            break;
+        }
+    }
+    seen.sort();
+    assert_eq!(seen, ["a", "b", "c"]);
+    assert_eq!(c.cmd(&["HLEN", "h"]), Value::Int(3));
+}
+
+#[test]
+fn watching_a_key_repeatedly_keeps_its_first_state() {
+    let server = start();
+    let mut a = Client::connect(&server);
+    let mut b = Client::connect(&server);
+    a.cmd(&["SET", "k", "1"]);
+    assert_eq!(a.cmd(&["WATCH", "k"]), ok());
+    b.cmd(&["SET", "k", "2"]);
+    // Watching again after the change must not forgive it.
+    for _ in 0..1000 {
+        assert_eq!(a.cmd(&["WATCH", "k"]), ok());
+    }
+    a.cmd(&["MULTI"]);
+    a.cmd(&["SET", "k", "mine"]);
+    assert_eq!(a.cmd(&["EXEC"]), null_array());
+    assert_eq!(a.cmd(&["GET", "k"]), bulk("2"));
+}
