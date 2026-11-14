@@ -1458,6 +1458,23 @@ fn hello_can_authenticate_and_switch_protocol_in_one_step() {
     assert_eq!(hello[2], (bulk("proto"), Value::Int(3)));
     assert_eq!(c.cmd(&["GET", "missing"]), Value::Null);
     assert_eq!(c.cmd(&["CLIENT", "GETNAME"]), bulk("worker"));
+    // An invalid name rejects the whole HELLO, even with good credentials.
+    let mut fresh = Client::connect(&server);
+    assert_eq!(
+        fresh.error(&[
+            "HELLO", "3", "AUTH", "default", "s3cret", "SETNAME", "bad name"
+        ]),
+        "ERR Client names cannot contain spaces, newlines or special characters."
+    );
+    assert_eq!(fresh.error(&["PING"]), NOAUTH);
+    assert_eq!(
+        c.error(&["CLIENT", "SETNAME", "two words"]),
+        "ERR Client names cannot contain spaces, newlines or special characters."
+    );
+    assert_eq!(c.cmd(&["CLIENT", "GETNAME"]), bulk("worker"));
+    // An empty name clears it.
+    assert_eq!(c.cmd(&["CLIENT", "SETNAME", ""]), ok());
+    assert_eq!(c.cmd(&["CLIENT", "GETNAME"]), Value::Null);
     // Once authenticated, HELLO needs no credentials.
     assert!(matches!(c.cmd(&["HELLO", "2"]), Value::Array(_)));
 }
