@@ -919,7 +919,11 @@ fn exec(conn: &mut Connection, session: &mut Session, shared: &Shared) -> CmdRes
             return Ok(Reply::NullArray);
         }
     }
-    let mut replies = Vec::with_capacity(queue.len());
+    // Each reply is encoded as soon as it is produced, in the protocol in
+    // force at that moment: a HELLO in the queue switches protocol for the
+    // replies after it, not for those before (and its own reply is in the
+    // version it selects).
+    let mut body = Vec::new();
     for raw in &queue {
         let name = raw[0].to_ascii_uppercase();
         let args: Vec<Arg<'_>> = raw[1..].iter().map(|a| Arg(a)).collect();
@@ -939,10 +943,15 @@ fn exec(conn: &mut Connection, session: &mut Session, shared: &Shared) -> CmdRes
                 Err(e) => Err(e),
             }
         };
-        replies.push(result.unwrap_or_else(|CmdError(msg)| Reply::Error(msg)));
+        match result {
+            Ok(reply) => encode(&reply, session.proto, &mut body),
+            Err(CmdError(msg)) => encode_error(&msg, &mut body),
+        }
     }
     tx.commit()?;
-    Ok(Reply::Lines(replies))
+    let mut encoded = format!("*{}\r\n", queue.len()).into_bytes();
+    encoded.extend_from_slice(&body);
+    Ok(Reply::Encoded(encoded))
 }
 
 /// MULTI, EXEC, DISCARD and WATCH, and the queueing of everything else while

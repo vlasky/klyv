@@ -1564,3 +1564,50 @@ fn the_server_raises_a_low_open_file_limit() {
         );
     }
 }
+
+// Each reply inside EXEC is encoded in the protocol in force when its
+// command ran. Expectations taken from a real Redis.
+#[test]
+fn hello_inside_a_transaction_switches_protocol_from_that_point_only() {
+    let server = start();
+    let mut c = Client::connect(&server);
+    c.cmd(&["HSET", "h", "f", "v"]);
+    c.cmd(&["MULTI"]);
+    for queued in [
+        &["GET", "missing"][..],
+        &["HGETALL", "h"],
+        &["HELLO", "3"],
+        &["GET", "missing"],
+        &["HGETALL", "h"],
+        &["LPUSH", "h", "x"],
+    ] {
+        assert_eq!(c.cmd(queued), Value::Simple("QUEUED".into()));
+    }
+    let Value::Array(replies) = c.cmd(&["EXEC"]) else {
+        panic!("EXEC should reply with an array");
+    };
+    assert_eq!(replies.len(), 6);
+    // Before HELLO 3: RESP2 shapes.
+    assert_eq!(replies[0], Value::Nil);
+    assert_eq!(replies[1], strs(&["f", "v"]));
+    // HELLO's own reply, and everything after it: RESP3 shapes.
+    assert!(matches!(&replies[2], Value::Map(m) if m[2] == (bulk("proto"), Value::Int(3))));
+    assert_eq!(replies[3], Value::Null);
+    assert_eq!(replies[4], Value::Map(vec![(bulk("f"), bulk("v"))]));
+    assert!(matches!(&replies[5], Value::Error(e) if e.starts_with("WRONGTYPE ")));
+    // The connection stays in RESP3 afterwards.
+    assert_eq!(c.cmd(&["GET", "missing"]), Value::Null);
+
+    // Two switches in one transaction: each HELLO reply is in its own version.
+    c.cmd(&["MULTI"]);
+    c.cmd(&["HELLO", "2"]);
+    c.cmd(&["HELLO", "3"]);
+    c.cmd(&["HELLO", "2"]);
+    let Value::Array(replies) = c.cmd(&["EXEC"]) else {
+        panic!("EXEC should reply with an array");
+    };
+    assert!(matches!(replies[0], Value::Array(_)));
+    assert!(matches!(replies[1], Value::Map(_)));
+    assert!(matches!(replies[2], Value::Array(_)));
+    assert_eq!(c.cmd(&["GET", "missing"]), Value::Nil);
+}

@@ -248,6 +248,7 @@ pub(crate) fn encode(reply: &Reply, proto: Proto, out: &mut Vec<u8>) {
         }
         Reply::Int(n) => out.extend_from_slice(format!(":{n}\r\n").as_bytes()),
         Reply::Bulk(v) => push_bulk(out, v),
+        Reply::Encoded(bytes) => out.extend_from_slice(bytes),
         Reply::Verbatim(v) if v3 => {
             push_header(out, '=', v.len() + 4);
             out.extend_from_slice(b"txt:");
@@ -257,7 +258,6 @@ pub(crate) fn encode(reply: &Reply, proto: Proto, out: &mut Vec<u8>) {
         Reply::Verbatim(v) => push_bulk(out, v),
         Reply::Nil | Reply::NullArray if v3 => out.extend_from_slice(b"_\r\n"),
         Reply::NullArray => out.extend_from_slice(b"*-1\r\n"),
-        Reply::Error(msg) => encode_error(msg, out),
         Reply::Nil => out.extend_from_slice(b"$-1\r\n"),
         Reply::Array(items, kind) => {
             match kind {
