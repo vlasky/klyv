@@ -11,12 +11,26 @@ use rusqlite::{Connection, params};
 /// Like the original, a `*` that fails against the whole remainder sets
 /// `skip_longer`, which stops enclosing `*`s retrying longer prefixes and
 /// keeps matching linear-ish rather than exponential in the number of stars.
+/// Also like the original, recursion (one level per `*`) is capped at
+/// `MAX_NESTING`; a pattern that needs more simply does not match, so a
+/// hostile pattern cannot overflow the stack.
+///
+/// Ranges compare bytes as *signed*, because Redis compares C `char`s and
+/// `char` is signed on x86 and on Apple ARM (verified against a live server:
+/// `[a-\xc3]` does not contain `b`, since 0xc3 is -61 and the reversed range
+/// is swapped to -61..=97). Linux ARM builds of Redis, where `char` is
+/// unsigned, differ; that only affects ranges with an endpoint above 0x7f.
 pub(crate) fn glob_match(pattern: &[u8], string: &[u8]) -> bool {
     let mut skip_longer = false;
-    glob_match_impl(pattern, string, &mut skip_longer)
+    glob_match_impl(pattern, string, &mut skip_longer, 0)
 }
 
-fn glob_match_impl(mut p: &[u8], mut s: &[u8], skip_longer: &mut bool) -> bool {
+const MAX_NESTING: usize = 1000;
+
+fn glob_match_impl(mut p: &[u8], mut s: &[u8], skip_longer: &mut bool, nesting: usize) -> bool {
+    if nesting > MAX_NESTING {
+        return false;
+    }
     while !p.is_empty() && !s.is_empty() {
         match p[0] {
             b'*' => {
@@ -27,7 +41,7 @@ fn glob_match_impl(mut p: &[u8], mut s: &[u8], skip_longer: &mut bool) -> bool {
                     return true;
                 }
                 while !s.is_empty() {
-                    if glob_match_impl(&p[1..], s, skip_longer) {
+                    if glob_match_impl(&p[1..], s, skip_longer, nesting + 1) {
                         return true;
                     }
                     if *skip_longer {
@@ -56,13 +70,10 @@ fn glob_match_impl(mut p: &[u8], mut s: &[u8], skip_longer: &mut bool) -> bool {
                     } else if p.is_empty() || p[0] == b']' {
                         break;
                     } else if p.len() >= 3 && p[1] == b'-' {
-                        let (lo, hi) = if p[0] <= p[2] {
-                            (p[0], p[2])
-                        } else {
-                            (p[2], p[0])
-                        };
+                        let (a, b) = (p[0] as i8, p[2] as i8);
+                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
                         p = &p[2..];
-                        matched |= (lo..=hi).contains(&c);
+                        matched |= (lo..=hi).contains(&(c as i8));
                     } else {
                         matched |= p[0] == c;
                     }
@@ -224,6 +235,25 @@ mod tests {
         assert!(!m("**", ""));
         assert!(!m("?*", ""));
         assert!(!m("", "a"));
+    }
+
+    // Checked against a live Redis: the range is a..0xc3 as signed bytes,
+    // i.e. -61..=97, followed by the literal 0xa9.
+    #[test]
+    fn high_byte_ranges_compare_signed_like_redis() {
+        assert!(!m("[a-é]*", "b"));
+        assert!(m("[a-é]*", "é"));
+        assert!(m("[a-é]*", "a"));
+        assert!(m("[a-é]*", "A"));
+    }
+
+    #[test]
+    fn nesting_is_capped_like_redis() {
+        // 1000 stars nest exactly to the cap and still match; two more do not.
+        assert!(m(&"*a".repeat(1000), &"a".repeat(1000)));
+        assert!(!m(&"*a".repeat(1002), &"a".repeat(1002)));
+        // Far beyond the cap: must return, not overflow the stack.
+        assert!(!m(&"*a".repeat(200_000), &"a".repeat(200_000)));
     }
 
     #[test]
