@@ -3230,3 +3230,26 @@ fn test_cli_option_conflicts_and_multi_key_exists() {
     );
     assert_eq!(klyv(&db, &["get-set", "b", "new"]).0.trim(), "1");
 }
+
+// The main thread's stack is the platform's choice (1 MB on Windows), and a
+// debug build of the argument parser needs more than that. The work runs on
+// a thread with an explicit stack, so a small limit must not matter.
+#[cfg(unix)]
+#[test]
+fn test_runs_with_a_small_main_thread_stack() {
+    let db = fresh_db();
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -s 512 && exec \"$0\" --db \"$1\" set k v")
+        .arg(env!("CARGO_BIN_EXE_klyv"))
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "crashed with a 512 KB stack: {:?} {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "OK");
+}

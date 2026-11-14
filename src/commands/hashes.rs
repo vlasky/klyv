@@ -4,6 +4,14 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 const KIND: &str = "hash";
 
+/// Sets a field, updating an existing one in place. Not `INSERT OR REPLACE`:
+/// that deletes and re-inserts, giving the row a new rowid, and HSCAN's
+/// cursor is a rowid. A field rewritten during an iteration would keep
+/// jumping ahead of the cursor, and a client that updates each field as it
+/// receives it would never finish.
+const UPSERT_FIELD: &str = "INSERT INTO hash_fields (key, field, value) VALUES (?1, ?2, ?3)
+     ON CONFLICT(key, field) DO UPDATE SET value = excluded.value";
+
 fn field_value(
     conn: &Connection,
     key: Arg<'_>,
@@ -29,10 +37,7 @@ pub(crate) fn cmd_hset(conn: &Connection, key: Arg<'_>, pairs: &[Arg<'_>]) -> Cm
     let mut count = 0i64;
     for chunk in pairs.chunks(2) {
         let existed = field_value(conn, key, chunk[0])?.is_some();
-        conn.execute(
-            "INSERT OR REPLACE INTO hash_fields (key, field, value) VALUES (?1, ?2, ?3)",
-            params![key, chunk[0], chunk[1]],
-        )?;
+        conn.execute(UPSERT_FIELD, params![key, chunk[0], chunk[1]])?;
         if !existed {
             count += 1;
         }
@@ -75,11 +80,8 @@ pub(crate) fn cmd_hincrby(
     let new_val = val
         .checked_add(amount)
         .ok_or_else(|| CmdError::new("ERR increment or decrement would overflow"))?;
-    conn.execute(
-        "INSERT OR REPLACE INTO hash_fields (key, field, value) VALUES (?1, ?2, ?3)",
-        params![key, field, new_val.to_string()],
-    )?;
-    // INSERT OR REPLACE added a row only if the field was not there.
+    conn.execute(UPSERT_FIELD, params![key, field, new_val.to_string()])?;
+    // The upsert added a row only if the field was not there.
     grow(conn, key, KIND, is_new as i64)?;
     Ok(Reply::Int(new_val))
 }
