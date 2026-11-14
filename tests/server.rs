@@ -538,10 +538,22 @@ fn connection_commands_clients_send_on_connect() {
         c.error(&["HELLO", "x"]),
         "ERR Protocol version is not an integer or out of range"
     );
-    assert!(
-        c.error(&["HELLO", "2", "AUTH", "u", "p"])
-            .starts_with("ERR AUTH <password> called without")
+    // No password is configured: Redis's `default` user then accepts any
+    // password, and no other user exists.
+    assert_eq!(
+        c.error(&["HELLO", "2", "AUTH", "u", "p"]),
+        "WRONGPASS invalid username-password pair or user is disabled."
     );
+    assert!(matches!(
+        c.cmd(&["HELLO", "2", "AUTH", "default", "anything"]),
+        Value::Array(_)
+    ));
+    assert_eq!(c.cmd(&["AUTH", "default", "anything"]), ok());
+    assert_eq!(
+        c.error(&["AUTH", "nouser", "x"]),
+        "WRONGPASS invalid username-password pair or user is disabled."
+    );
+    assert_eq!(c.error(&["AUTH", "a", "b", "c"]), "ERR syntax error");
     assert!(
         c.error(&["AUTH", "pw"])
             .starts_with("ERR AUTH <password> called without")
@@ -554,7 +566,8 @@ fn connection_commands_clients_send_on_connect() {
         "ERR value is not an integer or out of range"
     );
 
-    assert_eq!(c.cmd(&["CLIENT", "GETNAME"]), Value::Nil);
+    // The earlier `HELLO 2 SETNAME me` named the connection.
+    assert_eq!(c.cmd(&["CLIENT", "GETNAME"]), bulk("me"));
     assert_eq!(c.cmd(&["CLIENT", "SETNAME", "worker-1"]), ok());
     assert_eq!(c.cmd(&["CLIENT", "GETNAME"]), bulk("worker-1"));
     assert_eq!(c.cmd(&["CLIENT", "SETINFO", "lib-name", "x"]), ok());
@@ -1350,4 +1363,187 @@ fn watching_a_key_repeatedly_keeps_its_first_state() {
     a.cmd(&["SET", "k", "mine"]);
     assert_eq!(a.cmd(&["EXEC"]), null_array());
     assert_eq!(a.cmd(&["GET", "k"]), bulk("2"));
+}
+
+// === Authentication ===
+
+const NOAUTH: &str = "NOAUTH Authentication required.";
+const WRONGPASS: &str = "WRONGPASS invalid username-password pair or user is disabled.";
+
+fn start_with_password() -> Server {
+    start_with(
+        tempfile::tempdir().unwrap(),
+        &["--requirepass", "s3cret"],
+        1,
+    )
+}
+
+// Every expectation here was taken from a real Redis started with
+// --requirepass.
+#[test]
+fn a_password_gates_every_command_until_auth() {
+    let server = start_with_password();
+    let mut c = Client::connect(&server);
+    for cmd in [
+        &["PING"][..],
+        &["GET", "k"],
+        &["SET", "k", "v"],
+        &["ECHO", "hi"],
+        &["MULTI"],
+        &["INFO"],
+        &["NOSUCHCOMMAND"],
+        &["FLUSHALL"],
+    ] {
+        assert_eq!(c.error(cmd), NOAUTH, "{cmd:?}");
+    }
+    assert!(
+        c.error(&["HELLO"])
+            .starts_with("NOAUTH HELLO must be called with the client already authenticated")
+    );
+    assert!(
+        c.error(&["HELLO", "3"])
+            .starts_with("NOAUTH HELLO must be called")
+    );
+    assert_eq!(
+        c.error(&["HELLO", "2", "AUTH", "default", "wrong"]),
+        WRONGPASS
+    );
+    assert_eq!(
+        c.error(&["AUTH"]),
+        "ERR wrong number of arguments for 'auth' command"
+    );
+    assert_eq!(c.error(&["AUTH", "wrong"]), WRONGPASS);
+    assert_eq!(c.error(&["AUTH", "s3cre"]), WRONGPASS);
+    assert_eq!(c.error(&["AUTH", "s3cret!"]), WRONGPASS);
+    assert_eq!(c.error(&["AUTH", "default", "wrong"]), WRONGPASS);
+    assert_eq!(c.error(&["AUTH", "nouser", "s3cret"]), WRONGPASS);
+    assert_eq!(c.error(&["AUTH", "a", "b", "c"]), "ERR syntax error");
+    // Still locked out, and nothing leaked through.
+    assert_eq!(c.error(&["GET", "k"]), NOAUTH);
+
+    assert_eq!(c.cmd(&["AUTH", "s3cret"]), ok());
+    assert_eq!(c.cmd(&["GET", "k"]), Value::Nil);
+    assert_eq!(c.cmd(&["SET", "k", "v"]), ok());
+    // A later failed AUTH does not lock an authenticated connection out.
+    assert_eq!(c.error(&["AUTH", "wrong"]), WRONGPASS);
+    assert_eq!(c.cmd(&["GET", "k"]), bulk("v"));
+
+    // Authentication belongs to the connection.
+    let mut other = Client::connect(&server);
+    assert_eq!(other.error(&["GET", "k"]), NOAUTH);
+    assert_eq!(other.cmd(&["AUTH", "default", "s3cret"]), ok());
+    assert_eq!(other.cmd(&["GET", "k"]), bulk("v"));
+
+    // QUIT works without authenticating.
+    let mut leaving = Client::connect(&server);
+    assert_eq!(leaving.cmd(&["QUIT"]), ok());
+    assert!(leaving.closed());
+}
+
+#[test]
+fn hello_can_authenticate_and_switch_protocol_in_one_step() {
+    let server = start_with_password();
+    let mut c = Client::connect(&server);
+    // A rejected HELLO changes nothing: not the protocol, not the name.
+    assert_eq!(
+        c.error(&["HELLO", "3", "AUTH", "default", "wrong", "SETNAME", "x"]),
+        WRONGPASS
+    );
+    assert_eq!(c.error(&["PING"]), NOAUTH);
+    let Value::Map(hello) = c.cmd(&[
+        "HELLO", "3", "AUTH", "default", "s3cret", "SETNAME", "worker",
+    ]) else {
+        panic!("HELLO 3 with valid credentials should reply with a map");
+    };
+    assert_eq!(hello[2], (bulk("proto"), Value::Int(3)));
+    assert_eq!(c.cmd(&["GET", "missing"]), Value::Null);
+    assert_eq!(c.cmd(&["CLIENT", "GETNAME"]), bulk("worker"));
+    // Once authenticated, HELLO needs no credentials.
+    assert!(matches!(c.cmd(&["HELLO", "2"]), Value::Array(_)));
+}
+
+#[test]
+fn the_password_can_come_from_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.db").to_str().unwrap().to_string();
+    let mut child = Command::new(KLYV)
+        .args(["--db", &db, "serve", "--bind", "127.0.0.1:0"])
+        .env("KLYV_REQUIREPASS", "from-env")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let server = Server {
+        child,
+        addr: line
+            .trim()
+            .strip_prefix("listening on tcp://")
+            .unwrap()
+            .to_string(),
+        db,
+        _dir: dir,
+    };
+    let mut c = Client::connect(&server);
+    assert_eq!(c.error(&["PING"]), NOAUTH);
+    assert_eq!(c.cmd(&["AUTH", "from-env"]), ok());
+    assert_eq!(c.cmd(&["PING"]), Value::Simple("PONG".into()));
+
+    let out = Command::new(KLYV)
+        .args([
+            "--db",
+            &server.db,
+            "serve",
+            "--bind",
+            "127.0.0.1:0",
+            "--requirepass",
+            "",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--requirepass must not be empty"));
+}
+
+// The default soft limit on open files is often far too low for a server.
+// Started under a limit that would allow about a dozen clients, the server
+// must raise it and serve many more.
+#[cfg(unix)]
+#[test]
+fn the_server_raises_a_low_open_file_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("t.db").to_str().unwrap().to_string();
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -S -n 64 && exec \"$0\" --db \"$1\" serve --bind 127.0.0.1:0 --maxclients 100")
+        .arg(KLYV)
+        .arg(&db)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let server = Server {
+        child,
+        addr: line
+            .trim()
+            .strip_prefix("listening on tcp://")
+            .unwrap()
+            .to_string(),
+        db,
+        _dir: dir,
+    };
+    // 60 clients need about 240 descriptors, far beyond the 64 it began with.
+    let mut clients: Vec<_> = (0..60).map(|_| Client::connect(&server)).collect();
+    for (i, c) in clients.iter_mut().enumerate() {
+        assert_eq!(
+            c.cmd(&["INCR", "n"]),
+            Value::Int(i as i64 + 1),
+            "client {i} could not be served"
+        );
+    }
 }

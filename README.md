@@ -94,6 +94,7 @@ klyv --db my.db serve                                  # 127.0.0.1:6379
 klyv --db my.db serve --bind 127.0.0.1:7000            # another port (repeatable)
 klyv --db my.db serve --unixsocket /run/klyv.sock --unixsocketperm 660   # Unix socket only
 klyv --db my.db serve --maxclients 200                 # cap connections (default 10000)
+KLYV_REQUIREPASS=s3cret klyv --db my.db serve          # require a password
 
 redis-cli -p 7000 set greeting "hello world"
 redis-cli -p 7000 lrange tasks 0 -1
@@ -112,10 +113,18 @@ r.set("lock", "1", nx=True, ex=30)
 - **Connection commands** that clients send while connecting are answered: `PING`, `ECHO`, `QUIT`, `SELECT 0`, `HELLO`, `CLIENT SETNAME/GETNAME/ID/SETINFO`, `COMMAND`, `CONFIG GET`, `INFO`.
 - **Binary safe:** keys, fields and values may be any bytes.
 - **Same file, live:** the CLI can read and write the database while the server is running, and several servers can serve one file. Each command is one SQLite transaction either way.
-- **Connections:** one thread and four file descriptors per client, so the practical ceiling is the process's open-file limit (`ulimit -n`); clients beyond `--maxclients` are refused with Redis's error. There is no idle timeout.
+- **Connections:** one thread and four file descriptors per client. On start the server raises its own open-file limit as far as the system allows; if that is still not enough for `--maxclients` it lowers the client limit to fit and says so. Clients beyond the limit are refused with Redis's error. There is no idle timeout.
 - **Shutdown:** stop it with Ctrl-C or `SIGTERM`. Every command is committed before its reply is sent, so there is nothing to flush.
 
-There is **no authentication and no TLS**. The default bind address is loopback only; klyv prints a warning if you bind anything else. Put it behind a Unix socket with restrictive permissions, or a trusted network, never the open internet.
+**Security.** By default there is no password and the server listens on loopback only. `--requirepass` (or, better, the `KLYV_REQUIREPASS` environment variable, which does not show up in the process list) makes clients authenticate with `AUTH <password>`, `AUTH default <password>` or `HELLO ... AUTH default <password>`, exactly as with Redis's `requirepass`; until they do, every other command is refused with `NOAUTH`. There is **no TLS**: the password and all data cross the network in the clear, and klyv warns if you bind a non-loopback address. Use a Unix socket with restrictive permissions, a private network or a TLS-terminating proxy, never the open internet.
+
+```sh
+redis-cli -p 7000 -a s3cret ping
+```
+
+```python
+r = redis.Redis(port=7000, password="s3cret")
+```
 
 It is a durable store with Redis's interface, not a replacement for Redis's speed: every write is an SQLite commit. As a rough guide, a laptop serves about 100,000 `GET`s and 20,000 `SET`s per second across 20 connections. Not implemented: pub/sub, sorted sets, streams, scripting, blocking commands (`BLPOP`), and `INCRBYFLOAT`.
 
@@ -247,7 +256,7 @@ klyv --format json get missing
 2. Expired keys require explicit `purge` to reclaim space
 3. No pub/sub or Lua scripting; transactions (`MULTI`/`EXEC`/`WATCH`) are available through the server
 4. Four data types (strings, lists, sets, hashes); no sorted sets or streams
-5. The server has no authentication or TLS (see [Server mode](#server-mode))
+5. The server has password authentication but no TLS, users or ACLs (see [Server mode](#server-mode))
 
 ## License
 
