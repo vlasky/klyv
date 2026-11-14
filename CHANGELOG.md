@@ -5,7 +5,7 @@
 ### Fixed
 
 - **Opening a database no longer takes the write lock.** Since 0.3.0 every invocation, even a `get`, began with a write transaction to check the schema, so reads queued behind any writer (up to the 5 s busy timeout) and a database file without write permission could not be read at all. A file that is already at the current schema is now opened with read-only checks; the write lock is taken only to create, migrate or repair. (A WAL database in a directory where SQLite cannot create its side files remains unreadable; that is an SQLite limitation.)
-- **`keys` patterns now match exactly as in Redis**, including malformed ones. klyv ports Redis's own matcher instead of translating to SQLite `GLOB`, which disagreed on unclosed classes (`[a` matches `a`), empty classes (`[]a]` matches nothing), reversed ranges (`[c-a]` is `[a-c]`) and backslash escapes inside a class (`[a\-c]`).
+- **`keys` patterns now match exactly as in Redis**, including malformed ones. klyv ports Redis's own matcher instead of translating to SQLite `GLOB`, which disagreed on unclosed classes (`[a` matches `a`), empty classes (`[]a]` matches nothing), reversed ranges (`[c-a]` is `[a-c]`) and backslash escapes inside a class (`[a\-c]`). The port keeps Redis's 1000-level recursion cap and its signed-byte range comparison.
 - **Expiry overflow is rejected like Redis**: `expire`, `p-expire`, `expire-at` and `set --ex` report `ERR invalid expire time in '<command>' command` when the time cannot be represented, instead of silently saturating. The check happens before the key is looked up, as in Redis.
 - A database whose catalogue holds an unrecognised type (corrupted or hand-edited) reports `ERR database error` instead of panicking.
 
