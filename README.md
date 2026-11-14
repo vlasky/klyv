@@ -1,16 +1,17 @@
 # klyv
 
-[![Version](https://img.shields.io/badge/version-0.3.1-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Redis-compatible embedded key-value store backed by SQLite. No server, no daemon — just a CLI and a file.
+Redis-compatible embedded key-value store backed by SQLite. No server or daemon is needed: it is a CLI and a file. When you do want one, `klyv serve` speaks the Redis wire protocol, so ordinary Redis clients can use the same file.
 
 ## Features
 
 - **Four data types** — strings, lists, sets, hashes with Redis-compatible semantics
 - **TTL support** — per-key expiry with lazy filtering and explicit purge
 - **Single file** — all state lives in one SQLite database (WAL mode)
-- **Zero config** — no server process, no configuration files
+- **Zero config** — no server process needed, no configuration files
+- **Optional Redis-compatible server** — `klyv serve` speaks RESP2 and RESP3 over TCP or a Unix socket; `redis-cli`, redis-py and other clients connect unchanged
 - **Portable** — the database file can be shared across any conforming implementation
 
 ## Installation
@@ -68,7 +69,7 @@ Run `klyv` with no command to enter a `redis-cli`-style shell with line editing 
 
 ```
 $ klyv --db my.db
-klyv 0.3.1 — 'help' lists commands, 'exit' or Ctrl-D quits
+klyv 0.4.0 — 'help' lists commands, 'exit' or Ctrl-D quits
 klyv> set greeting "hello world"
 OK
 klyv> get greeting
@@ -83,6 +84,36 @@ printf 'set a 1\nincr counter\nl-push tasks "write docs"\n' | klyv --db my.db
 ```
 
 Values with spaces use shell-style quoting in both modes. A failing line prints its error to stderr and the session continues; pipe mode exits 1 if any line failed. `--format` applies to every reply in the session.
+
+### Server mode
+
+`klyv serve` runs a Redis-compatible server on the database, so existing Redis clients and tools can use it:
+
+```sh
+klyv --db my.db serve                                  # 127.0.0.1:6379
+klyv --db my.db serve --bind 127.0.0.1:7000            # another port (repeatable)
+klyv --db my.db serve --unixsocket /run/klyv.sock --unixsocketperm 660   # Unix socket only
+
+redis-cli -p 7000 set greeting "hello world"
+redis-cli -p 7000 lrange tasks 0 -1
+```
+
+```python
+import redis
+r = redis.Redis(port=7000)
+r.set("lock", "1", nx=True, ex=30)
+```
+
+- **Protocols:** RESP2 and RESP3 (negotiated with `HELLO`), pipelining, and inline commands.
+- **Commands:** everything the CLI offers, under its Redis name, plus a few aliases: `SET` (`NX`, `XX`, `EX`, `PX`, `KEEPTTL`), `SETNX`, `SETEX`, `PSETEX`, `GET`, `GETDEL`, `DEL`, `UNLINK`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `STRLEN`, `MSET`, `MGET`, `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LREM`, `LPOS`, `LINDEX`, `LSET`, `LTRIM`, `LINSERT`, `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SPOP`, `SUNION`, `SINTER`, `SDIFF`, `HSET`, `HMSET`, `HGET`, `HEXISTS`, `HINCRBY`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `KEYS`, `EXISTS` (multiple keys), `TYPE`, `RENAME`, `DBSIZE`, `FLUSHALL`, `FLUSHDB`. `PURGE` is klyv's own. Replies match Redis's types and error messages; this is checked against a real Redis server in the test suite.
+- **Connection commands** that clients send while connecting are answered: `PING`, `ECHO`, `QUIT`, `SELECT 0`, `HELLO`, `CLIENT SETNAME/GETNAME/ID/SETINFO`, `COMMAND`, `CONFIG GET`, `INFO`.
+- **Binary safe:** keys, fields and values may be any bytes.
+- **Same file, live:** the CLI can read and write the database while the server is running, and several servers can serve one file. Each command is one SQLite transaction either way.
+- **Shutdown:** stop it with Ctrl-C or `SIGTERM`. Every command is committed before its reply is sent, so there is nothing to flush.
+
+There is **no authentication and no TLS**. The default bind address is loopback only; klyv prints a warning if you bind anything else. Put it behind a Unix socket with restrictive permissions, or a trusted network, never the open internet.
+
+It is a durable store with Redis's interface, not a replacement for Redis's speed: every write is an SQLite commit. As a rough guide, a laptop serves about 100,000 `GET`s and 20,000 `SET`s per second across 20 connections. Not implemented: `SCAN`, `MULTI`/`EXEC`, pub/sub, sorted sets, streams, scripting, blocking commands, and count/option arguments beyond those listed.
 
 ### Output formats
 
@@ -202,6 +233,8 @@ klyv --format json get missing
 1. Every write persists to disk immediately (no in-memory mode)
 2. Expired keys require explicit `purge` to reclaim space
 3. No pub/sub, transactions (MULTI/EXEC), or Lua scripting
+4. Four data types (strings, lists, sets, hashes); no sorted sets or streams
+5. The server has no authentication or TLS (see [Server mode](#server-mode))
 
 ## License
 

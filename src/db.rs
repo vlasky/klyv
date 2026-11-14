@@ -420,7 +420,21 @@ pub(crate) fn bind_value(bytes: Vec<u8>) -> Value {
     }
 }
 
-/// Parses a stored value as an i64 for INCR-style commands.
+/// Parses bytes as an i64 with Redis's strict syntax (`string2ll`): an
+/// optional minus, no plus sign, no leading zeros, no surrounding whitespace,
+/// and within range. Used both for stored values (INCR on a value that
+/// APPEND turned into `042` must fail, as in Redis) and for integer
+/// arguments arriving over the wire. Rust's own parser is too lenient: it
+/// accepts `+5` and `05`.
 pub(crate) fn parse_int(bytes: &[u8]) -> Option<i64> {
+    let digits = bytes.strip_prefix(b"-").unwrap_or(bytes);
+    let well_formed = match digits {
+        [] => false,
+        [b'0'] => bytes.len() == 1,
+        [first, rest @ ..] => (b'1'..=b'9').contains(first) && rest.iter().all(u8::is_ascii_digit),
+    };
+    if !well_formed {
+        return None;
+    }
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }

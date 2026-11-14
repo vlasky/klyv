@@ -1,4 +1,4 @@
-//! `klyv serve`: a Redis-compatible server speaking RESP2 over TCP and/or a
+//! `klyv serve`: a Redis-compatible server speaking RESP2 and RESP3 over TCP and/or a
 //! Unix domain socket, so ordinary Redis clients can use a klyv database.
 //!
 //! One thread per client connection, each with its own SQLite handle. There
@@ -15,7 +15,7 @@
 use crate::commands::{hashes::*, keys::*, lists::*, sets::*, strings::*, ttl::*};
 use crate::db::{Arg, open_db};
 use crate::reply::{CmdError, CmdResult, Empty, Reply};
-use crate::resp::{ReadError, encode, encode_error, read_command};
+use crate::resp::{Proto, ReadError, encode, encode_error, read_command};
 use rusqlite::{Connection, TransactionBehavior};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -55,6 +55,8 @@ struct Shared {
 struct Session {
     id: u64,
     name: Option<Vec<u8>>,
+    /// RESP2 until the client asks for RESP3 with HELLO 3.
+    proto: Proto,
 }
 
 fn err(msg: impl Into<String>) -> CmdError {
@@ -65,19 +67,9 @@ fn syntax_error() -> CmdError {
     err("ERR syntax error")
 }
 
-/// Redis's strict integer syntax (`string2ll`): an optional minus, no plus,
-/// no leading zeros, no surrounding whitespace, and within i64.
+/// An integer argument, in Redis's strict syntax (see `parse_int`).
 fn int(a: Arg<'_>) -> Result<i64, CmdError> {
-    let b = a.as_bytes();
-    let digits = b.strip_prefix(b"-").unwrap_or(b);
-    let well_formed = match digits {
-        [] => false,
-        [b'0'] => b.len() == 1,
-        [first, rest @ ..] => (b'1'..=b'9').contains(first) && rest.iter().all(u8::is_ascii_digit),
-    };
-    well_formed
-        .then(|| std::str::from_utf8(b).ok()?.parse().ok())
-        .flatten()
+    crate::db::parse_int(a.as_bytes())
         .ok_or_else(|| err("ERR value is not an integer or out of range"))
 }
 
@@ -366,15 +358,17 @@ fn bulk(s: impl Into<Vec<u8>>) -> Reply {
     Reply::Bulk(s.into())
 }
 
-fn hello(session: &Session, args: &[Arg<'_>]) -> CmdResult {
+fn hello(session: &mut Session, args: &[Arg<'_>]) -> CmdResult {
     if let Some(&version) = args.first() {
-        let version = int(version)
-            .map_err(|_| err("ERR Protocol version is not an integer or out of range"))?;
-        // RESP3 is not implemented; refusing it makes clients fall back to
-        // RESP2, which is what NOPROTO is for.
-        if version != 2 {
-            return Err(err("NOPROTO unsupported protocol version"));
-        }
+        let proto = match int(version)
+            .map_err(|_| err("ERR Protocol version is not an integer or out of range"))?
+        {
+            2 => Proto::Resp2,
+            3 => Proto::Resp3,
+            _ => return Err(err("NOPROTO unsupported protocol version")),
+        };
+        // Validate every option before switching, so a rejected HELLO
+        // leaves the connection as it was.
         let mut rest = args[1..].iter().copied();
         while let Some(opt) = rest.next() {
             if is(opt, "AUTH") {
@@ -385,22 +379,20 @@ fn hello(session: &Session, args: &[Arg<'_>]) -> CmdResult {
                 return Err(syntax_error());
             }
         }
+        session.proto = proto;
     }
-    Ok(Reply::Lines(vec![
-        bulk("server"),
-        bulk("redis"),
-        bulk("version"),
-        bulk(REDIS_COMPAT_VERSION),
-        bulk("proto"),
-        Reply::Int(2),
-        bulk("id"),
-        Reply::Int(session.id as i64),
-        bulk("mode"),
-        bulk("standalone"),
-        bulk("role"),
-        bulk("master"),
-        bulk("modules"),
-        Reply::Lines(vec![]),
+    let proto = match session.proto {
+        Proto::Resp2 => 2,
+        Proto::Resp3 => 3,
+    };
+    Ok(Reply::Map(vec![
+        (bulk("server"), bulk("redis")),
+        (bulk("version"), bulk(REDIS_COMPAT_VERSION)),
+        (bulk("proto"), Reply::Int(proto)),
+        (bulk("id"), Reply::Int(session.id as i64)),
+        (bulk("mode"), bulk("standalone")),
+        (bulk("role"), bulk("master")),
+        (bulk("modules"), Reply::Lines(vec![])),
     ]))
 }
 
@@ -503,7 +495,9 @@ fn connection_command(
         }),
         b"CONFIG" => {
             if is(args[0], "GET") {
-                Ok(Reply::Array(vec![], Empty::List))
+                // No Redis configuration parameters exist here; an empty
+                // result is what Redis gives for an unknown parameter.
+                Ok(Reply::Map(vec![]))
             } else {
                 Err(err(format!(
                     "ERR unknown subcommand '{}'. Try CONFIG HELP.",
@@ -557,7 +551,7 @@ fn execute(
         None => (data_command(conn, &name, raw, &args), false),
     };
     match result {
-        Ok(reply) => encode(&reply, out),
+        Ok(reply) => encode(&reply, session.proto, out),
         Err(CmdError(msg)) => encode_error(&msg, out),
     }
     close
@@ -579,6 +573,7 @@ fn serve_connection(reader: impl Read, writer: impl Write, shared: &Shared) {
     let mut session = Session {
         id: shared.next_id.fetch_add(1, Ordering::Relaxed),
         name: None,
+        proto: Proto::Resp2,
     };
     let mut out = Vec::new();
     loop {
@@ -619,9 +614,17 @@ where
     let _ = std::thread::Builder::new()
         .name("klyv-client".into())
         .spawn(move || {
+            // Counted down on drop, so the count stays right even if a
+            // command panics and unwinds this thread.
+            struct Connected<'a>(&'a AtomicUsize);
+            impl Drop for Connected<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
             shared.clients.fetch_add(1, Ordering::Relaxed);
+            let _connected = Connected(&shared.clients);
             serve_connection(reader, writer, &shared);
-            shared.clients.fetch_sub(1, Ordering::Relaxed);
         });
 }
 

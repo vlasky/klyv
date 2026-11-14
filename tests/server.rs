@@ -66,6 +66,12 @@ enum Value {
     Bulk(Vec<u8>),
     Nil,
     Array(Vec<Value>),
+    /// RESP3 null (`_`).
+    Null,
+    /// RESP3 set (`~`).
+    Set(Vec<Value>),
+    /// RESP3 map (`%`).
+    Map(Vec<(Value, Value)>),
 }
 
 fn bulk(s: &str) -> Value {
@@ -146,6 +152,22 @@ impl<S: Read + Write> Client<S> {
             "*" => {
                 let n: i64 = rest.parse().unwrap();
                 Value::Array((0..n).map(|_| self.read()).collect())
+            }
+            "_" => Value::Null,
+            "~" => {
+                let n: i64 = rest.parse().unwrap();
+                Value::Set((0..n).map(|_| self.read()).collect())
+            }
+            "%" => {
+                let n: i64 = rest.parse().unwrap();
+                Value::Map(
+                    (0..n)
+                        .map(|_| {
+                            let k = self.read();
+                            (k, self.read())
+                        })
+                        .collect(),
+                )
             }
             other => panic!("unexpected reply type {other:?} in {line:?}"),
         }
@@ -485,7 +507,11 @@ fn connection_commands_clients_send_on_connect() {
         Value::Array(_)
     ));
     assert_eq!(
-        c.error(&["HELLO", "3"]),
+        c.error(&["HELLO", "4"]),
+        "NOPROTO unsupported protocol version"
+    );
+    assert_eq!(
+        c.error(&["HELLO", "1"]),
         "NOPROTO unsupported protocol version"
     );
     assert_eq!(
@@ -546,6 +572,55 @@ fn connection_commands_clients_send_on_connect() {
 
     assert_eq!(c.cmd(&["QUIT"]), ok());
     assert!(c.closed());
+}
+
+#[test]
+fn resp3_is_negotiated_per_connection() {
+    let server = start();
+    let mut c = Client::connect(&server);
+    c.cmd(&["HSET", "h", "f", "v"]);
+    c.cmd(&["SADD", "s", "m"]);
+    c.cmd(&["SET", "k", "v"]);
+    // RESP2 until asked otherwise.
+    assert_eq!(c.cmd(&["HGETALL", "h"]), strs(&["f", "v"]));
+    assert_eq!(c.cmd(&["GET", "missing"]), Value::Nil);
+
+    // A rejected HELLO must not switch the protocol.
+    assert_eq!(c.error(&["HELLO", "3", "BOGUS"]), "ERR syntax error");
+    assert_eq!(c.cmd(&["GET", "missing"]), Value::Nil);
+
+    let Value::Map(hello) = c.cmd(&["HELLO", "3"]) else {
+        panic!("HELLO 3 should reply with a map");
+    };
+    assert_eq!(hello[2], (bulk("proto"), Value::Int(3)));
+    assert_eq!(c.cmd(&["GET", "missing"]), Value::Null);
+    assert_eq!(c.cmd(&["GET", "k"]), bulk("v"));
+    assert_eq!(
+        c.cmd(&["HGETALL", "h"]),
+        Value::Map(vec![(bulk("f"), bulk("v"))])
+    );
+    assert_eq!(c.cmd(&["HGETALL", "missing"]), Value::Map(vec![]));
+    assert_eq!(c.cmd(&["HKEYS", "h"]), strs(&["f"]));
+    assert_eq!(c.cmd(&["SMEMBERS", "s"]), Value::Set(vec![bulk("m")]));
+    assert_eq!(c.cmd(&["SINTER", "s", "missing"]), Value::Set(vec![]));
+    assert_eq!(
+        c.cmd(&["LRANGE", "missing", "0", "-1"]),
+        Value::Array(vec![])
+    );
+    assert_eq!(
+        c.cmd(&["MGET", "k", "missing"]),
+        Value::Array(vec![bulk("v"), Value::Null])
+    );
+    assert_eq!(c.cmd(&["CONFIG", "GET", "save"]), Value::Map(vec![]));
+    assert_eq!(c.cmd(&["SISMEMBER", "s", "m"]), Value::Int(1));
+
+    // Other connections are unaffected, and HELLO 2 switches back.
+    assert_eq!(
+        Client::connect(&server).cmd(&["GET", "missing"]),
+        Value::Nil
+    );
+    assert!(matches!(c.cmd(&["HELLO", "2"]), Value::Array(_)));
+    assert_eq!(c.cmd(&["GET", "missing"]), Value::Nil);
 }
 
 #[test]

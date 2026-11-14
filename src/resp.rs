@@ -1,4 +1,5 @@
-//! RESP2 wire protocol: reading client commands and encoding replies.
+//! RESP wire protocol: reading client commands and encoding replies in
+//! RESP2 or RESP3.
 //!
 //! A client command is either a RESP array of bulk strings
 //! (`*2\r\n$3\r\nGET\r\n$1\r\nk\r\n`) or an "inline" command, a plain line of
@@ -10,7 +11,7 @@
 //! diagnostics it would see from Redis and cannot make the server allocate
 //! unbounded memory from a length header alone.
 
-use crate::reply::Reply;
+use crate::reply::{Empty, Reply};
 use crate::shell::split_line;
 use std::io::{self, BufRead, Read};
 
@@ -138,9 +139,23 @@ fn push_bulk(out: &mut Vec<u8>, v: &[u8]) {
     out.extend_from_slice(b"\r\n");
 }
 
-/// Encodes a reply as RESP2. `Lines` is a general array whose elements may be
-/// of any type (MGET's values and nils, HELLO's mixed map).
-pub(crate) fn encode(reply: &Reply, out: &mut Vec<u8>) {
+/// The protocol version a connection speaks, chosen by HELLO.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Proto {
+    Resp2,
+    Resp3,
+}
+
+fn push_header(out: &mut Vec<u8>, kind: char, len: usize) {
+    out.extend_from_slice(format!("{kind}{len}\r\n").as_bytes());
+}
+
+/// Encodes a reply. RESP3 differs from RESP2 in three ways that matter here:
+/// nil is `_` rather than a null bulk string, a set reply is `~` rather than
+/// an array, and a hash or map reply is `%` (counting pairs) rather than a
+/// flat array of alternating keys and values.
+pub(crate) fn encode(reply: &Reply, proto: Proto, out: &mut Vec<u8>) {
+    let v3 = proto == Proto::Resp3;
     match reply {
         Reply::Simple(s) => {
             out.push(b'+');
@@ -149,17 +164,33 @@ pub(crate) fn encode(reply: &Reply, out: &mut Vec<u8>) {
         }
         Reply::Int(n) => out.extend_from_slice(format!(":{n}\r\n").as_bytes()),
         Reply::Bulk(v) => push_bulk(out, v),
+        Reply::Nil if v3 => out.extend_from_slice(b"_\r\n"),
         Reply::Nil => out.extend_from_slice(b"$-1\r\n"),
-        Reply::Array(items, _) => {
-            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+        Reply::Array(items, kind) => {
+            match kind {
+                Empty::Set if v3 => push_header(out, '~', items.len()),
+                Empty::Hash if v3 => push_header(out, '%', items.len() / 2),
+                _ => push_header(out, '*', items.len()),
+            }
             for item in items {
                 push_bulk(out, item);
             }
         }
         Reply::Lines(replies) => {
-            out.extend_from_slice(format!("*{}\r\n", replies.len()).as_bytes());
+            push_header(out, '*', replies.len());
             for r in replies {
-                encode(r, out);
+                encode(r, proto, out);
+            }
+        }
+        Reply::Map(pairs) => {
+            if v3 {
+                push_header(out, '%', pairs.len());
+            } else {
+                push_header(out, '*', pairs.len() * 2);
+            }
+            for (k, v) in pairs {
+                encode(k, proto, out);
+                encode(v, proto, out);
             }
         }
     }
@@ -179,7 +210,6 @@ pub(crate) fn encode_error(msg: &str, out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reply::Empty;
 
     fn read_all(input: &[u8]) -> Result<Vec<Vec<Vec<u8>>>, ReadError> {
         let mut r = io::BufReader::new(input);
@@ -297,8 +327,43 @@ mod tests {
 
     fn enc(reply: &Reply) -> Vec<u8> {
         let mut out = Vec::new();
-        encode(reply, &mut out);
+        encode(reply, Proto::Resp2, &mut out);
         out
+    }
+
+    fn enc3(reply: &Reply) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode(reply, Proto::Resp3, &mut out);
+        out
+    }
+
+    #[test]
+    fn resp3_encoding_differs_only_for_nil_sets_and_maps() {
+        assert_eq!(enc3(&Reply::Simple("OK")), b"+OK\r\n");
+        assert_eq!(enc3(&Reply::Int(3)), b":3\r\n");
+        assert_eq!(enc3(&Reply::Bulk(b"v".to_vec())), b"$1\r\nv\r\n");
+        assert_eq!(enc3(&Reply::Nil), b"_\r\n");
+        let items = vec![b"a".to_vec(), b"b".to_vec()];
+        assert_eq!(
+            enc3(&Reply::Array(items.clone(), Empty::List)),
+            b"*2\r\n$1\r\na\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(
+            enc3(&Reply::Array(items.clone(), Empty::Set)),
+            b"~2\r\n$1\r\na\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(
+            enc3(&Reply::Array(items, Empty::Hash)),
+            b"%1\r\n$1\r\na\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(enc3(&Reply::Array(vec![], Empty::Hash)), b"%0\r\n");
+        assert_eq!(
+            enc3(&Reply::Lines(vec![Reply::Nil, Reply::Int(1)])),
+            b"*2\r\n_\r\n:1\r\n"
+        );
+        let map = Reply::Map(vec![(Reply::Bulk(b"proto".to_vec()), Reply::Int(3))]);
+        assert_eq!(enc3(&map), b"%1\r\n$5\r\nproto\r\n:3\r\n");
+        assert_eq!(enc(&map), b"*2\r\n$5\r\nproto\r\n:3\r\n");
     }
 
     #[test]

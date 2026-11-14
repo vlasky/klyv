@@ -1125,3 +1125,288 @@ fn differential_random_sequences() {
         }
     }
 }
+
+// === Server mode ===
+//
+// The same scenarios and random sequences again, but through `klyv serve`,
+// compared with real Redis at the wire level: a minimal RESP client here
+// sends each command to both servers over a socket and compares the parsed
+// replies, *including their types*. That is stricter than anything a client
+// program can show: `$-1` versus `*-1`, a simple string versus a bulk string,
+// or (in RESP3) an array versus a set or a map are all differences here, and
+// error messages must match in full, not just by code. Each test runs once
+// per protocol version.
+
+struct KlyvServer {
+    child: Child,
+    port: u16,
+}
+
+impl Drop for KlyvServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_klyv_server(db: &std::path::Path) -> KlyvServer {
+    use std::io::BufRead;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_klyv"))
+        .arg("--db")
+        .arg(db)
+        .args(["serve", "--bind", "127.0.0.1:0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start klyv serve");
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let port = line
+        .trim()
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected server announcement: {line:?}"));
+    KlyvServer { child, port }
+}
+
+/// A reply as it appears on the wire, type tag and all.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Wire {
+    Simple(String),
+    Error(String),
+    Int(i64),
+    Bulk(Vec<u8>),
+    /// RESP2 `$-1`.
+    NullBulk,
+    /// RESP2 `*-1`.
+    NullArray,
+    /// RESP3 `_`.
+    Null,
+    Array(Vec<Wire>),
+    /// RESP3 `~`.
+    Set(Vec<Wire>),
+    /// RESP3 `%`.
+    Map(Vec<(Wire, Wire)>),
+    /// Any other RESP3 scalar (boolean, double, big number), kept verbatim.
+    Other(char, String),
+}
+
+struct WireClient {
+    reader: std::io::BufReader<std::net::TcpStream>,
+    writer: std::net::TcpStream,
+}
+
+impl WireClient {
+    fn connect(port: u16, resp3: bool) -> Self {
+        let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let mut client = WireClient {
+            reader: std::io::BufReader::new(stream.try_clone().unwrap()),
+            writer: stream,
+        };
+        if resp3 {
+            let hello = client.cmd(&["HELLO", "3"]);
+            assert!(matches!(hello, Wire::Map(_)), "HELLO 3 gave {hello:?}");
+        }
+        client
+    }
+
+    fn line(&mut self) -> String {
+        use std::io::BufRead;
+        let mut line = String::new();
+        self.reader.read_line(&mut line).expect("read failed");
+        assert!(line.ends_with("\r\n"), "unterminated reply line {line:?}");
+        line.truncate(line.len() - 2);
+        line
+    }
+
+    fn read(&mut self) -> Wire {
+        use std::io::Read;
+        let line = self.line();
+        let kind = line.chars().next().expect("empty reply line");
+        let rest = &line[1..];
+        let count = |rest: &str| rest.parse::<i64>().expect("bad length");
+        match kind {
+            '+' => Wire::Simple(rest.to_string()),
+            '-' => Wire::Error(rest.to_string()),
+            ':' => Wire::Int(rest.parse().expect("bad integer")),
+            '_' => Wire::Null,
+            '$' | '=' | '!' => {
+                let len = count(rest);
+                if len < 0 {
+                    return Wire::NullBulk;
+                }
+                let mut buf = vec![0u8; len as usize + 2];
+                self.reader.read_exact(&mut buf).unwrap();
+                buf.truncate(len as usize);
+                match kind {
+                    '$' => Wire::Bulk(buf),
+                    '!' => Wire::Error(String::from_utf8_lossy(&buf).into_owned()),
+                    _ => Wire::Other(kind, String::from_utf8_lossy(&buf).into_owned()),
+                }
+            }
+            '*' | '~' | '>' => {
+                let n = count(rest);
+                if n < 0 {
+                    return Wire::NullArray;
+                }
+                let items = (0..n).map(|_| self.read()).collect();
+                if kind == '~' {
+                    Wire::Set(items)
+                } else {
+                    Wire::Array(items)
+                }
+            }
+            '%' => Wire::Map(
+                (0..count(rest))
+                    .map(|_| {
+                        let k = self.read();
+                        (k, self.read())
+                    })
+                    .collect(),
+            ),
+            other => Wire::Other(other, rest.to_string()),
+        }
+    }
+
+    fn cmd(&mut self, args: &[&str]) -> Wire {
+        use std::io::Write;
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+            out.extend_from_slice(a.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        self.writer.write_all(&out).unwrap();
+        self.read()
+    }
+}
+
+/// Puts an unordered reply into a canonical order, keeping its type.
+fn canonical(reply: Wire, cmp: Cmp) -> Wire {
+    match (cmp, reply) {
+        (Cmp::Sorted, Wire::Array(mut items)) => {
+            items.sort();
+            Wire::Array(items)
+        }
+        (Cmp::Sorted | Cmp::PairSorted, Wire::Set(mut items)) => {
+            items.sort();
+            Wire::Set(items)
+        }
+        (Cmp::PairSorted, Wire::Map(mut pairs)) => {
+            pairs.sort();
+            Wire::Map(pairs)
+        }
+        // RESP2 hash reply: a flat array of alternating fields and values.
+        (Cmp::PairSorted, Wire::Array(items)) => {
+            let mut pairs: Vec<Vec<Wire>> = items.chunks(2).map(<[Wire]>::to_vec).collect();
+            pairs.sort();
+            Wire::Array(pairs.into_iter().flatten().collect())
+        }
+        (_, other) => other,
+    }
+}
+
+fn server_scenarios(resp3: bool) {
+    if !have("redis-server") || !have("redis-cli") {
+        eprintln!("skipping differential test: redis-server/redis-cli not on PATH");
+        return;
+    }
+    let redis = start_redis();
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_klyv_server(&dir.path().join("server.db"));
+    let mut k = WireClient::connect(server.port, resp3);
+    let mut r = WireClient::connect(redis.port, resp3);
+
+    for (name, steps) in scenarios() {
+        r.cmd(&["FLUSHALL"]);
+        k.cmd(&["FLUSHALL"]);
+        for (j, s) in steps.iter().enumerate() {
+            let k_out = canonical(k.cmd(s.redis), s.cmp);
+            let r_out = canonical(r.cmd(s.redis), s.cmp);
+            assert_eq!(
+                k_out, r_out,
+                "scenario '{name}' step {j} (resp3={resp3}): {:?}\n  left: klyv server, right: redis",
+                s.redis
+            );
+            if matches!(s.cmp, Cmp::Error) {
+                assert!(
+                    matches!(r_out, Wire::Error(_)),
+                    "expected an error: {r_out:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn differential_server_resp2() {
+    server_scenarios(false);
+}
+
+#[test]
+fn differential_server_resp3() {
+    server_scenarios(true);
+}
+
+fn server_random(resp3: bool) {
+    if !have("redis-server") || !have("redis-cli") {
+        eprintln!("skipping differential test: redis-server/redis-cli not on PATH");
+        return;
+    }
+    // A socket round trip is far cheaper than spawning a process per step,
+    // so this layer runs four times as many steps as the CLI one.
+    let steps: usize = std::env::var("KLYV_DIFF_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(250)
+        * 4;
+    let seeds: Vec<u64> = match std::env::var("KLYV_DIFF_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(seed) => vec![seed],
+        None => vec![0x5EED_0001, 0x5EED_0002, 0x5EED_0003],
+    };
+    let redis = start_redis();
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_klyv_server(&dir.path().join("server-random.db"));
+    let mut k = WireClient::connect(server.port, resp3);
+    let mut r = WireClient::connect(redis.port, resp3);
+
+    for seed in seeds {
+        r.cmd(&["FLUSHALL"]);
+        k.cmd(&["FLUSHALL"]);
+        let mut rng = Rng(seed);
+        let mut history: Vec<String> = Vec::new();
+        for i in 0..steps {
+            let g = random_step(&mut rng);
+            let args: Vec<&str> = g.redis.iter().map(String::as_str).collect();
+            history.push(format!("{i:>4}: {}", g.redis.join(" ")));
+            let k_out = canonical(k.cmd(&args), g.ok_cmp);
+            let r_out = canonical(r.cmd(&args), g.ok_cmp);
+            if k_out != r_out {
+                let from = history.len().saturating_sub(15);
+                panic!(
+                    "seed {seed:#x} step {i} resp3={resp3} (replay with KLYV_DIFF_SEED={seed}); recent history:\n{}\n  klyv server: {k_out:?}\n  redis:       {r_out:?}",
+                    history[from..].join("\n")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn differential_server_random_resp2() {
+    server_random(false);
+}
+
+#[test]
+fn differential_server_random_resp3() {
+    server_random(true);
+}

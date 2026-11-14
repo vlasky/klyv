@@ -1,10 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-11-14)
+
+### Added
+
+- **`klyv serve`: a Redis-compatible server.** Speaks RESP2 and RESP3 (negotiated with `HELLO`) over TCP (`--bind`, default `127.0.0.1:6379`) and/or a Unix socket (`--unixsocket`, `--unixsocketperm`), so `redis-cli`, redis-py and other Redis clients can use a klyv database unchanged. Every CLI command is available under its Redis name, plus `SETNX`, `SETEX`, `PSETEX`, `HMSET`, `UNLINK`, `FLUSHDB`, multi-key `EXISTS` and `SET ... XX`. Pipelining and inline commands are supported, keys and values are binary safe, and the connection commands clients send on connect (`PING`, `HELLO`, `SELECT`, `CLIENT`, `COMMAND`, `CONFIG GET`, `INFO`) are answered. One thread and one SQLite connection per client, one transaction per command, so the CLI can use the same file while the server runs. No authentication or TLS: it binds loopback by default and warns otherwise. See the README and SPEC.md "Server Mode".
+- Wire-level differential tests: every scenario and long random command sequences are sent to klyv's server and to a real Redis over raw sockets, in both protocol versions, and the replies must be identical including their wire types and full error text.
+
+### Fixed
+
+- **`incr`/`decr`/`incr-by`/`h-incr-by` accepted non-canonical integers.** A stored value such as `042` or `+5` (reachable with `append`) was treated as a number; Redis rejects it. Integers now follow Redis's strict syntax: an optional minus, no plus sign, no leading zeros. Found by the new wire-level tests after about 28,000 random steps.
 
 ### Changed
 
-- Internal: every command function takes its keys, fields and values as bytes rather than strings, bound to SQLite as TEXT when valid UTF-8 and BLOB otherwise. With byte-valued replies (0.3.0) the core is now binary-safe end to end, the prerequisite for the RESP server. No behaviour change from the CLI, which can only pass UTF-8.
+- The integer error now reads `ERR value is not an integer or out of range`, as in Redis (previously `ERR value is not an integer`).
+- Internal: every command function takes its keys, fields and values as bytes rather than strings, bound to SQLite as TEXT when valid UTF-8 and BLOB otherwise, making the core binary-safe end to end.
 
 ## 0.3.1 (2026-11-14)
 
