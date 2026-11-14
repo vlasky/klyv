@@ -591,7 +591,7 @@ impl<R: Read, W: Write> Read for FlushBeforeRead<'_, R, W> {
 }
 
 /// Serves one client until it disconnects, quits or breaks the protocol.
-fn serve_connection(reader: impl Read, writer: impl Write, shared: &Shared) {
+fn serve_connection(reader: impl Read, writer: impl Write, shared: &Shared, admitted: bool) {
     let writer = RefCell::new(BufWriter::new(writer));
     let send = |bytes: &[u8]| writer.borrow_mut().write_all(bytes);
     let fail = |msg: &str| {
@@ -604,7 +604,7 @@ fn serve_connection(reader: impl Read, writer: impl Write, shared: &Shared) {
         writer: &writer,
     });
     // Redis's reply to a client over the limit, sent before closing.
-    if shared.clients.load(Ordering::Relaxed) > shared.max_clients {
+    if !admitted {
         fail("ERR max number of clients reached");
         let _ = writer.borrow_mut().flush();
         return;
@@ -663,9 +663,12 @@ where
                     self.0.fetch_sub(1, Ordering::Relaxed);
                 }
             }
-            shared.clients.fetch_add(1, Ordering::Relaxed);
+            // Count and decide in one atomic step: with a separate load,
+            // two connections racing for the last slot could each see the
+            // other's increment and both be turned away.
+            let count = shared.clients.fetch_add(1, Ordering::Relaxed) + 1;
             let _connected = Connected(&shared.clients);
-            serve_connection(&stream, &stream, &shared);
+            serve_connection(&stream, &stream, &shared, count <= shared.max_clients);
         });
 }
 
@@ -694,7 +697,10 @@ mod unix {
     /// and never a file that is not a socket. Only "connection refused"
     /// counts as stale: any other failure to connect (permissions, resource
     /// limits) proves nothing, and the file is left alone.
-    pub(super) fn bind(path: &Path, perm: Option<&str>) -> Result<UnixListener, String> {
+    pub(super) fn bind(
+        path: &Path,
+        perm: Option<&str>,
+    ) -> Result<(UnixListener, Option<(u64, u64)>), String> {
         let mode = match perm {
             Some(perm) => Some(
                 u32::from_str_radix(perm, 8)
@@ -724,11 +730,13 @@ mod unix {
             }
         }
         let listener = UnixListener::bind(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        // Taken at once, so it describes the file this bind created.
+        let created = identity(path);
         if let Some(mode) = mode {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
                 .map_err(|e| format!("{}: {e}", path.display()))?;
         }
-        Ok(listener)
+        Ok((listener, created))
     }
 
     /// Identifies the socket file this process created, so that shutdown
@@ -801,10 +809,10 @@ fn start(db: &Path, args: ServeArgs) -> Result<Vec<std::thread::JoinHandle<()>>,
     // Remove the socket file on Ctrl-C / SIGTERM. Nothing else needs an
     // orderly shutdown: every command is its own committed transaction.
     #[cfg(unix)]
-    let socket = args
-        .unixsocket
-        .clone()
-        .map(|path| (unix::identity(&path), path));
+    let socket = unix_listener
+        .as_ref()
+        .zip(args.unixsocket.clone())
+        .map(|((_, created), path)| (*created, path));
     ctrlc::set_handler(move || {
         // Only if the path is still the socket this process bound: another
         // server may have replaced it since.
@@ -836,7 +844,7 @@ fn start(db: &Path, args: ServeArgs) -> Result<Vec<std::thread::JoinHandle<()>>,
         handles.push(std::thread::spawn(move || accept_tcp(listener, shared)));
     }
     #[cfg(unix)]
-    if let (Some(listener), Some(path)) = (unix_listener, &args.unixsocket) {
+    if let (Some((listener, _)), Some(path)) = (unix_listener, &args.unixsocket) {
         let _ = writeln!(out, "listening on unix://{}", path.display());
         let shared = Arc::clone(&shared);
         handles.push(std::thread::spawn(move || unix::accept(listener, shared)));
