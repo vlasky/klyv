@@ -1,6 +1,7 @@
 //! Command-line definitions and the transactional dispatcher.
 
 use crate::commands::{hashes::*, keys::*, lists::*, sets::*, strings::*, ttl::*};
+use crate::db::Arg;
 use crate::reply::*;
 use clap::{Parser, Subcommand, ValueEnum};
 use rusqlite::{Connection, TransactionBehavior};
@@ -365,6 +366,15 @@ pub(crate) fn dispatch(conn: &mut Connection, cmd: Command) -> CmdResult {
     Ok(reply)
 }
 
+/// A CLI string argument as a byte argument.
+fn a(s: &str) -> Arg<'_> {
+    Arg::from(s)
+}
+
+fn args(v: &[String]) -> Vec<Arg<'_>> {
+    v.iter().map(|s| a(s)).collect()
+}
+
 pub(crate) fn run(conn: &Connection, cmd: Command) -> CmdResult {
     match cmd {
         Command::Set {
@@ -383,75 +393,75 @@ pub(crate) fn run(conn: &Connection, cmd: Command) -> CmdResult {
                 (None, Some(ms)) => Some(ms),
                 (None, None) => None,
             };
-            cmd_set(conn, &key, &value, nx, ttl_ms, keep_ttl)
+            cmd_set(conn, a(&key), a(&value), nx, ttl_ms, keep_ttl)
         }
-        Command::Get { key } => cmd_get(conn, &key),
-        Command::GetDel { key } => cmd_getdel(conn, &key),
-        Command::Del { keys } => cmd_del(conn, &keys),
-        Command::Incr { key } => cmd_incrby(conn, &key, 1),
-        Command::Decr { key } => cmd_incrby(conn, &key, -1),
-        Command::IncrBy { key, amount } => cmd_incrby(conn, &key, amount),
+        Command::Get { key } => cmd_get(conn, a(&key)),
+        Command::GetDel { key } => cmd_getdel(conn, a(&key)),
+        Command::Del { keys } => cmd_del(conn, &args(&keys)),
+        Command::Incr { key } => cmd_incrby(conn, a(&key), 1),
+        Command::Decr { key } => cmd_incrby(conn, a(&key), -1),
+        Command::IncrBy { key, amount } => cmd_incrby(conn, a(&key), amount),
         Command::DecrBy { key, amount } => {
             let neg = amount
                 .checked_neg()
                 .ok_or_else(|| CmdError::new("ERR increment or decrement would overflow"))?;
-            cmd_incrby(conn, &key, neg)
+            cmd_incrby(conn, a(&key), neg)
         }
-        Command::Append { key, value } => cmd_append(conn, &key, &value),
-        Command::Strlen { key } => cmd_strlen(conn, &key),
-        Command::MSet { pairs } => cmd_mset(conn, &pairs),
-        Command::MGet { keys } => cmd_mget(conn, &keys),
+        Command::Append { key, value } => cmd_append(conn, a(&key), a(&value)),
+        Command::Strlen { key } => cmd_strlen(conn, a(&key)),
+        Command::MSet { pairs } => cmd_mset(conn, &args(&pairs)),
+        Command::MGet { keys } => cmd_mget(conn, &args(&keys)),
 
-        Command::LPush { key, values } => cmd_lpush(conn, &key, &values),
-        Command::RPush { key, values } => cmd_rpush(conn, &key, &values),
-        Command::LPop { key } => cmd_pop(conn, &key, "ASC"),
-        Command::RPop { key } => cmd_pop(conn, &key, "DESC"),
-        Command::LRange { key, start, stop } => cmd_lrange(conn, &key, start, stop),
-        Command::LLen { key } => cmd_llen(conn, &key),
-        Command::LRem { key, count, value } => cmd_lrem(conn, &key, count, &value),
-        Command::LPos { key, value } => cmd_lpos(conn, &key, &value),
-        Command::LIndex { key, index } => cmd_lindex(conn, &key, index),
-        Command::LSet { key, index, value } => cmd_lset(conn, &key, index, &value),
-        Command::LTrim { key, start, stop } => cmd_ltrim(conn, &key, start, stop),
+        Command::LPush { key, values } => cmd_lpush(conn, a(&key), &args(&values)),
+        Command::RPush { key, values } => cmd_rpush(conn, a(&key), &args(&values)),
+        Command::LPop { key } => cmd_pop(conn, a(&key), "ASC"),
+        Command::RPop { key } => cmd_pop(conn, a(&key), "DESC"),
+        Command::LRange { key, start, stop } => cmd_lrange(conn, a(&key), start, stop),
+        Command::LLen { key } => cmd_llen(conn, a(&key)),
+        Command::LRem { key, count, value } => cmd_lrem(conn, a(&key), count, a(&value)),
+        Command::LPos { key, value } => cmd_lpos(conn, a(&key), a(&value)),
+        Command::LIndex { key, index } => cmd_lindex(conn, a(&key), index),
+        Command::LSet { key, index, value } => cmd_lset(conn, a(&key), index, a(&value)),
+        Command::LTrim { key, start, stop } => cmd_ltrim(conn, a(&key), start, stop),
         Command::LInsert {
             key,
             r#where,
             pivot,
             value,
-        } => cmd_linsert(conn, &key, r#where, &pivot, &value),
+        } => cmd_linsert(conn, a(&key), r#where, a(&pivot), a(&value)),
 
-        Command::SAdd { key, members } => cmd_sadd(conn, &key, &members),
-        Command::SRem { key, members } => cmd_srem(conn, &key, &members),
-        Command::SMembers { key } => cmd_smembers(conn, &key),
-        Command::SIsMember { key, member } => cmd_sismember(conn, &key, &member),
-        Command::SCard { key } => cmd_scard(conn, &key),
-        Command::SPop { key } => cmd_spop(conn, &key),
-        Command::SUnion { keys } => cmd_sunion(conn, &keys),
-        Command::SInter { keys } => cmd_sinter(conn, &keys),
-        Command::SDiff { keys } => cmd_sdiff(conn, &keys),
+        Command::SAdd { key, members } => cmd_sadd(conn, a(&key), &args(&members)),
+        Command::SRem { key, members } => cmd_srem(conn, a(&key), &args(&members)),
+        Command::SMembers { key } => cmd_smembers(conn, a(&key)),
+        Command::SIsMember { key, member } => cmd_sismember(conn, a(&key), a(&member)),
+        Command::SCard { key } => cmd_scard(conn, a(&key)),
+        Command::SPop { key } => cmd_spop(conn, a(&key)),
+        Command::SUnion { keys } => cmd_sunion(conn, &args(&keys)),
+        Command::SInter { keys } => cmd_sinter(conn, &args(&keys)),
+        Command::SDiff { keys } => cmd_sdiff(conn, &args(&keys)),
 
-        Command::HSet { key, pairs } => cmd_hset(conn, &key, &pairs),
-        Command::HGet { key, field } => cmd_hget(conn, &key, &field),
-        Command::HExists { key, field } => cmd_hexists(conn, &key, &field),
-        Command::HIncrBy { key, field, amount } => cmd_hincrby(conn, &key, &field, amount),
-        Command::HDel { key, fields } => cmd_hdel(conn, &key, &fields),
-        Command::HGetAll { key } => cmd_hgetall(conn, &key),
-        Command::HKeys { key } => cmd_hkeys(conn, &key),
-        Command::HVals { key } => cmd_hvals(conn, &key),
-        Command::HLen { key } => cmd_hlen(conn, &key),
+        Command::HSet { key, pairs } => cmd_hset(conn, a(&key), &args(&pairs)),
+        Command::HGet { key, field } => cmd_hget(conn, a(&key), a(&field)),
+        Command::HExists { key, field } => cmd_hexists(conn, a(&key), a(&field)),
+        Command::HIncrBy { key, field, amount } => cmd_hincrby(conn, a(&key), a(&field), amount),
+        Command::HDel { key, fields } => cmd_hdel(conn, a(&key), &args(&fields)),
+        Command::HGetAll { key } => cmd_hgetall(conn, a(&key)),
+        Command::HKeys { key } => cmd_hkeys(conn, a(&key)),
+        Command::HVals { key } => cmd_hvals(conn, a(&key)),
+        Command::HLen { key } => cmd_hlen(conn, a(&key)),
 
-        Command::Keys { pattern } => cmd_keys(conn, pattern.as_deref()),
-        Command::Exists { key } => cmd_exists(conn, &key),
-        Command::Type { key } => cmd_type(conn, &key),
-        Command::Rename { key, newkey } => cmd_rename(conn, &key, &newkey),
+        Command::Keys { pattern } => cmd_keys(conn, pattern.as_deref().map(Arg::from)),
+        Command::Exists { key } => cmd_exists(conn, a(&key)),
+        Command::Type { key } => cmd_type(conn, a(&key)),
+        Command::Rename { key, newkey } => cmd_rename(conn, a(&key), a(&newkey)),
 
-        Command::Expire { key, seconds } => cmd_expire(conn, &key, seconds),
-        Command::PExpire { key, milliseconds } => cmd_pexpire(conn, &key, milliseconds),
-        Command::ExpireAt { key, timestamp } => cmd_expireat(conn, &key, timestamp),
-        Command::PExpireAt { key, timestamp_ms } => cmd_pexpireat(conn, &key, timestamp_ms),
-        Command::Ttl { key } => cmd_ttl(conn, &key),
-        Command::PTtl { key } => cmd_pttl(conn, &key),
-        Command::Persist { key } => cmd_persist(conn, &key),
+        Command::Expire { key, seconds } => cmd_expire(conn, a(&key), seconds),
+        Command::PExpire { key, milliseconds } => cmd_pexpire(conn, a(&key), milliseconds),
+        Command::ExpireAt { key, timestamp } => cmd_expireat(conn, a(&key), timestamp),
+        Command::PExpireAt { key, timestamp_ms } => cmd_pexpireat(conn, a(&key), timestamp_ms),
+        Command::Ttl { key } => cmd_ttl(conn, a(&key)),
+        Command::PTtl { key } => cmd_pttl(conn, a(&key)),
+        Command::Persist { key } => cmd_persist(conn, a(&key)),
         Command::Purge => cmd_purge(conn),
 
         Command::DbSize => cmd_dbsize(conn),

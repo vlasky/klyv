@@ -20,7 +20,7 @@ fn members(
     Ok(Reply::Array(rows, Empty::Set))
 }
 
-pub(crate) fn cmd_sadd(conn: &Connection, key: &str, members: &[String]) -> CmdResult {
+pub(crate) fn cmd_sadd(conn: &Connection, key: Arg<'_>, members: &[Arg<'_>]) -> CmdResult {
     if members.is_empty() {
         return Err(CmdError::new(
             "ERR wrong number of arguments for 'sadd' command",
@@ -41,7 +41,7 @@ pub(crate) fn cmd_sadd(conn: &Connection, key: &str, members: &[String]) -> CmdR
     Ok(Reply::Int(count))
 }
 
-pub(crate) fn cmd_srem(conn: &Connection, key: &str, members: &[String]) -> CmdResult {
+pub(crate) fn cmd_srem(conn: &Connection, key: Arg<'_>, members: &[Arg<'_>]) -> CmdResult {
     let now = now_ms();
     ensure_type(conn, key, KIND, now)?;
     drop_if_expired(conn, key, now)?;
@@ -59,7 +59,7 @@ pub(crate) fn cmd_srem(conn: &Connection, key: &str, members: &[String]) -> CmdR
     Ok(Reply::Int(count))
 }
 
-pub(crate) fn cmd_smembers(conn: &Connection, key: &str) -> CmdResult {
+pub(crate) fn cmd_smembers(conn: &Connection, key: Arg<'_>) -> CmdResult {
     if !check_type(conn, key, KIND, now_ms())? {
         return Ok(empty());
     }
@@ -70,7 +70,7 @@ pub(crate) fn cmd_smembers(conn: &Connection, key: &str) -> CmdResult {
     )?)
 }
 
-pub(crate) fn cmd_sismember(conn: &Connection, key: &str, member: &str) -> CmdResult {
+pub(crate) fn cmd_sismember(conn: &Connection, key: Arg<'_>, member: Arg<'_>) -> CmdResult {
     if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Int(0));
     }
@@ -85,7 +85,7 @@ pub(crate) fn cmd_sismember(conn: &Connection, key: &str, member: &str) -> CmdRe
     Ok(Reply::Int(exists as i64))
 }
 
-pub(crate) fn cmd_scard(conn: &Connection, key: &str) -> CmdResult {
+pub(crate) fn cmd_scard(conn: &Connection, key: Arg<'_>) -> CmdResult {
     if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Int(0));
     }
@@ -97,7 +97,7 @@ pub(crate) fn cmd_scard(conn: &Connection, key: &str) -> CmdResult {
     Ok(Reply::Int(count))
 }
 
-pub(crate) fn cmd_spop(conn: &Connection, key: &str) -> CmdResult {
+pub(crate) fn cmd_spop(conn: &Connection, key: Arg<'_>) -> CmdResult {
     let now = now_ms();
     ensure_type(conn, key, KIND, now)?;
     drop_if_expired(conn, key, now)?;
@@ -120,13 +120,9 @@ pub(crate) fn cmd_spop(conn: &Connection, key: &str) -> CmdResult {
 
 /// Type-checks every input key (WRONGTYPE on any mismatch) and returns the
 /// ones that are live; missing/expired input sets are treated as empty.
-fn live_sets<'a>(
-    conn: &Connection,
-    keys: &'a [String],
-    now: i64,
-) -> Result<Vec<&'a String>, CmdError> {
+fn live_sets<'a>(conn: &Connection, keys: &[Arg<'a>], now: i64) -> Result<Vec<Arg<'a>>, CmdError> {
     let mut live = Vec::with_capacity(keys.len());
-    for k in keys {
+    for &k in keys {
         if check_type(conn, k, KIND, now)? {
             live.push(k);
         }
@@ -141,7 +137,7 @@ fn placeholders(n: usize, start: usize) -> String {
         .join(", ")
 }
 
-pub(crate) fn cmd_sunion(conn: &Connection, keys: &[String]) -> CmdResult {
+pub(crate) fn cmd_sunion(conn: &Connection, keys: &[Arg<'_>]) -> CmdResult {
     let live = live_sets(conn, keys, now_ms())?;
     if live.is_empty() {
         return Ok(empty());
@@ -151,11 +147,11 @@ pub(crate) fn cmd_sunion(conn: &Connection, keys: &[String]) -> CmdResult {
         placeholders(live.len(), 1)
     );
     let params: Vec<&dyn rusqlite::ToSql> =
-        live.iter().map(|k| *k as &dyn rusqlite::ToSql).collect();
+        live.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
     Ok(members(conn, &sql, &params)?)
 }
 
-pub(crate) fn cmd_sinter(conn: &Connection, keys: &[String]) -> CmdResult {
+pub(crate) fn cmd_sinter(conn: &Connection, keys: &[Arg<'_>]) -> CmdResult {
     if keys.is_empty() {
         return Ok(empty());
     }
@@ -165,7 +161,7 @@ pub(crate) fn cmd_sinter(conn: &Connection, keys: &[String]) -> CmdResult {
         return Ok(empty());
     }
     // Dedup keys so repeated args don't break the COUNT(DISTINCT key) test.
-    let mut keys: Vec<&String> = live;
+    let mut keys = live;
     keys.sort();
     keys.dedup();
     let n = keys.len();
@@ -176,16 +172,17 @@ pub(crate) fn cmd_sinter(conn: &Connection, keys: &[String]) -> CmdResult {
     );
     let count = n as i64;
     let mut params: Vec<&dyn rusqlite::ToSql> =
-        keys.iter().map(|k| *k as &dyn rusqlite::ToSql).collect();
+        keys.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
     params.push(&count);
     Ok(members(conn, &sql, &params)?)
 }
 
-pub(crate) fn cmd_sdiff(conn: &Connection, keys: &[String]) -> CmdResult {
+pub(crate) fn cmd_sdiff(conn: &Connection, keys: &[Arg<'_>]) -> CmdResult {
     let Some((first, rest)) = keys.split_first() else {
         return Ok(empty());
     };
     let now = now_ms();
+    let first = *first;
     if !check_type(conn, first, KIND, now)? {
         // Still type-check the others so a wrong-type argument is an error.
         live_sets(conn, rest, now)?;
@@ -205,7 +202,7 @@ pub(crate) fn cmd_sdiff(conn: &Connection, keys: &[String]) -> CmdResult {
             SELECT member FROM set_members WHERE key IN ({}))",
         placeholders(rest.len(), 2)
     );
-    let mut params: Vec<&dyn rusqlite::ToSql> = vec![first as &dyn rusqlite::ToSql];
-    params.extend(rest.iter().map(|k| *k as &dyn rusqlite::ToSql));
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&first as &dyn rusqlite::ToSql];
+    params.extend(rest.iter().map(|k| k as &dyn rusqlite::ToSql));
     Ok(members(conn, &sql, &params)?)
 }

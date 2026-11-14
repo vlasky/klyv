@@ -125,7 +125,9 @@ Module layout under `src/`:
 - `reply.rs` — the typed `Reply`/`CmdError` and the human/raw/json renderers.
 - `db.rs` — schema creation and the v1→v2 migration, plus the catalogue helpers every command shares (`lookup`, `key_type`, `check_type`/`ensure_type`, `drop_if_expired`, `claim`, `release_if_empty`, `remove_key`).
 - `shell.rs` — REPL and pipe mode (`split_line`, `run_line`, `repl`, `pipe`).
-- `commands/{strings,lists,sets,hashes,keys,ttl}.rs` — one module per type family; each `cmd_*` takes a `&Connection` already inside the dispatcher's transaction.
+- `commands/{strings,lists,sets,hashes,keys,ttl}.rs` — one module per type family; each `cmd_*` takes a `&Connection` already inside the dispatcher's transaction, and its keys/fields/values as `Arg`.
+
+**Always pass `Arg` to SQL, never a bare `&[u8]`.** `Arg` binds valid UTF-8 as TEXT and anything else as BLOB; rusqlite binds a bare byte slice as BLOB always, and SQLite never considers a BLOB equal to a TEXT of the same bytes, so a bare slice silently misses every key written as text.
 
 All state in one SQLite database, schema v2 (`PRAGMA user_version = 2`): a `keyspace` catalogue (key, type, expires_at in Unix ms) that is the single source of truth for existence/type/expiry, plus four payload tables `strings`, `list_items`, `set_members`, `hash_fields`. Invariants: payload in exactly the table for the catalogue type; catalogue row iff payload rows (`claim` on create, `release_if_empty` after removals). Lists use fractional indexing (REAL column) for O(1) push. Expiry uses lazy filtering (`purge` does physical deletion). v1 files (klyv ≤ 0.2.0) migrate in place on first open. WAL mode for concurrent reads. `open_db` has a fast path: a file already at the current schema, in WAL mode and carrying the downgrade guard is opened with read-only checks and no write lock (keep it that way: any schema work added to open must stay behind `is_current`).
 
@@ -162,7 +164,7 @@ enum Reply { Simple(&'static str), Int(i64), Bulk(Vec<u8>), Nil, Array(Vec<Vec<u
 fn cmd_get(conn, key) -> CmdResult   // not println!
 ```
 
-What remains for the server is a **RESP encoder** as a fourth renderer. Replies already carry bytes. Two gaps remain when wiring RESP: command functions still take `&str` for keys, fields and values (fine for CLI input, but RESP allows arbitrary bytes in every position, so these become `&[u8]` and keys bind through the same text-or-blob rule as values), and `Array` holds flat byte strings rather than nested replies (sufficient today; RESP2 nil-inside-array cases may need a richer variant).
+What remains for the server is a **RESP encoder** as a fourth renderer. Replies carry bytes, and every command function takes its keys, fields and values as `Arg` (a `&[u8]` newtype in `db.rs`), so the core is binary-safe end to end; `commands/mod.rs` has unit tests driving it with non-UTF-8 input. One gap remains when wiring RESP: `Array` holds flat byte strings rather than nested replies (sufficient today; RESP2 nil-inside-array cases may need a richer variant).
 
 **Other key points:**
 - RESP2 is ~150 lines to hand-roll, or use the `redis-protocol` crate (RESP2/3). A command arrives as an array of bulk strings → `Vec<Vec<u8>>` = `[name, args…]`.

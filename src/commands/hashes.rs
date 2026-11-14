@@ -4,7 +4,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 const KIND: &str = "hash";
 
-fn field_value(conn: &Connection, key: &str, field: &str) -> rusqlite::Result<Option<Vec<u8>>> {
+fn field_value(
+    conn: &Connection,
+    key: Arg<'_>,
+    field: Arg<'_>,
+) -> rusqlite::Result<Option<Vec<u8>>> {
     conn.query_row(
         "SELECT value FROM hash_fields WHERE key = ?1 AND field = ?2",
         params![key, field],
@@ -13,7 +17,7 @@ fn field_value(conn: &Connection, key: &str, field: &str) -> rusqlite::Result<Op
     .optional()
 }
 
-pub(crate) fn cmd_hset(conn: &Connection, key: &str, pairs: &[String]) -> CmdResult {
+pub(crate) fn cmd_hset(conn: &Connection, key: Arg<'_>, pairs: &[Arg<'_>]) -> CmdResult {
     if pairs.is_empty() || !pairs.len().is_multiple_of(2) {
         return Err(CmdError::new(
             "ERR wrong number of arguments for 'hset' command",
@@ -24,7 +28,7 @@ pub(crate) fn cmd_hset(conn: &Connection, key: &str, pairs: &[String]) -> CmdRes
     drop_if_expired(conn, key, now)?;
     let mut count = 0i64;
     for chunk in pairs.chunks(2) {
-        let existed = field_value(conn, key, &chunk[0])?.is_some();
+        let existed = field_value(conn, key, chunk[0])?.is_some();
         conn.execute(
             "INSERT OR REPLACE INTO hash_fields (key, field, value) VALUES (?1, ?2, ?3)",
             params![key, chunk[0], chunk[1]],
@@ -37,21 +41,26 @@ pub(crate) fn cmd_hset(conn: &Connection, key: &str, pairs: &[String]) -> CmdRes
     Ok(Reply::Int(count))
 }
 
-pub(crate) fn cmd_hget(conn: &Connection, key: &str, field: &str) -> CmdResult {
+pub(crate) fn cmd_hget(conn: &Connection, key: Arg<'_>, field: Arg<'_>) -> CmdResult {
     if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Nil);
     }
     Ok(field_value(conn, key, field)?.map_or(Reply::Nil, Reply::Bulk))
 }
 
-pub(crate) fn cmd_hexists(conn: &Connection, key: &str, field: &str) -> CmdResult {
+pub(crate) fn cmd_hexists(conn: &Connection, key: Arg<'_>, field: Arg<'_>) -> CmdResult {
     if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Int(0));
     }
     Ok(Reply::Int(field_value(conn, key, field)?.is_some() as i64))
 }
 
-pub(crate) fn cmd_hincrby(conn: &Connection, key: &str, field: &str, amount: i64) -> CmdResult {
+pub(crate) fn cmd_hincrby(
+    conn: &Connection,
+    key: Arg<'_>,
+    field: Arg<'_>,
+    amount: i64,
+) -> CmdResult {
     let now = now_ms();
     ensure_type(conn, key, KIND, now)?;
     drop_if_expired(conn, key, now)?;
@@ -72,7 +81,7 @@ pub(crate) fn cmd_hincrby(conn: &Connection, key: &str, field: &str, amount: i64
     Ok(Reply::Int(new_val))
 }
 
-pub(crate) fn cmd_hdel(conn: &Connection, key: &str, fields: &[String]) -> CmdResult {
+pub(crate) fn cmd_hdel(conn: &Connection, key: Arg<'_>, fields: &[Arg<'_>]) -> CmdResult {
     let now = now_ms();
     ensure_type(conn, key, KIND, now)?;
     drop_if_expired(conn, key, now)?;
@@ -90,7 +99,7 @@ pub(crate) fn cmd_hdel(conn: &Connection, key: &str, fields: &[String]) -> CmdRe
     Ok(Reply::Int(count))
 }
 
-pub(crate) fn cmd_hgetall(conn: &Connection, key: &str) -> CmdResult {
+pub(crate) fn cmd_hgetall(conn: &Connection, key: Arg<'_>) -> CmdResult {
     if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Array(vec![], Empty::Hash));
     }
@@ -109,7 +118,7 @@ pub(crate) fn cmd_hgetall(conn: &Connection, key: &str) -> CmdResult {
     Ok(Reply::Array(items, Empty::Hash))
 }
 
-fn hash_column(conn: &Connection, key: &str, column: &str) -> rusqlite::Result<Vec<Vec<u8>>> {
+fn hash_column(conn: &Connection, key: Arg<'_>, column: &str) -> rusqlite::Result<Vec<Vec<u8>>> {
     let mut stmt = conn.prepare(&format!("SELECT {column} FROM hash_fields WHERE key = ?1"))?;
     let rows = stmt
         .query_map(params![key], |row| bytes_col(row, 0))?
@@ -117,21 +126,21 @@ fn hash_column(conn: &Connection, key: &str, column: &str) -> rusqlite::Result<V
     Ok(rows)
 }
 
-pub(crate) fn cmd_hkeys(conn: &Connection, key: &str) -> CmdResult {
+pub(crate) fn cmd_hkeys(conn: &Connection, key: Arg<'_>) -> CmdResult {
     if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Array(vec![], Empty::List));
     }
     Ok(Reply::Array(hash_column(conn, key, "field")?, Empty::List))
 }
 
-pub(crate) fn cmd_hvals(conn: &Connection, key: &str) -> CmdResult {
+pub(crate) fn cmd_hvals(conn: &Connection, key: Arg<'_>) -> CmdResult {
     if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Array(vec![], Empty::List));
     }
     Ok(Reply::Array(hash_column(conn, key, "value")?, Empty::List))
 }
 
-pub(crate) fn cmd_hlen(conn: &Connection, key: &str) -> CmdResult {
+pub(crate) fn cmd_hlen(conn: &Connection, key: Arg<'_>) -> CmdResult {
     if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Int(0));
     }
