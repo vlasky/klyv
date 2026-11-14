@@ -32,16 +32,17 @@ pub(crate) enum Reply {
     /// aborted by WATCH). Same as `Nil` except in RESP2, which has a
     /// distinct null array.
     NullArray,
-    /// An error as an element of an array: EXEC reports each queued
-    /// command's failure in place. (A command that fails as a whole
-    /// returns `Err(CmdError)` instead.)
-    Error(String),
     /// Items printed as a numbered, quoted list; the Empty kind picks the
     /// "(empty list)"/"(empty set)"/"(empty hash)" placeholder.
     Array(Vec<Vec<u8>>, Empty),
     /// One reply per line without numbering (MGET); on the wire, a general
     /// array whose elements may be of any type.
     Lines(Vec<Reply>),
+    /// A reply already encoded for the wire, sent as is. EXEC uses it: each
+    /// queued command's reply must be encoded in the protocol version in
+    /// force when that command ran, which a HELLO in the queue can change
+    /// part-way through. Only the server produces it.
+    Encoded(Vec<u8>),
     /// Key/value pairs of arbitrary replies: a RESP3 map, flattened to an
     /// array in RESP2. Only the server produces it (HELLO, CONFIG GET).
     Map(Vec<(Reply, Reply)>),
@@ -75,12 +76,11 @@ pub(crate) fn render_human(reply: &Reply, out: &mut Vec<u8>) {
             out.push(b'\n');
         }
         Reply::Int(n) => out.extend_from_slice(format!("(integer) {n}\n").as_bytes()),
-        Reply::Bulk(v) | Reply::Verbatim(v) => {
+        Reply::Bulk(v) | Reply::Verbatim(v) | Reply::Encoded(v) => {
             push_lossy(out, v);
             out.push(b'\n');
         }
         Reply::Nil | Reply::NullArray => out.extend_from_slice(b"(nil)\n"),
-        Reply::Error(msg) => out.extend_from_slice(format!("(error) {msg}\n").as_bytes()),
         Reply::Array(items, empty) => {
             if items.is_empty() {
                 out.extend_from_slice(match empty {
@@ -121,15 +121,11 @@ pub(crate) fn render_raw(reply: &Reply, out: &mut Vec<u8>) {
             out.extend_from_slice(n.to_string().as_bytes());
             out.push(b'\n');
         }
-        Reply::Bulk(v) | Reply::Verbatim(v) => {
+        Reply::Bulk(v) | Reply::Verbatim(v) | Reply::Encoded(v) => {
             out.extend_from_slice(v);
             out.push(b'\n');
         }
         Reply::Nil | Reply::NullArray => out.push(b'\n'),
-        Reply::Error(msg) => {
-            out.extend_from_slice(msg.as_bytes());
-            out.push(b'\n');
-        }
         Reply::Array(items, _) => {
             for item in items {
                 out.extend_from_slice(item);
@@ -175,9 +171,8 @@ pub(crate) fn render_json(reply: &Reply, out: &mut Vec<u8>) {
     match reply {
         Reply::Simple(s) => push_json_string(s.as_bytes(), out),
         Reply::Int(n) => out.extend_from_slice(n.to_string().as_bytes()),
-        Reply::Bulk(v) | Reply::Verbatim(v) => push_json_string(v, out),
+        Reply::Bulk(v) | Reply::Verbatim(v) | Reply::Encoded(v) => push_json_string(v, out),
         Reply::Nil | Reply::NullArray => out.extend_from_slice(b"null"),
-        Reply::Error(msg) => push_json_string(msg.as_bytes(), out),
         // Alternating field/value items (HGETALL) become a JSON object.
         Reply::Array(items, Empty::Hash) => {
             out.push(b'{');
