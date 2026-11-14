@@ -91,7 +91,8 @@ Expired keys are hidden from reads (lazy expiry) but remain on disk until `purge
 
 ### Key operations
 ```
-keys [pattern]          List keys (Redis glob: * ? [abc] [^a] [a-z], \ escapes; case-sensitive)
+keys [pattern]          List keys (Redis glob: * ? [abc] [^a] [a-z], \ escapes; case-sensitive;
+                        a port of Redis's matcher, so malformed patterns behave identically)
 exists <key>            Test existence (1/0, respects expiry)
 type <key>              string | list | set | hash | none
 rename <key> <newkey>   Rename (overwrites target, preserves TTL)
@@ -126,7 +127,7 @@ Module layout under `src/`:
 - `shell.rs` — REPL and pipe mode (`split_line`, `run_line`, `repl`, `pipe`).
 - `commands/{strings,lists,sets,hashes,keys,ttl}.rs` — one module per type family; each `cmd_*` takes a `&Connection` already inside the dispatcher's transaction.
 
-All state in one SQLite database, schema v2 (`PRAGMA user_version = 2`): a `keyspace` catalogue (key, type, expires_at in Unix ms) that is the single source of truth for existence/type/expiry, plus four payload tables `strings`, `list_items`, `set_members`, `hash_fields`. Invariants: payload in exactly the table for the catalogue type; catalogue row iff payload rows (`claim` on create, `release_if_empty` after removals). Lists use fractional indexing (REAL column) for O(1) push. Expiry uses lazy filtering (`purge` does physical deletion). v1 files (klyv ≤ 0.2.0) migrate in place on first open. WAL mode for concurrent reads.
+All state in one SQLite database, schema v2 (`PRAGMA user_version = 2`): a `keyspace` catalogue (key, type, expires_at in Unix ms) that is the single source of truth for existence/type/expiry, plus four payload tables `strings`, `list_items`, `set_members`, `hash_fields`. Invariants: payload in exactly the table for the catalogue type; catalogue row iff payload rows (`claim` on create, `release_if_empty` after removals). Lists use fractional indexing (REAL column) for O(1) push. Expiry uses lazy filtering (`purge` does physical deletion). v1 files (klyv ≤ 0.2.0) migrate in place on first open. WAL mode for concurrent reads. `open_db` has a fast path: a file already at the current schema, in WAL mode and carrying the downgrade guard is opened with read-only checks and no write lock (keep it that way: any schema work added to open must stay behind `is_current`).
 
 See SPEC.md for the full portable specification.
 
@@ -134,7 +135,7 @@ See SPEC.md for the full portable specification.
 
 ### Interactive mode (REPL) and pipe mode — ✅ SHIPPED
 
-`klyv --db <PATH>` with no subcommand enters the loop: a rustyline REPL when stdin is a tty, non-interactive pipe mode (one command per line from stdin) otherwise. One process, one DB open, per-line recoverable errors via `LineInput::try_parse_from` + `dispatch`. See `run_line`/`repl`/`pipe` in src/main.rs.
+`klyv --db <PATH>` with no subcommand enters the loop: a rustyline REPL when stdin is a tty, non-interactive pipe mode (one command per line from stdin) otherwise. One process, one DB open, per-line recoverable errors via `LineInput::try_parse_from` + `dispatch`. See `run_line`/`repl`/`pipe` in src/shell.rs.
 
 ### Pub/Sub — hard, fights the architecture
 
@@ -157,11 +158,11 @@ Transports (mirrors real Redis): `--bind 127.0.0.1:6379` for TCP and `--unixsock
 **The crux — split compute from render (the shared foundation): ✅ DONE.** All command functions now return `Result<Reply, CmdError>` instead of printing, with three renderers (human/raw/json) consuming the `Reply`:
 
 ```rust
-enum Reply { Simple(&'static str), Int(i64), Bulk(String), Nil, Array(Vec<String>, Empty), Lines(Vec<Reply>) }
+enum Reply { Simple(&'static str), Int(i64), Bulk(Vec<u8>), Nil, Array(Vec<Vec<u8>>, Empty), Lines(Vec<Reply>) }
 fn cmd_get(conn, key) -> CmdResult   // not println!
 ```
 
-What remains for the server is a **RESP encoder** as a fourth renderer. Note two Reply-shape gaps to close when wiring RESP: values are `String` not `Vec<u8>` (fine for CLI input, RESP allows arbitrary bytes), and `Array` holds flat strings rather than nested replies (sufficient today; RESP2 nil-inside-array cases like `LPOS` misses may need a richer variant).
+What remains for the server is a **RESP encoder** as a fourth renderer. Replies already carry bytes. Two gaps remain when wiring RESP: command functions still take `&str` for keys, fields and values (fine for CLI input, but RESP allows arbitrary bytes in every position, so these become `&[u8]` and keys bind through the same text-or-blob rule as values), and `Array` holds flat byte strings rather than nested replies (sufficient today; RESP2 nil-inside-array cases may need a richer variant).
 
 **Other key points:**
 - RESP2 is ~150 lines to hand-roll, or use the `redis-protocol` crate (RESP2/3). A command arrives as an array of bulk strings → `Vec<Vec<u8>>` = `[name, args…]`.
