@@ -1,6 +1,6 @@
 # klyv
 
-Redis-compatible embedded KV store backed by SQLite. No server, no daemon — just a CLI and a file.
+Redis-compatible embedded KV store backed by SQLite. No server or daemon needed: a CLI and a file. `klyv serve` optionally exposes the same commands over the Redis wire protocol (RESP2/RESP3).
 
 ## Usage
 
@@ -125,6 +125,8 @@ Module layout under `src/`:
 - `reply.rs` — the typed `Reply`/`CmdError` and the human/raw/json renderers.
 - `db.rs` — schema creation and the v1→v2 migration, plus the catalogue helpers every command shares (`lookup`, `key_type`, `check_type`/`ensure_type`, `drop_if_expired`, `claim`, `release_if_empty`, `remove_key`).
 - `shell.rs` — REPL and pipe mode (`split_line`, `run_line`, `repl`, `pipe`).
+- `resp.rs` — the wire protocol: `read_command` (multibulk and inline, with Redis's limits and error texts) and `encode` (RESP2/RESP3). Pure functions over `Read`/`Vec<u8>`, unit-tested without sockets.
+- `server.rs` — `klyv serve`: listeners (TCP, Unix socket), thread-per-connection loop, the name-keyed command table (`lookup`) that routes Redis commands to the same `cmd_*` functions, and the connection-level commands (`PING`, `HELLO`, `SELECT`, `CLIENT`, ...).
 - `commands/{strings,lists,sets,hashes,keys,ttl}.rs` — one module per type family; each `cmd_*` takes a `&Connection` already inside the dispatcher's transaction, and its keys/fields/values as `Arg`.
 
 **Always pass `Arg` to SQL, never a bare `&[u8]`.** `Arg` binds valid UTF-8 as TEXT and anything else as BLOB; rusqlite binds a bare byte slice as BLOB always, and SQLite never considers a BLOB equal to a TEXT of the same bytes, so a bare slice silently misses every key written as text.
@@ -151,38 +153,22 @@ There is no low-effort path to *real* pub/sub. Recommendation if pursued: Option
 
 **Note:** real Redis pub/sub becomes feasible *only* once the RESP server below exists — a long-running daemon with persistent connections is exactly what fire-and-forget fan-out needs (a shared subscriber registry behind a `Mutex`). So pub/sub is best deferred until then.
 
-### Redis-compatible server (RESP wire protocol) — large, multi-day
+### Redis-compatible server (RESP wire protocol) — Phase 1 ✅ SHIPPED (0.4.0), with RESP3
 
-A `klyv serve` daemon that speaks the **RESP** wire protocol over **TCP and/or a Unix domain socket** so real Redis clients (`redis-cli`, redis-py, ioredis, go-redis, jedis) can connect. The protocol itself is easy; the difficulty is concentrated in two places.
+`klyv --db <PATH> serve [--bind ADDR:PORT]... [--unixsocket PATH [--unixsocketperm MODE]]`. Thread per connection with blocking `std::net`, one rusqlite handle per connection, one transaction per command (same as the CLI, so the CLI and the server can share a file live). RESP2 and RESP3 (`HELLO`), pipelining, inline commands, Redis's protocol limits and error texts. See `src/server.rs` and `src/resp.rs`; behaviour is specified in SPEC.md "Server Mode".
 
-Transports (mirrors real Redis): `--bind 127.0.0.1:6379` for TCP and `--unixsocket /path/klyv.sock` for a Unix socket; either or both can be enabled at once (`redis-cli -s /path/klyv.sock` connects to the latter). Listening only on a Unix socket is a common, lower-overhead setup for same-host clients and sidesteps TCP port/firewall concerns.
+Things worth knowing before changing it:
 
-**The crux — split compute from render (the shared foundation): ✅ DONE.** All command functions now return `Result<Reply, CmdError>` instead of printing, with three renderers (human/raw/json) consuming the `Reply`:
+- **Adding a command** means: implement `cmd_*` in `commands/`, add the CLI variant in `cli.rs`, add a row to `lookup` *and* to `DATA_COMMANDS` in `server.rs` (a unit test checks they agree), then add steps to `scenarios()` and `random_step` in `tests/differential.rs`. The server differential tests pick the new steps up automatically.
+- **RESP3 was pulled forward from Phase 2** because redis-py 8 sends `HELLO 3` by default and does not fall back when refused. The `Empty` tag on `Reply::Array` doubles as the collection kind: `Set` encodes as `~`, `Hash` as `%`. A new command returning a set or a hash must use the right tag.
+- **Integers are strict** (`db::parse_int`, Redis `string2ll`): no `+`, no leading zeros. Rust's `str::parse` is too lenient; never use it for stored values or wire arguments.
+- **Reply fidelity is tested at the wire level.** `tests/differential.rs` server mode sends each command to klyv and to a real Redis over raw sockets, in both protocols, and compares parsed replies including type tags and full error text. Run it long before trusting a change: `KLYV_DIFF_STEPS=40000 cargo test --test differential differential_server_random` is about a million steps in under a minute.
+- Unix socket paths have a short OS limit (about 104 bytes on macOS); tests pass a relative path and run the server in the temp dir.
 
-```rust
-enum Reply { Simple(&'static str), Int(i64), Bulk(Vec<u8>), Nil, Array(Vec<Vec<u8>>, Empty), Lines(Vec<Reply>) }
-fn cmd_get(conn, key) -> CmdResult   // not println!
-```
+**Known limitations / what remains:**
 
-What remains for the server is a **RESP encoder** as a fourth renderer. Replies carry bytes, and every command function takes its keys, fields and values as `Arg` (a `&[u8]` newtype in `db.rs`), so the core is binary-safe end to end; `commands/mod.rs` has unit tests driving it with non-UTF-8 input. One gap remains when wiring RESP: `Array` holds flat byte strings rather than nested replies (sufficient today; RESP2 nil-inside-array cases may need a richer variant).
-
-**Other key points:**
-- RESP2 is ~150 lines to hand-roll, or use the `redis-protocol` crate (RESP2/3). A command arrives as an array of bulk strings → `Vec<Vec<u8>>` = `[name, args…]`.
-- Dispatch on the uppercased command name (`SET`, `LPUSH`) — clap can't be reused (it parses kebab-case CLI args); add a name-keyed table feeding the same core functions both CLI and server route into.
-- Networking: thread-per-connection with blocking `std::net` (no async runtime needed); each connection gets its own rusqlite handle (`Connection` isn't `Sync`). The hardening already shipped (WAL + `busy_timeout` + per-command `BEGIN IMMEDIATE`) gives correct multi-connection serialization for free.
-- Unix socket support is almost free because the RESP read/write loop is transport-agnostic — it operates on any `Read + Write`. `std::os::unix::net::UnixListener`/`UnixStream` mirror `TcpListener`/`TcpStream`, so the accept loop can `Box<dyn Read+Write>` (or be generic) and hand either stream to the same handler. Extra work is small and Unix-only (gate behind `#[cfg(unix)]`): unlink any stale socket file on bind, remove it on graceful shutdown, and optionally set permissions (`--unixsocketperm`, like Redis). Windows builds simply omit the flag.
-- **The real long tail:** clients probe on connect, so you need stubs for `PING`/`QUIT`/`HELLO`/`SELECT 0`/`COMMAND`/`CLIENT`/`CONFIG GET`/`INFO`, plus exact reply-*type* fidelity (`TYPE`→`+string`, `HGETALL`→flat array in RESP2 vs map in RESP3, missing-key pops→nil bulk). Error strings (`WRONGTYPE`, `ERR …`) are already wire-correct.
-
-**Phased effort:**
-- Phase 0 — compute/render split (`Reply` enum + renderers, tests stay green): ✅ **shipped** (with human/raw/json renderers; RESP encoder still to write).
-- Phase 1 — minimal server (`serve`, thread-per-conn, RESP2, `PING`/`QUIT`/`SELECT 0` + handshake stubs): **1–2 days**.
-- Phase 2 — real-client compat (RESP3/`HELLO`, `SCAN`, `MULTI`/`EXEC`, richer `INFO`/`CONFIG`, reply-type audit): **several days → open-ended**.
-- Phase 3 — ops/perf (pipelining, optional faster sync mode, graceful shutdown, max-conns, optional `AUTH`/TLS): **a few days**.
-
-Realistic total for "real clients can use the commands klyv implements": **~1–2 weeks**, dominated by Phase 0 and Phase 2. Passing Redis's full ~200-command test suite is open-ended and not a goal.
-
-**Caveats:**
-- Performance is SQLite-bound, not Redis-bound (every write hits WAL — durable but slower than in-memory). Position it as a *durable, Redis-wire-compatible store*, not a drop-in perf replacement; a `synchronous=OFF`/memory-mode flag could narrow the gap.
-- This server is the prerequisite for real pub/sub (see above).
-
-**Suggested build order:** ~~Phase 0~~ (done), ~~the REPL~~ (done), then server Phases 1→2, then pub/sub on top.
+- Phase 2 — more of the Redis surface real applications use: `SCAN`/`HSCAN`/`SSCAN`, `MULTI`/`EXEC`, count arguments (`LPOP key n`, `SPOP key n`, `SRANDMEMBER`), `EXPIRE` `NX|XX|GT|LT`, `GETSET`/`GETEX`/`INCRBYFLOAT`/`HMGET`/`SMOVE`/`COPY`, sorted sets. Each needs a `cmd_*`, not just a table row.
+- Phase 3 — operations: `AUTH`/TLS, max connections and idle timeouts, cached prepared statements (`prepare_cached`; every command currently re-prepares its SQL), an optional faster sync mode.
+- `LPUSH`/`RPUSH`/`LLEN` are O(n) in list length because the length is a `COUNT(*)`; pushing onto a 20,000-element list runs at about 1,500/s against 20,000/s for `SET`. Fixing it means a length column in `keyspace` (schema v3).
+- Expiry is still lazy only; a long-running server could purge in the background.
+- Real pub/sub is now feasible (a shared subscriber registry behind a `Mutex`), per the note above.
