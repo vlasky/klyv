@@ -29,7 +29,18 @@ pub(crate) struct Cli {
     pub(crate) format: OutputFormat,
 
     #[command(subcommand)]
-    pub(crate) command: Option<Command>,
+    pub(crate) command: Option<TopCommand>,
+}
+
+/// What the binary can be asked to do: run one data command, or serve.
+/// `serve` is kept out of `Command` so it is not available as a line in the
+/// shell or in pipe mode.
+#[derive(Subcommand)]
+pub(crate) enum TopCommand {
+    #[command(about = "Run a Redis-compatible server (RESP2) on this database")]
+    Serve(crate::server::ServeArgs),
+    #[command(flatten)]
+    Data(Command),
 }
 
 /// Parser for one line of shell/pipe input: just the subcommand, no --db or
@@ -393,7 +404,12 @@ pub(crate) fn run(conn: &Connection, cmd: Command) -> CmdResult {
                 (None, Some(ms)) => Some(ms),
                 (None, None) => None,
             };
-            cmd_set(conn, a(&key), a(&value), nx, ttl_ms, keep_ttl)
+            let cond = if nx {
+                SetCond::IfAbsent
+            } else {
+                SetCond::Always
+            };
+            cmd_set(conn, a(&key), a(&value), cond, ttl_ms, keep_ttl)
         }
         Command::Get { key } => cmd_get(conn, a(&key)),
         Command::GetDel { key } => cmd_getdel(conn, a(&key)),
