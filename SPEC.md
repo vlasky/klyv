@@ -24,6 +24,8 @@ PRAGMA busy_timeout=5000;
 
 WAL mode enables concurrent readers and improves write performance. `NORMAL` synchronous is safe against corruption from application crashes (though not OS crashes). `busy_timeout` makes a writer wait for a competing lock instead of failing immediately.
 
+**Opening must not take the write lock when there is nothing to do.** An implementation first checks, with plain reads, that `PRAGMA user_version` equals the current schema version, that `PRAGMA journal_mode` is already `wal`, and that `sqlite_master` lists `expiry` as a *view* (the downgrade guard below). If all three hold, no schema statement is run. Only otherwise does it switch the journal mode and enter the `BEGIN IMMEDIATE` setup transaction (re-reading the version under the lock). Without this fast path every read would queue behind any writer and a database file without write permission could not be read.
+
 ### Schema
 
 Schema version **2**, recorded in `PRAGMA user_version = 2`. A `keyspace` catalogue holds one row per key — its type and expiry — and is the single source of truth for whether a key exists, what type it is and when it expires; the four per-type data tables hold only payload.
@@ -172,7 +174,7 @@ INSERT OR REPLACE INTO strings (key, value) VALUES (?, ?);
 Options (mirroring Redis SET options):
 
 - `--nx` — only set if the key does not already exist (an expired key counts as absent). If the key exists, nothing is written.
-- `--ex seconds` / `--px milliseconds` — set a TTL atomically with the value, in the same transaction (the two-command `set` + `expire` sequence is not atomic across processes). The two options are mutually exclusive. A non-positive TTL is rejected with `ERR invalid expire time in 'set' command` before anything is written.
+- `--ex seconds` / `--px milliseconds` — set a TTL atomically with the value, in the same transaction (the two-command `set` + `expire` sequence is not atomic across processes). The two options are mutually exclusive. A non-positive TTL, or an `--ex` value too large to convert to milliseconds, is rejected with `ERR invalid expire time in 'set' command` before anything is written. (A TTL so large that `now + ttl` overflows saturates to the maximum timestamp; Redis accepts such a value too, but its sum wraps negative and the key expires at once, which is not copied.)
 - `--keep-ttl` — retain the key's existing TTL instead of discarding it (Redis `KEEPTTL`). Mutually exclusive with `--ex`/`--px`. `MSET` has no such option and always discards TTLs, as in Redis.
 
 **Output:** `OK`, or `(nil)` if `--nx` was given and the key already exists.
@@ -488,7 +490,9 @@ These operate across all data types.
 
 Return all keys matching a Redis-style glob: `*` matches any sequence, `?` one character, `[abc]` a class, `[^abc]` a negated class, `[a-z]` a range, and `\x` a literal `x` (so a literal backslash is `\\`). Matching is case-sensitive. If no pattern is given, return all keys. Expired keys are excluded.
 
-Implementation note: SQLite's `GLOB` operator has these exact semantics except for escaping (it has no escape character; a literal special is written as a one-character class such as `[*]`), so a pattern translates by rewriting `\*`, `\?`, `\[` to `[*]`, `[?]`, `[[]` and dropping other backslashes. Do **not** use SQL `LIKE`: it ignores ASCII case.
+Matching follows Redis's `stringmatchlen` byte for byte, including on malformed patterns: an unclosed class ends at the end of the pattern (`[a` matches `a`, `[^` matches any one character); `]` directly after `[` closes the class, so `[]a]` matches nothing; a reversed range is swapped (`[c-a]` is `[a-c]`); `\` escapes the next character inside a class as well as outside (`[a\-c]` is the three characters `a`, `-`, `c`); a trailing lone backslash is a literal backslash. A lone `*` matches every key including the empty key, but no other pattern containing a character matches the empty key (`**` does not).
+
+Implementation note: port the Redis matcher and filter keys in application code. Do **not** use SQL `LIKE` (it ignores ASCII case), and do not rely on SQLite `GLOB`: it agrees with Redis on well-formed patterns only.
 
 **Output:** Numbered lines or `(empty list)`.
 
@@ -523,6 +527,8 @@ A key is expired once the current time **reaches** its `expires_at` — the chec
 #### EXPIRE key seconds
 
 Set a key to expire `seconds` from now. The key must exist and not already be expired. A zero or negative `seconds` stores an already-past timestamp, so the key becomes immediately invisible.
+
+**Error (all four expiry setters):** if converting to milliseconds or adding the current time would overflow a signed 64-bit integer, print `ERR invalid expire time in '<name>' command` (`expire`, `pexpire`, `expireat`, `pexpireat`) and change nothing. As in Redis, this is checked before the key is looked up, so it is reported even for a missing key.
 
 **Output:** `(integer) 1` if the timeout was set, `(integer) 0` if the key does not exist.
 

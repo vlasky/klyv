@@ -1,6 +1,6 @@
 # klyv
 
-[![Version](https://img.shields.io/badge/version-0.3.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.3.1-blue)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Redis-compatible embedded key-value store backed by SQLite. No server, no daemon — just a CLI and a file.
@@ -64,7 +64,7 @@ Run `klyv` with no command to enter a `redis-cli`-style shell with line editing 
 
 ```
 $ klyv --db my.db
-klyv 0.2.0 — 'help' lists commands, 'exit' or Ctrl-D quits
+klyv 0.3.1 — 'help' lists commands, 'exit' or Ctrl-D quits
 klyv> set greeting "hello world"
 OK
 klyv> get greeting
@@ -177,7 +177,7 @@ klyv --format json get missing
 
 | Command | Description |
 |---------|-------------|
-| `keys [pattern]` | List keys (Redis glob: `*`, `?`, `[abc]`, `[^a]`, `[a-z]`, `\` escapes) |
+| `keys [pattern]` | List keys (Redis glob: `*`, `?`, `[abc]`, `[^a]`, `[a-z]`, `\` escapes; matched exactly as Redis does) |
 | `exists <key>` | Test existence (1/0) |
 | `type <key>` | string / list / set / hash / none |
 | `rename <key> <newkey>` | Rename key |
@@ -190,7 +190,8 @@ klyv --format json get missing
 - **Fractional indexing** for O(1) list push (no reindexing)
 - **Lazy expiry** — expired keys are hidden from reads, treated as absent on write, and stay on disk until `purge`
 - **Schema versioning** — the file records its schema version; a database written by klyv 0.2.0 is migrated in place on first open
-- **Separate tables** per data type for type-specific indexing and constraints; a key holds one type at a time (mismatched commands fail with `WRONGTYPE`, Redis-style)
+- **A key catalogue plus one payload table per data type**; a key holds one type at a time (mismatched commands fail with `WRONGTYPE`, Redis-style)
+- **Reads take no write lock**, including on open, so a read never waits for a writer and a database file you cannot write to can still be read
 
 ## Differences from Redis
 

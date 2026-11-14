@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.1 (2026-11-14)
+
+### Fixed
+
+- **Opening a database no longer takes the write lock.** Since 0.3.0 every invocation, even a `get`, began with a write transaction to check the schema, so reads queued behind any writer (up to the 5 s busy timeout) and a database file without write permission could not be read at all. A file that is already at the current schema is now opened with read-only checks; the write lock is taken only to create, migrate or repair. (A WAL database in a directory where SQLite cannot create its side files remains unreadable; that is an SQLite limitation.)
+- **`keys` patterns now match exactly as in Redis**, including malformed ones. klyv ports Redis's own matcher instead of translating to SQLite `GLOB`, which disagreed on unclosed classes (`[a` matches `a`), empty classes (`[]a]` matches nothing), reversed ranges (`[c-a]` is `[a-c]`) and backslash escapes inside a class (`[a\-c]`).
+- **Expiry overflow is rejected like Redis**: `expire`, `p-expire`, `expire-at` and `set --ex` report `ERR invalid expire time in '<command>' command` when the time cannot be represented, instead of silently saturating. The check happens before the key is looked up, as in Redis.
+- A database whose catalogue holds an unrecognised type (corrupted or hand-edited) reports `ERR database error` instead of panicking.
+
+### Changed
+
+- Dependencies: rusqlite 0.31 → 0.42 (bundled SQLite updated with it), rustyline 18 → 19.
+- Differential tests: malformed-glob and expiry-overflow scenarios; the randomised layer now draws hostile patterns and boundary expiry values; the comparator no longer drops empty fields and members. One Redis artefact is deliberately not copied: `SET k v PX 9223372036854775807` replies OK in Redis but the key vanishes at once because `now + ttl` wraps; klyv saturates and keeps the key.
+
 ## 0.3.0 (2026-10-08)
 
 ### Changed
@@ -7,26 +21,22 @@
 - **Schema v2 (automatic in-place migration).** A `keyspace` catalogue table (key, type, expiry) now records every key; the per-type tables hold payload only. Type lookup, `exists`, `type`, `keys`, `db-size` and every TTL command are single indexed reads instead of probes across four tables, and the one-type-per-key invariant is structural rather than per-command. Databases from klyv 0.2.0 are migrated the first time they are opened; files with a newer schema version are refused, and a v2 file carries a guard (a view named `expiry`) that makes klyv ≤ 0.2.0 fail to open it rather than run split-brain against it. Documented in SPEC.md.
 - **Millisecond expiry.** Expiry is stored in Unix milliseconds. `p-expire` and `set --px` no longer round up to whole seconds; `ttl` rounds the remainder to the nearest second like Redis (so `expire k 100` then `ttl k` reports 100, not 99).
 - **`db-size` counts live keys only**; expired-but-unpurged keys are no longer included.
+- **`set` now discards any existing TTL, like Redis.** Previously a live TTL survived `set`/`m-set`, a deviation that stemmed from a mistaken belief (recorded in the original test) that Redis behaves that way. New `--keep-ttl` flag (Redis `KEEPTTL`) retains it; `m-set` always clears, as in Redis.
 - Internal: replies carry bytes rather than strings, and raw output is written byte-for-byte, so binary values from a future RESP client will survive the storage and output layers.
 
-- **`set` now discards any existing TTL, like Redis.** Previously a live TTL survived `set`/`m-set`, a deviation that stemmed from a mistaken belief (recorded in the original test) that Redis behaves that way. New `--keep-ttl` flag (Redis `KEEPTTL`) retains it; `m-set` always clears, as in Redis.
+### Added
+
+- Interactive shell (REPL): `klyv --db <PATH>` with no command opens a `redis-cli`-style shell with line editing and in-session history (rustyline). `help` lists commands; `exit`/`quit`/Ctrl-D leaves; errors are shown and the session continues.
+- Pipe mode: the same no-command invocation with stdin not a terminal executes commands one per line over a single connection — one process and one database open for the whole batch. Shell-style quoting (single/double quotes, backslash escapes; `#` is ordinary data, never a comment); a failing line reports to stderr and processing continues; exit code 1 if any line failed. `--format` applies to the whole session.
+- `p-ttl` (remaining TTL in milliseconds) and `p-expire-at` (absolute expiry in milliseconds).
+- Differential test harness (`tests/differential.rs`): runs ~190 identical command steps through klyv and a real Redis server and diffs the replies. Self-skips when redis is not installed; CI runs it in a dedicated ubuntu job.
+- Randomised differential layer: seeded command sequences over an awkward alphabet (mixed-case and empty keys, unicode, hyphen-leading values, boundary indexes, overflowing integers), every reply checked against Redis; failures print a replayable seed (`KLYV_DIFF_SEED`).
+- Documented the `--` escape for storing values that begin with a hyphen (`klyv append -- k -value`).
 
 ### Fixed
 
 - **`keys` was case-insensitive** (SQLite `LIKE` ignores ASCII case): `keys 'user:*'` matched `User:2`. Now uses SQLite `GLOB`, which is case-sensitive and implements Redis glob semantics natively, so `[abc]`, `[^a]` and `[a-z]` classes work and `\` is the escape character exactly as in Redis. Removes two documented deviations.
-
-### Added
-
-- `p-ttl` (remaining TTL in milliseconds) and `p-expire-at` (absolute expiry in milliseconds).
-
-### Fixed
-
 - `l-push`/`r-push`/`s-add`/`h-set`/`h-del`/`s-rem`/`del`/`m-set`/`m-get` and the set-algebra commands now require their variadic arguments (Redis "wrong number of arguments"); previously `l-push key` with no values was accepted and, under schema v2, would have registered a key with no contents.
-- Interactive shell (REPL): `klyv --db <PATH>` with no command opens a `redis-cli`-style shell with line editing and in-session history (rustyline). `help` lists commands; `exit`/`quit`/Ctrl-D leaves; errors are shown and the session continues.
-- Pipe mode: the same no-command invocation with stdin not a terminal executes commands one per line over a single connection — one process and one database open for the whole batch. Shell-style quoting (single/double quotes, backslash escapes; `#` is ordinary data, never a comment); a failing line reports to stderr and processing continues; exit code 1 if any line failed. `--format` applies to the whole session.
-- Randomised differential layer: seeded command sequences over an awkward alphabet (mixed-case and empty keys, unicode, hyphen-leading values, boundary indexes, overflowing integers), every reply checked against Redis; failures print a replayable seed (`KLYV_DIFF_SEED`).
-- Differential test harness (`tests/differential.rs`): runs ~190 identical command steps through klyv and a real Redis server and diffs the replies. Self-skips when redis is not installed; CI runs it in a dedicated ubuntu job.
-- Documented the `--` escape for storing values that begin with a hyphen (`klyv append -- k -value`).
 
 ## 0.2.0 (2026-07-12)
 
