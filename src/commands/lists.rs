@@ -339,3 +339,38 @@ pub(crate) fn cmd_linsert(
     // midpoint is always representable.
     Err(CmdError::new("ERR could not compute insert position"))
 }
+
+fn out_of_range() -> CmdError {
+    CmdError::new("ERR value is out of range, must be positive")
+}
+
+/// LPOP/RPOP with a count: up to `count` elements, in pop order. A missing
+/// key is a null array (not an empty one), as in Redis.
+pub(crate) fn cmd_pop_count(conn: &Connection, key: Arg<'_>, order: &str, count: i64) -> CmdResult {
+    if count < 0 {
+        return Err(out_of_range());
+    }
+    let now = now_ms();
+    ensure_type(conn, key, KIND, now)?;
+    drop_if_expired(conn, key, now)?;
+    if live_len(conn, key, KIND, now)?.is_none() {
+        return Ok(Reply::NullArray);
+    }
+    let popped: Vec<(i64, Vec<u8>)> = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT rowid, value FROM list_items WHERE key = ?1 ORDER BY idx {order} LIMIT ?2"
+        ))?;
+        stmt.query_map(params![key, count], |row| {
+            Ok((row.get(0)?, bytes_col(row, 1)?))
+        })?
+        .collect::<Result<_, _>>()?
+    };
+    for (rowid, _) in &popped {
+        conn.execute("DELETE FROM list_items WHERE rowid = ?1", params![rowid])?;
+    }
+    shrink(conn, key, popped.len() as i64)?;
+    Ok(Reply::Array(
+        popped.into_iter().map(|(_, v)| v).collect(),
+        Empty::List,
+    ))
+}

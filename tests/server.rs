@@ -66,6 +66,8 @@ enum Value {
     Bulk(Vec<u8>),
     Nil,
     Array(Vec<Value>),
+    /// RESP2 null array (`*-1`).
+    NullArray,
     /// RESP3 null (`_`).
     Null,
     /// RESP3 set (`~`).
@@ -153,6 +155,9 @@ impl<S: Read + Write> Client<S> {
             }
             "*" => {
                 let n: i64 = rest.parse().unwrap();
+                if n < 0 {
+                    return Value::NullArray;
+                }
                 Value::Array((0..n).map(|_| self.read()).collect())
             }
             "_" => Value::Null,
@@ -888,4 +893,368 @@ fn connections_beyond_maxclients_are_refused() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(b.cmd(&["PING"]), Value::Simple("PONG".into()));
+}
+
+// === Transactions ===
+
+fn null_array() -> Value {
+    Value::NullArray
+}
+
+#[test]
+fn exec_replies_with_each_result_and_keeps_going_after_a_failure() {
+    let server = start();
+    let mut c = Client::connect(&server);
+    assert_eq!(c.cmd(&["MULTI"]), ok());
+    assert_eq!(c.cmd(&["SET", "n", "5"]), Value::Simple("QUEUED".into()));
+    assert_eq!(c.cmd(&["INCR", "n"]), Value::Simple("QUEUED".into()));
+    assert_eq!(c.cmd(&["LPUSH", "n", "x"]), Value::Simple("QUEUED".into()));
+    assert_eq!(c.cmd(&["INCR", "n"]), Value::Simple("QUEUED".into()));
+    assert_eq!(
+        c.cmd(&["EXEC"]),
+        Value::Array(vec![
+            ok(),
+            Value::Int(6),
+            Value::Error(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".into()
+            ),
+            Value::Int(7),
+        ])
+    );
+    assert_eq!(c.cmd(&["GET", "n"]), bulk("7"));
+}
+
+// A failing command inside EXEC is undone on its own, even when it had
+// already written something before failing.
+#[test]
+fn a_failed_command_in_exec_leaves_no_partial_write() {
+    let server = start();
+    let mut c = Client::connect(&server);
+    c.cmd(&["SET", "a", "1"]);
+    c.cmd(&["RPUSH", "b", "x"]);
+    c.cmd(&["MULTI"]);
+    // MSET writes `a` and then... succeeds; the failure is the INCR on a list.
+    c.cmd(&["MSET", "a", "2", "c", "3"]);
+    c.cmd(&["INCR", "b"]);
+    c.cmd(&["APPEND", "a", "!"]);
+    assert_eq!(
+        c.cmd(&["EXEC"]),
+        Value::Array(vec![
+            ok(),
+            Value::Error(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".into()
+            ),
+            Value::Int(2),
+        ])
+    );
+    assert_eq!(c.cmd(&["MGET", "a", "c"]), strs(&["2!", "3"]));
+    assert_eq!(c.cmd(&["LRANGE", "b", "0", "-1"]), strs(&["x"]));
+}
+
+#[test]
+fn queued_commands_are_invisible_until_exec_and_atomic_when_run() {
+    let server = start();
+    let mut writer = Client::connect(&server);
+    let mut reader = Client::connect(&server);
+    writer.cmd(&["SET", "a", "0"]);
+    writer.cmd(&["SET", "b", "0"]);
+    writer.cmd(&["MULTI"]);
+    writer.cmd(&["INCR", "a"]);
+    writer.cmd(&["INCR", "b"]);
+    // Nothing has happened yet, and MULTI state belongs to one connection.
+    assert_eq!(reader.cmd(&["MGET", "a", "b"]), strs(&["0", "0"]));
+    assert_eq!(reader.cmd(&["INCR", "other"]), Value::Int(1));
+    assert_eq!(
+        writer.cmd(&["EXEC"]),
+        Value::Array(vec![Value::Int(1), Value::Int(1)])
+    );
+    assert_eq!(reader.cmd(&["MGET", "a", "b"]), strs(&["1", "1"]));
+
+    // Many transfers between two counters from several connections: every
+    // observer must see them sum to the same total at all times.
+    writer.cmd(&["MSET", "x", "1000", "y", "0"]);
+    let addr = server.addr.clone();
+    let movers: Vec<_> = (0..4)
+        .map(|_| {
+            let addr = addr.clone();
+            std::thread::spawn(move || {
+                let stream = TcpStream::connect(&addr).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(60)))
+                    .unwrap();
+                let mut c = Client {
+                    reader: BufReader::new(stream.try_clone().unwrap()),
+                    writer: stream,
+                };
+                for _ in 0..50 {
+                    c.cmd(&["MULTI"]);
+                    c.cmd(&["DECR", "x"]);
+                    c.cmd(&["INCR", "y"]);
+                    assert!(matches!(c.cmd(&["EXEC"]), Value::Array(v) if v.len() == 2));
+                }
+            })
+        })
+        .collect();
+    for _ in 0..200 {
+        let Value::Array(pair) = reader.cmd(&["MGET", "x", "y"]) else {
+            panic!("MGET should return an array");
+        };
+        let total: i64 = pair
+            .iter()
+            .map(|v| match v {
+                Value::Bulk(b) => String::from_utf8_lossy(b).parse::<i64>().unwrap(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .sum();
+        assert_eq!(total, 1000, "a transfer was observed half done");
+    }
+    for m in movers {
+        m.join().unwrap();
+    }
+    assert_eq!(reader.cmd(&["MGET", "x", "y"]), strs(&["800", "200"]));
+}
+
+#[test]
+fn watch_aborts_exec_when_another_client_or_the_cli_changes_the_key() {
+    let server = start();
+    let mut a = Client::connect(&server);
+    let mut b = Client::connect(&server);
+    a.cmd(&["SET", "k", "1"]);
+
+    // Changed by another connection.
+    assert_eq!(a.cmd(&["WATCH", "k"]), ok());
+    assert_eq!(b.cmd(&["SET", "k", "2"]), ok());
+    a.cmd(&["MULTI"]);
+    a.cmd(&["SET", "k", "from-a"]);
+    assert_eq!(a.cmd(&["EXEC"]), null_array());
+    assert_eq!(a.cmd(&["GET", "k"]), bulk("2"));
+
+    // Changed by the CLI, a different process altogether.
+    assert_eq!(a.cmd(&["WATCH", "k"]), ok());
+    klyv_cli(&server.db, &["append", "k", "!"]);
+    a.cmd(&["MULTI"]);
+    a.cmd(&["SET", "k", "from-a"]);
+    assert_eq!(a.cmd(&["EXEC"]), null_array());
+    assert_eq!(a.cmd(&["GET", "k"]), bulk("2!"));
+
+    // Created, deleted, or given a TTL: all count as changes.
+    for change in [
+        &["SET", "absent", "now-here"][..],
+        &["DEL", "k"],
+        &["EXPIRE", "list", "1000"],
+        &["RPUSH", "list", "more"],
+    ] {
+        b.cmd(&["SET", "k", "v"]);
+        b.cmd(&["DEL", "absent", "list"]);
+        b.cmd(&["RPUSH", "list", "x"]);
+        assert_eq!(a.cmd(&["WATCH", "k", "absent", "list"]), ok());
+        b.cmd(change);
+        a.cmd(&["MULTI"]);
+        a.cmd(&["INCR", "ran"]);
+        assert_eq!(a.cmd(&["EXEC"]), null_array(), "{change:?} went unnoticed");
+    }
+    assert_eq!(a.cmd(&["EXISTS", "ran"]), Value::Int(0));
+
+    // Untouched watched keys do not get in the way, and a change to an
+    // unwatched key is irrelevant.
+    assert_eq!(a.cmd(&["WATCH", "k"]), ok());
+    b.cmd(&["SET", "unrelated", "x"]);
+    a.cmd(&["MULTI"]);
+    a.cmd(&["INCR", "ran"]);
+    assert_eq!(a.cmd(&["EXEC"]), Value::Array(vec![Value::Int(1)]));
+
+    // The classic check-and-set loop converges under contention.
+    a.cmd(&["SET", "counter", "0"]);
+    let addr = server.addr.clone();
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let addr = addr.clone();
+            std::thread::spawn(move || {
+                let stream = TcpStream::connect(&addr).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(60)))
+                    .unwrap();
+                let mut c = Client {
+                    reader: BufReader::new(stream.try_clone().unwrap()),
+                    writer: stream,
+                };
+                for _ in 0..25 {
+                    loop {
+                        c.cmd(&["WATCH", "counter"]);
+                        let Value::Bulk(v) = c.cmd(&["GET", "counter"]) else {
+                            panic!("counter should exist");
+                        };
+                        let next = String::from_utf8(v).unwrap().parse::<i64>().unwrap() + 1;
+                        c.cmd(&["MULTI"]);
+                        c.cmd(&["SET", "counter", &next.to_string()]);
+                        if c.cmd(&["EXEC"]) == Value::Array(vec![ok()]) {
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        w.join().unwrap();
+    }
+    assert_eq!(a.cmd(&["GET", "counter"]), bulk("100"));
+}
+
+// === SCAN ===
+
+fn scan_all(c: &mut Client<TcpStream>, args: &[&str]) -> Vec<String> {
+    let mut cursor = String::from("0");
+    let mut seen = Vec::new();
+    loop {
+        let full: Vec<&str> = args
+            .iter()
+            .map(|a| if *a == "CURSOR" { cursor.as_str() } else { a })
+            .collect();
+        let Value::Array(page) = c.cmd(&full) else {
+            panic!("scan page should be an array");
+        };
+        let (Value::Bulk(next), Value::Array(items)) = (&page[0], &page[1]) else {
+            panic!("scan page should be [cursor, items]");
+        };
+        for item in items {
+            let Value::Bulk(b) = item else {
+                panic!("scan item should be a bulk string");
+            };
+            seen.push(String::from_utf8(b.clone()).unwrap());
+        }
+        cursor = String::from_utf8(next.clone()).unwrap();
+        if cursor == "0" {
+            return seen;
+        }
+    }
+}
+
+// The guarantee that matters: a key that exists for the whole iteration is
+// returned exactly once, whatever else is created, deleted, renamed or
+// rewritten while the iteration is in progress.
+#[test]
+fn scan_returns_every_stable_key_once_despite_concurrent_changes() {
+    let server = start();
+    let mut c = Client::connect(&server);
+    let mut other = Client::connect(&server);
+    for i in 0..200 {
+        c.cmd(&["SET", &format!("stable:{i}"), "v"]);
+        c.cmd(&["SET", &format!("doomed:{i}"), "v"]);
+    }
+    let mut cursor = String::from("0");
+    let mut seen = Vec::new();
+    let mut round = 0;
+    loop {
+        let Value::Array(page) = c.cmd(&["SCAN", &cursor, "COUNT", "7"]) else {
+            panic!("scan page should be an array");
+        };
+        let (Value::Bulk(next), Value::Array(items)) = (&page[0], &page[1]) else {
+            panic!("scan page should be [cursor, items]");
+        };
+        assert!(items.len() <= 7, "COUNT bounds the page");
+        for item in items {
+            if let Value::Bulk(b) = item {
+                seen.push(String::from_utf8(b.clone()).unwrap());
+            }
+        }
+        // Churn between pages: delete, create, overwrite in place (including
+        // a change of type), and give keys a TTL.
+        other.cmd(&["DEL", &format!("doomed:{round}")]);
+        other.cmd(&["SET", &format!("new:{round}"), "v"]);
+        other.cmd(&["SET", &format!("stable:{}", round % 200), "rewritten"]);
+        other.cmd(&["DEL", &format!("stable-as-list:{round}")]);
+        other.cmd(&["EXPIRE", &format!("stable:{}", (round * 3) % 200), "1000"]);
+        if round % 5 == 0 {
+            let key = format!("stable:{}", (round * 7) % 200);
+            other.cmd(&["DEL", "tmp"]);
+            other.cmd(&["RPUSH", "tmp", "a"]);
+            other.cmd(&["COPY", "tmp", &key, "REPLACE"]);
+        }
+        round += 1;
+        cursor = String::from_utf8(next.clone()).unwrap();
+        if cursor == "0" {
+            break;
+        }
+    }
+    for i in 0..200 {
+        let key = format!("stable:{i}");
+        let times = seen.iter().filter(|k| **k == key).count();
+        assert!(times >= 1, "{key} was never returned");
+    }
+    // Keys never touched by a replace are returned exactly once.
+    let once = seen.iter().filter(|k| *k == "stable:1").count();
+    assert_eq!(once, 1);
+}
+
+#[test]
+fn scan_family_pages_filters_and_edge_cases() {
+    let server = start();
+    let mut c = Client::connect(&server);
+    for i in 0..25 {
+        c.cmd(&["SET", &format!("s{i}"), "v"]);
+        c.cmd(&["HSET", "h", &format!("f{i}"), &format!("v{i}")]);
+        c.cmd(&["SADD", "set", &format!("m{i}")]);
+    }
+    c.cmd(&["RPUSH", "l", "a"]);
+    c.cmd(&["SET", "expired", "v"]);
+    c.cmd(&["PEXPIREAT", "expired", "1"]);
+
+    let mut all = scan_all(&mut c, &["SCAN", "CURSOR", "COUNT", "4"]);
+    all.sort();
+    assert_eq!(
+        all.len(),
+        28,
+        "25 strings, h, set and l; not the expired key"
+    );
+    assert!(!all.contains(&"expired".to_string()));
+    assert_eq!(
+        scan_all(&mut c, &["SCAN", "CURSOR", "MATCH", "s1?"]).len(),
+        10
+    );
+    assert_eq!(scan_all(&mut c, &["SCAN", "CURSOR", "TYPE", "hash"]), ["h"]);
+    assert_eq!(
+        scan_all(&mut c, &["SCAN", "CURSOR", "TYPE", "zset"]).len(),
+        0
+    );
+    assert_eq!(
+        scan_all(&mut c, &["HSCAN", "h", "CURSOR", "COUNT", "3"]).len(),
+        50
+    );
+    assert_eq!(
+        scan_all(&mut c, &["HSCAN", "h", "CURSOR", "NOVALUES"]).len(),
+        25
+    );
+    assert_eq!(
+        scan_all(&mut c, &["HSCAN", "h", "CURSOR", "MATCH", "f2*"]).len(),
+        12
+    );
+    assert_eq!(
+        scan_all(&mut c, &["SSCAN", "set", "CURSOR", "COUNT", "6"]).len(),
+        25
+    );
+
+    // Any numeric cursor is accepted, including ones no page ever returned.
+    for cursor in ["99999999", "18446744073709551615"] {
+        assert_eq!(
+            c.cmd(&["SCAN", cursor]),
+            Value::Array(vec![bulk("0"), Value::Array(vec![])])
+        );
+    }
+    assert_eq!(c.error(&["SCAN", "abc"]), "ERR invalid cursor");
+    assert_eq!(c.error(&["SCAN", "-1"]), "ERR invalid cursor");
+    assert_eq!(c.error(&["SCAN", "0", "COUNT", "0"]), "ERR syntax error");
+    assert_eq!(
+        c.error(&["SSCAN", "set", "0", "NOVALUES"]),
+        "ERR NOVALUES option can only be used in HSCAN"
+    );
+
+    // In RESP3 the items are still a plain array, as in Redis.
+    c.cmd(&["HELLO", "3"]);
+    assert!(matches!(
+        c.cmd(&["HSCAN", "h", "0", "COUNT", "100"]),
+        Value::Array(page) if matches!(&page[1], Value::Array(items) if items.len() == 50)
+    ));
+    assert_eq!(c.cmd(&["LPOP", "nokey", "2"]), Value::Null);
+    assert_eq!(c.cmd(&["SPOP", "set", "0"]), Value::Set(vec![]));
 }

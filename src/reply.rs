@@ -28,6 +28,14 @@ pub(crate) enum Reply {
     Verbatim(Vec<u8>),
     /// Missing value, printed as "(nil)".
     Nil,
+    /// A missing *collection* (LPOP with a count on a missing key, EXEC
+    /// aborted by WATCH). Same as `Nil` except in RESP2, which has a
+    /// distinct null array.
+    NullArray,
+    /// An error as an element of an array: EXEC reports each queued
+    /// command's failure in place. (A command that fails as a whole
+    /// returns `Err(CmdError)` instead.)
+    Error(String),
     /// Items printed as a numbered, quoted list; the Empty kind picks the
     /// "(empty list)"/"(empty set)"/"(empty hash)" placeholder.
     Array(Vec<Vec<u8>>, Empty),
@@ -71,7 +79,8 @@ pub(crate) fn render_human(reply: &Reply, out: &mut Vec<u8>) {
             push_lossy(out, v);
             out.push(b'\n');
         }
-        Reply::Nil => out.extend_from_slice(b"(nil)\n"),
+        Reply::Nil | Reply::NullArray => out.extend_from_slice(b"(nil)\n"),
+        Reply::Error(msg) => out.extend_from_slice(format!("(error) {msg}\n").as_bytes()),
         Reply::Array(items, empty) => {
             if items.is_empty() {
                 out.extend_from_slice(match empty {
@@ -116,7 +125,11 @@ pub(crate) fn render_raw(reply: &Reply, out: &mut Vec<u8>) {
             out.extend_from_slice(v);
             out.push(b'\n');
         }
-        Reply::Nil => out.push(b'\n'),
+        Reply::Nil | Reply::NullArray => out.push(b'\n'),
+        Reply::Error(msg) => {
+            out.extend_from_slice(msg.as_bytes());
+            out.push(b'\n');
+        }
         Reply::Array(items, _) => {
             for item in items {
                 out.extend_from_slice(item);
@@ -163,7 +176,8 @@ pub(crate) fn render_json(reply: &Reply, out: &mut Vec<u8>) {
         Reply::Simple(s) => push_json_string(s.as_bytes(), out),
         Reply::Int(n) => out.extend_from_slice(n.to_string().as_bytes()),
         Reply::Bulk(v) | Reply::Verbatim(v) => push_json_string(v, out),
-        Reply::Nil => out.extend_from_slice(b"null"),
+        Reply::Nil | Reply::NullArray => out.extend_from_slice(b"null"),
+        Reply::Error(msg) => push_json_string(msg.as_bytes(), out),
         // Alternating field/value items (HGETALL) become a JSON object.
         Reply::Array(items, Empty::Hash) => {
             out.push(b'{');

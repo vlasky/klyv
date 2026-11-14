@@ -146,3 +146,19 @@ pub(crate) fn cmd_hlen(conn: &Connection, key: Arg<'_>) -> CmdResult {
         live_len(conn, key, KIND, now_ms())?.unwrap_or(0),
     ))
 }
+
+/// HMGET: the values of several fields, nil for each that is missing (all
+/// of them if the key is).
+pub(crate) fn cmd_hmget(conn: &Connection, key: Arg<'_>, fields: &[Arg<'_>]) -> CmdResult {
+    let live = check_type(conn, key, KIND, now_ms())?;
+    let mut replies = Vec::with_capacity(fields.len());
+    for &field in fields {
+        let value = if live {
+            field_value(conn, key, field)?
+        } else {
+            None
+        };
+        replies.push(value.map_or(Reply::Nil, Reply::Bulk));
+    }
+    Ok(Reply::Lines(replies))
+}

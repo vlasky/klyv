@@ -199,6 +199,14 @@ Retrieve the string value at key.
 
 **Output:** The value as a line of text, or `(nil)` if the key does not exist.
 
+#### GETSET key value
+
+Store `value` and return the previous value, or nil if there was none. Like `SET` it discards any TTL. Unlike `SET` it fails with `WRONGTYPE` on a key of another type, since the old value must be returned as a string.
+
+#### GETEX key [EX seconds | PX milliseconds | EXAT unix-seconds | PXAT unix-ms | PERSIST]
+
+Return the value, like `GET`, and change the key's expiry in the same step: set it, or with `PERSIST` remove it. With no option it is `GET`. At most one option; a zero, negative or unrepresentable time is `ERR invalid expire time in 'getex' command`. An absolute time in the past expires the key at once, after returning its value. A missing key gives nil and nothing is set.
+
 #### GETDEL key
 
 Retrieve the string value at key and delete the key (including its expiry row) in the same transaction.
@@ -279,11 +287,13 @@ Insert values at the tail (highest index). The first element of an empty list is
 
 **Output:** `(integer) N`
 
-#### LPOP key
+#### LPOP key [count]
 
 Remove and return the element at the head of the list.
 
 **Output:** The value, or `(nil)` if the list is empty/doesn't exist.
+
+With `count`: remove and return up to `count` elements, in the order they are popped, as a list. A missing key gives nil, not an empty list (RESP2 `*-1`, RESP3 `_`); a count of 0 on an existing list gives an empty list. A negative or non-numeric count is `ERR value is out of range, must be positive`. `RPOP` takes the same argument.
 
 #### RPOP key
 
@@ -388,9 +398,21 @@ Return the number of members (cardinality).
 
 **Output:** `(integer) N`
 
-#### SPOP key
+#### SPOP key [count]
 
-Remove and return a random member (`ORDER BY RANDOM() LIMIT 1`).
+Remove and return a random member (`ORDER BY RANDOM() LIMIT 1`). With `count`: up to `count` random members as a set (empty for a missing key); a negative or non-numeric count is `ERR value is out of range, must be positive`.
+
+#### SRANDMEMBER key [count]
+
+Return a random member without removing it, or nil if the key is missing. With `count` > 0: up to that many *distinct* members. With `count` < 0: exactly `|count|` picks, with repeats allowed. With a count the reply is a list (an array even in RESP3, since it may contain repeats), empty for a missing key.
+
+#### SMOVE source destination member
+
+Move `member` from one set to another. A missing source is `(integer) 0` without the destination being examined; otherwise both keys must be sets (`WRONGTYPE`). Returns 1 if the member was in the source (it is removed from there even if the destination already held it), 0 if not. Moving the last member deletes the source. With source equal to destination the reply is whether the member is present.
+
+#### SSCAN key cursor [MATCH pattern] [COUNT count]
+
+See [SCAN](#scan-cursor-match-pattern-count-count-type-type).
 
 **Error:** `WRONGTYPE` if the key holds a non-set value.
 
@@ -512,11 +534,23 @@ Implementation note: port the Redis matcher and filter keys in application code.
 
 **Output:** Numbered lines or `(empty list)`.
 
-#### EXISTS key
+#### EXISTS key [key ...]
 
-Test if a key exists in any table.
+Count how many of the given keys exist. A key named twice is counted twice.
 
-**Output:** `(integer) 1` if exists, `(integer) 0` if not.
+**Output:** `(integer) N`.
+
+#### COPY source destination [REPLACE]
+
+Copy the value at `source`, and its expiry, to `destination`. Returns 0 if the source is missing, or if the destination exists and `REPLACE` was not given; 1 otherwise. With `REPLACE` the destination is overwritten whatever its type. `ERR source and destination objects are the same` if they are equal. (Over the wire, `DB 0` is accepted and any other index is `ERR DB index is out of range`.) The copy's `len` is copied with its catalogue row.
+
+#### SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]
+
+Iterate the keyspace a page at a time. The reply is a two-element list: the cursor to pass to the next call, and this page's keys. An iteration starts with cursor 0 and is complete when 0 comes back. `HSCAN key cursor [MATCH] [COUNT] [NOVALUES]` iterates a hash's fields (each followed by its value unless `NOVALUES`) and `SSCAN key cursor [MATCH] [COUNT]` a set's members, with the same shape; both give `[0, []]` for a missing key and `WRONGTYPE` for a key of another type.
+
+**Guarantee** (the one Redis gives): an element that exists from the start of an iteration to its end is returned at least once, and exactly once if it is not replaced during it. Elements created or deleted meanwhile may or may not appear.
+
+**Cursor.** Cursors are opaque to clients and need not match Redis's. The reference implementation uses the SQLite `rowid` of the last row examined: a page is the next `COUNT` rows (default 10) with `rowid` greater than the cursor, in `rowid` order, from `keyspace` for `SCAN` and from the payload table for `HSCAN`/`SSCAN`. The next cursor is the last rowid examined, or 0 if the page came back short. This meets the guarantee because a catalogue row keeps its rowid for as long as the key exists: writes to an existing key must update its row in place (`INSERT ... ON CONFLICT DO UPDATE`, never `INSERT OR REPLACE`, which would assign a new rowid). `COUNT` bounds the rows *examined*; `MATCH`, `TYPE` and expiry filter within the page, so a page may be empty with a non-zero cursor. Any unsigned decimal is a valid cursor (one beyond every rowid yields `[0, []]`); anything else is `ERR invalid cursor`. `COUNT` below 1 is `ERR syntax error`; `NOVALUES` outside `HSCAN` is `ERR NOVALUES option can only be used in HSCAN`.
 
 #### TYPE key
 
@@ -540,7 +574,9 @@ A write that removes the last element of a list, set, or hash (`LPOP`/`RPOP`, `L
 
 A key is expired once the current time **reaches** its `expires_at` — the check is `expires_at <= now_ms` (used by reads, writes and `PURGE`). "Now" is taken once per command, in milliseconds, so every statement in a command agrees on it.
 
-#### EXPIRE key seconds
+#### EXPIRE key seconds [NX | XX | GT | LT]
+
+The four expiry setters accept a condition (CLI: `--nx`, `--xx`, `--gt`, `--lt`); if it does not hold, nothing changes and the reply is `(integer) 0`. `NX`: only if the key has no expiry. `XX`: only if it has one. `GT`: only if the new expiry is later than the current one; a key with no expiry counts as never expiring, so `GT` never applies to it. `LT`: only if the new expiry is earlier, which for a key with no expiry is always. `XX` may be combined with `GT` or `LT`. `NX` with any other is `ERR NX and XX, GT or LT options at the same time are not compatible`; `GT` with `LT` is `ERR GT and LT options at the same time are not compatible`; anything else is `ERR Unsupported option <name>`.
 
 Set a key to expire `seconds` from now. The key must exist and not already be expired. A zero or negative `seconds` stores an already-past timestamp, so the key becomes immediately invisible.
 
@@ -676,7 +712,11 @@ For CLI usage (one command per invocation), this is sufficient. Server mode uses
 
 `HKEYS`, `HVALS`, `KEYS`, `LRANGE` and `MGET` are arrays in both. Errors are `-` lines whose text matches Redis in full (`WRONGTYPE ...`, `ERR wrong number of arguments for 'get' command`, `ERR unknown command 'foo', with args beginning with: 'a' 'b' `, `ERR syntax error`, `ERR value is not an integer or out of range`).
 
-**Commands.** Names are case-insensitive. Each maps to the CLI command of the same meaning and runs in one transaction: `SET` (`NX`, `XX`, `EX`, `PX`, `KEEPTTL`), `SETNX`, `SETEX`, `PSETEX`, `GET`, `GETDEL`, `DEL`, `UNLINK`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `STRLEN`, `MSET`, `MGET`, `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LREM`, `LPOS`, `LINDEX`, `LSET`, `LTRIM`, `LINSERT`, `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SPOP`, `SUNION`, `SINTER`, `SDIFF`, `HSET`, `HMSET`, `HGET`, `HEXISTS`, `HINCRBY`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `KEYS`, `EXISTS` (multiple keys), `TYPE`, `RENAME`, `DBSIZE`, `FLUSHALL`, `FLUSHDB`, and klyv's own `PURGE`. Arity is checked as in Redis; optional arguments that klyv does not implement (for example a count on `LPOP`/`SPOP`, or `NX`/`GT` on `EXPIRE`) are arity or syntax errors rather than being ignored. Integer arguments use the strict syntax described under `INCR`. `FLUSHALL`/`FLUSHDB` accept a single `ASYNC` or `SYNC` (which has no effect) and reject anything else with `ERR syntax error` without flushing.
+**Commands.** Names are case-insensitive. Each maps to the CLI command of the same meaning and runs in one transaction: `SET` (`NX`, `XX`, `EX`, `PX`, `KEEPTTL`), `SETNX`, `SETEX`, `PSETEX`, `GET`, `GETDEL`, `GETSET`, `GETEX`, `DEL`, `UNLINK`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `STRLEN`, `MSET`, `MGET`, `LPUSH`, `RPUSH`, `LPOP`/`RPOP` (with optional count), `LRANGE`, `LLEN`, `LREM`, `LPOS`, `LINDEX`, `LSET`, `LTRIM`, `LINSERT`, `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SPOP` (with optional count), `SRANDMEMBER`, `SMOVE`, `SUNION`, `SINTER`, `SDIFF`, `HSET`, `HMSET`, `HGET`, `HMGET`, `HEXISTS`, `HINCRBY`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT` (`NX`, `XX`, `GT`, `LT`), `TTL`, `PTTL`, `PERSIST`, `KEYS`, `SCAN`, `HSCAN`, `SSCAN`, `EXISTS` (multiple keys), `TYPE`, `RENAME`, `COPY`, `DBSIZE`, `FLUSHALL`, `FLUSHDB`, and klyv's own `PURGE`. Arity is checked as in Redis; optional arguments that klyv does not implement are arity or syntax errors rather than being ignored. Integer arguments use the strict syntax described under `INCR`. `FLUSHALL`/`FLUSHDB` accept a single `ASYNC` or `SYNC` (which has no effect) and reject anything else with `ERR syntax error` without flushing.
+
+**Transactions.** `MULTI` starts queueing: each following command is checked for existence and arity and answered `+QUEUED`; one that fails that check is answered with its error and marks the transaction, so that `EXEC` replies `EXECABORT Transaction discarded because of previous errors.` and runs nothing. `EXEC` runs the queue inside a single SQLite write transaction, so no other connection or process observes it half done, and replies with a list of each command's result. Redis does not undo a transaction when a command fails at run time, and neither does this: each queued command runs under its own savepoint, a failing one is rolled back alone, its error appears in its place in the list, and the rest still apply. `DISCARD` drops the queue. Errors: `ERR MULTI calls can not be nested`, `ERR EXEC without MULTI`, `ERR DISCARD without MULTI`, `ERR WATCH inside MULTI is not allowed`. An argument to `MULTI`, `EXEC` or `DISCARD` is an arity error and changes nothing.
+
+`WATCH key [key ...]` makes the next `EXEC` conditional: if any watched key has changed since it was watched, `EXEC` runs nothing and replies nil (RESP2 `*-1`, RESP3 `_`). `EXEC`, `DISCARD` and `UNWATCH` clear the watches. The reference implementation records a fingerprint of each watched key's whole state (type, expiry and contents, read in a canonical order) and compares it inside `EXEC`'s write transaction. This differs from Redis in one respect: Redis aborts if the key was *touched*, this aborts if it *differs*, so a key changed and changed back does not abort. No check-and-set logic depends on that case, and comparing state needs nothing stored and sees writes from every process using the file, including the CLI.
 
 **Connection commands.** `PING [message]`, `ECHO`, `QUIT`, `SELECT` (only index 0 exists; others give `ERR DB index is out of range`), `HELLO [2|3 [AUTH ...] [SETNAME name]]`, `CLIENT SETNAME|GETNAME|ID|SETINFO`, `COMMAND` (an empty array; `COMMAND COUNT` an integer), `CONFIG GET` (always empty), `INFO` (a short `# Server` / `# Clients` / `# Keyspace` report; a bulk string in RESP2 and a verbatim `txt` string in RESP3), and `AUTH`, which fails with Redis's "called without any password configured" error. The reported `redis_version` is `6.2.0`.
 
@@ -689,7 +729,8 @@ For CLI usage (one command per invocation), this is sufficient. Server mode uses
 1. **Persistence is default** — every command writes to disk immediately (via SQLite WAL). There is no in-memory-only mode.
 2. **Lazy expiry only** — expired keys are hidden from reads but not deleted until `PURGE` is called. Redis uses both lazy expiry and an active background sweep.
 3. **No pub/sub.**
-4. **No transactions (MULTI/EXEC)** — each command is implicitly atomic, in the CLI and over the wire.
+4. **Transactions (MULTI/EXEC) exist only in server mode**; each CLI command is implicitly atomic. `WATCH` compares state rather than tracking touches (see [Server Mode](#server-mode)).
+4a. **No `INCRBYFLOAT`/`HINCRBYFLOAT`.** Redis formats the result from a C `long double`, whose precision differs between platforms (80-bit on x86, 64-bit on ARM), so its replies are not reproducible from one Redis build to another, let alone from another implementation.
 5. **No Lua scripting.**
 6. **One oversized TTL is not copied.** `SET k v PX 9223372036854775807` replies OK in Redis but the key vanishes at once (its `now + ttl` wraps); klyv keeps the key.
 7. **Server mode has no authentication or TLS**, and implements only the commands listed under [Server Mode](#server-mode).

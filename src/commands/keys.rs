@@ -132,8 +132,15 @@ pub(crate) fn cmd_keys(conn: &Connection, pattern: Option<Arg<'_>>) -> CmdResult
     Ok(Reply::Array(keys, Empty::List))
 }
 
-pub(crate) fn cmd_exists(conn: &Connection, key: Arg<'_>) -> CmdResult {
-    Ok(Reply::Int(key_type(conn, key, now_ms())?.is_some() as i64))
+/// EXISTS with several keys: how many of them exist, counting a key once
+/// per mention, as Redis does.
+pub(crate) fn cmd_exists_many(conn: &Connection, keys: &[Arg<'_>]) -> CmdResult {
+    let now = now_ms();
+    let mut count = 0;
+    for &key in keys {
+        count += key_type(conn, key, now)?.is_some() as i64;
+    }
+    Ok(Reply::Int(count))
 }
 
 pub(crate) fn cmd_type(conn: &Connection, key: Arg<'_>) -> CmdResult {
@@ -190,6 +197,158 @@ pub(crate) fn cmd_flushall(conn: &Connection) -> CmdResult {
          DELETE FROM hash_fields;",
     )?;
     Ok(Reply::Simple("OK"))
+}
+
+/// COPY: duplicate a key's value and expiry under another name. 0 if the
+/// source is missing, or the destination exists and `replace` is false.
+pub(crate) fn cmd_copy(conn: &Connection, src: Arg<'_>, dst: Arg<'_>, replace: bool) -> CmdResult {
+    if src == dst {
+        return Err(CmdError::new(
+            "ERR source and destination objects are the same",
+        ));
+    }
+    let now = now_ms();
+    let Some(row) = lookup(conn, src)?.filter(|r| r.is_live(now)) else {
+        return Ok(Reply::Int(0));
+    };
+    if key_type(conn, dst, now)?.is_some() && !replace {
+        return Ok(Reply::Int(0));
+    }
+    // Whatever is there (live and being replaced, or expired) goes first.
+    remove_key(conn, dst)?;
+    conn.execute(
+        "INSERT INTO keyspace (key, type, expires_at, len)
+         SELECT ?2, type, expires_at, len FROM keyspace WHERE key = ?1",
+        params![src, dst],
+    )?;
+    let columns = match row.kind {
+        "string" => "value",
+        "list" => "idx, value",
+        "set" => "member",
+        _ => "field, value",
+    };
+    let table = data_table(row.kind);
+    conn.execute(
+        &format!(
+            "INSERT INTO {table} (key, {columns}) SELECT ?2, {columns} FROM {table} WHERE key = ?1"
+        ),
+        params![src, dst],
+    )?;
+    Ok(Reply::Int(1))
+}
+
+/// The reply every SCAN-family command gives: the cursor for the next call
+/// (0 when the iteration is complete) and this call's items.
+fn scan_reply(next: i64, items: Vec<Vec<u8>>) -> Reply {
+    Reply::Lines(vec![
+        Reply::Bulk(next.to_string().into_bytes()),
+        Reply::Array(items, Empty::List),
+    ])
+}
+
+/// A page must examine at least one row; Redis calls anything less a syntax
+/// error.
+fn check_scan_count(count: i64) -> Result<(), CmdError> {
+    if count < 1 {
+        return Err(CmdError::new("ERR syntax error"));
+    }
+    Ok(())
+}
+
+/// The cursor to hand back after a page: the last rowid seen, or 0 once a
+/// page comes back short, meaning the end was reached.
+fn next_cursor(last_rowid: i64, rows: i64, count: i64) -> i64 {
+    if rows < count { 0 } else { last_rowid }
+}
+
+/// SCAN: iterate the keyspace a page at a time.
+///
+/// The cursor is the SQLite rowid of the last catalogue row examined, and a
+/// page is the next `count` rows in rowid order. A key keeps its rowid for
+/// as long as it exists (writes update its row in place), so a key present
+/// for the whole iteration is returned exactly once; keys created or deleted
+/// meanwhile may or may not appear. That is the guarantee Redis gives. As
+/// in Redis, `count` bounds the rows examined rather than the rows returned:
+/// MATCH and TYPE filter within the page, so a page may come back empty with
+/// a non-zero cursor.
+pub(crate) fn cmd_scan(
+    conn: &Connection,
+    cursor: i64,
+    pattern: Option<Arg<'_>>,
+    count: i64,
+    kind: Option<Arg<'_>>,
+) -> CmdResult {
+    check_scan_count(count)?;
+    let now = now_ms();
+    let mut stmt = conn.prepare(
+        "SELECT rowid, key, type, expires_at FROM keyspace
+         WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+    )?;
+    let mut rows = stmt.query(params![cursor, count])?;
+    let (mut keys, mut last, mut seen) = (Vec::new(), 0, 0);
+    while let Some(row) = rows.next()? {
+        last = row.get(0)?;
+        seen += 1;
+        let expires_at: Option<i64> = row.get(3)?;
+        if expires_at.is_some_and(|t| t <= now) {
+            continue;
+        }
+        if let Some(kind) = kind
+            && row.get_ref(2)?.as_bytes().ok() != Some(kind.as_bytes())
+        {
+            continue;
+        }
+        let key = bytes_col(row, 1)?;
+        if pattern.is_none_or(|p| p.as_bytes() == b"*" || glob_match(p.as_bytes(), &key)) {
+            keys.push(key);
+        }
+    }
+    Ok(scan_reply(next_cursor(last, seen, count), keys))
+}
+
+/// HSCAN / SSCAN: iterate one hash's fields (with their values unless
+/// `values` is false) or one set's members. The cursor is a rowid in the
+/// payload table, as for SCAN. Each call selects the key's remaining rows in
+/// rowid order, which is linear in the size of the collection: fine for the
+/// collections this is normally used on, slow for a full iteration of a
+/// very large one.
+pub(crate) fn cmd_scan_within(
+    conn: &Connection,
+    kind: &'static str,
+    key: Arg<'_>,
+    cursor: i64,
+    pattern: Option<Arg<'_>>,
+    count: i64,
+    values: bool,
+) -> CmdResult {
+    check_scan_count(count)?;
+    if !check_type(conn, key, kind, now_ms())? {
+        return Ok(scan_reply(0, vec![]));
+    }
+    let hash = kind == "hash";
+    let sql = if hash {
+        "SELECT rowid, field, value FROM hash_fields
+         WHERE key = ?1 AND rowid > ?2 ORDER BY rowid LIMIT ?3"
+    } else {
+        "SELECT rowid, member FROM set_members
+         WHERE key = ?1 AND rowid > ?2 ORDER BY rowid LIMIT ?3"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query(params![key, cursor, count])?;
+    let (mut items, mut last, mut seen) = (Vec::new(), 0, 0);
+    while let Some(row) = rows.next()? {
+        last = row.get(0)?;
+        seen += 1;
+        let name = bytes_col(row, 1)?;
+        if pattern.is_some_and(|p| p.as_bytes() != b"*" && !glob_match(p.as_bytes(), &name)) {
+            continue;
+        }
+        items.push(name);
+        if hash && values {
+            items.push(bytes_col(row, 2)?);
+        }
+    }
+    Ok(scan_reply(next_cursor(last, seen, count), items))
 }
 
 #[cfg(test)]
