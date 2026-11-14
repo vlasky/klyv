@@ -15,6 +15,10 @@
 //!   differ (e.g. Redis appends "or out of range" to integer-parse errors).
 //! - Unordered replies (sets, keys, hashes) are sorted on both sides.
 //!
+//! Deliberately not matched: `SET k v PX 9223372036854775807` (or the largest
+//! accepted EX). Redis replies OK but its `now + ttl` wraps negative and the
+//! key is gone immediately; klyv saturates and keeps the key.
+//!
 //! Not exercised here: purge (klyv-only) and db-size (Redis may briefly count
 //! a logically expired key until its active sweep runs, so results can race).
 
@@ -126,14 +130,26 @@ fn step(klyv: &'static [&'static str], redis: &'static [&'static str], cmp: Cmp)
     Step { klyv, redis, cmp }
 }
 
+/// Reply lines, keeping empty ones: an empty key, member, field or value is
+/// a real (empty) line and dropping it would misalign everything after it.
+/// The one unavoidable ambiguity is a lone newline, which redis-cli prints
+/// both for an empty array and for an array holding one empty string; it is
+/// read as empty, which is what klyv's empty output (no line at all) means.
+fn reply_lines(s: &str) -> Vec<&str> {
+    if s.is_empty() || s == "\n" {
+        return Vec::new();
+    }
+    s.strip_suffix('\n').unwrap_or(s).split('\n').collect()
+}
+
 fn sorted_lines(s: &str) -> Vec<&str> {
-    let mut lines: Vec<&str> = s.lines().filter(|l| !l.is_empty()).collect();
+    let mut lines = reply_lines(s);
     lines.sort_unstable();
     lines
 }
 
 fn sorted_pairs(s: &str) -> Vec<(&str, &str)> {
-    let lines: Vec<&str> = s.lines().filter(|l| !l.is_empty()).collect();
+    let lines = reply_lines(s);
     let mut pairs: Vec<(&str, &str)> = lines
         .chunks(2)
         .map(|c| (c[0], *c.get(1).unwrap_or(&"")))
@@ -704,6 +720,90 @@ fn scenarios() -> Vec<(&'static str, Vec<Step>)> {
                 step(&["keys", "a\\\\b"], &["KEYS", "a\\\\b"], Sorted),
             ],
         ),
+        (
+            "keys-glob-malformed",
+            vec![
+                step(
+                    &["m-set", "a", "1", "a]", "1", "a\\", "1", "[a", "1"],
+                    &["MSET", "a", "1", "a]", "1", "a\\", "1", "[a", "1"],
+                    Exact,
+                ),
+                step(
+                    &["m-set", "ab", "1", "a-c", "1", "b", "1"],
+                    &["MSET", "ab", "1", "a-c", "1", "b", "1"],
+                    Exact,
+                ),
+                step(&["keys", "[a"], &["KEYS", "[a"], Sorted),
+                step(&["keys", "a["], &["KEYS", "a["], Sorted),
+                step(&["keys", "[a-"], &["KEYS", "[a-"], Sorted),
+                step(&["keys", "[^"], &["KEYS", "[^"], Sorted),
+                step(&["keys", "[]a]"], &["KEYS", "[]a]"], Sorted),
+                step(&["keys", "a[]"], &["KEYS", "a[]"], Sorted),
+                step(&["keys", "[c-a]"], &["KEYS", "[c-a]"], Sorted),
+                step(&["keys", "[a\\-c]*"], &["KEYS", "[a\\-c]*"], Sorted),
+                step(&["keys", "[\\]a]*"], &["KEYS", "[\\]a]*"], Sorted),
+                step(&["keys", "[!a]*"], &["KEYS", "[!a]*"], Sorted),
+                step(&["keys", "a\\"], &["KEYS", "a\\"], Sorted),
+                step(&["keys", "**"], &["KEYS", "**"], Sorted),
+                step(&["keys", "*[ab]"], &["KEYS", "*[ab]"], Sorted),
+            ],
+        ),
+        (
+            "expire-overflow",
+            vec![
+                step(&["set", "k", "v"], &["SET", "k", "v"], Exact),
+                // Overflow is rejected before the key is looked up.
+                step(
+                    &["expire", "missing", "9223372036854775807"],
+                    &["EXPIRE", "missing", "9223372036854775807"],
+                    Error,
+                ),
+                step(
+                    &["expire", "k", "9223372036854775"],
+                    &["EXPIRE", "k", "9223372036854775"],
+                    Error,
+                ),
+                step(
+                    &["expire", "k", "-9223372036854775808"],
+                    &["EXPIRE", "k", "-9223372036854775808"],
+                    Error,
+                ),
+                step(
+                    &["p-expire", "k", "9223372036854775807"],
+                    &["PEXPIRE", "k", "9223372036854775807"],
+                    Error,
+                ),
+                step(
+                    &["expire-at", "k", "9223372036854776"],
+                    &["EXPIREAT", "k", "9223372036854776"],
+                    Error,
+                ),
+                step(&["ttl", "k"], &["TTL", "k"], Exact),
+                step(
+                    &["set", "k", "v", "--ex", "9223372036854776"],
+                    &["SET", "k", "v", "EX", "9223372036854776"],
+                    Error,
+                ),
+                // The largest values that are accepted.
+                step(
+                    &["expire-at", "k", "9223372036854775"],
+                    &["EXPIREAT", "k", "9223372036854775"],
+                    Exact,
+                ),
+                step(
+                    &["p-expire-at", "k", "9223372036854775807"],
+                    &["PEXPIREAT", "k", "9223372036854775807"],
+                    Exact,
+                ),
+                step(&["exists", "k"], &["EXISTS", "k"], Exact),
+                step(
+                    &["p-expire", "k", "-9223372036854775808"],
+                    &["PEXPIRE", "k", "-9223372036854775808"],
+                    Exact,
+                ),
+                step(&["exists", "k"], &["EXISTS", "k"], Exact),
+            ],
+        ),
     ]
 }
 
@@ -787,7 +887,23 @@ const AMOUNTS: &[&str] = &[
 ];
 const INDEXES: &[&str] = &["-100", "-3", "-1", "0", "1", "2", "5", "100"];
 const COUNTS: &[&str] = &["-2", "-1", "0", "1", "2"];
-const PATTERNS: &[&str] = &["*", "k*", "K*", "key:?", "[kK]*", "*-*", "k\\[1\\]", "?"];
+const PATTERNS: &[&str] = &[
+    "*", "k*", "K*", "key:?", "[kK]*", "*-*", "k\\[1\\]", "?",
+    // Malformed or hostile: unclosed and empty classes, reversed ranges,
+    // escapes inside classes, a trailing backslash, runs of stars.
+    "[k", "[^", "[]k]*", "[z-a]*", "[k\\-z]*", "k\\", "**", "", "*[", "[^-]*", "*?*",
+];
+/// Expiry arguments whose outcome does not depend on timing: immediate,
+/// far-future, or rejected as overflowing.
+const EXPIRIES: &[&str] = &[
+    "-9223372036854775808",
+    "-1",
+    "0",
+    "100000",
+    "9223372036854775",
+    "9223372036854776",
+    "9223372036854775807",
+];
 
 struct Gen {
     klyv: Vec<String>,
@@ -818,7 +934,8 @@ fn random_step(rng: &mut Rng) -> Gen {
     let j = *rng.pick(INDEXES);
     let c = *rng.pick(COUNTS);
     let pat = *rng.pick(PATTERNS);
-    match rng.below(44) {
+    let x = *rng.pick(EXPIRIES);
+    match rng.below(46) {
         0..=2 => g(&["set", "--", k, v], &["SET", k, v], Exact),
         3 => g(&["set", "--nx", "--", k, v], &["SET", k, v, "NX"], Exact),
         4 => g(
@@ -883,6 +1000,20 @@ fn random_step(rng: &mut Rng) -> Gen {
             8 => g(&["keys", "--", pat], &["KEYS", pat], Sorted),
             _ => g(&["persist", "--", k], &["PERSIST", k], Exact),
         },
+        43 => match rng.below(4) {
+            0 => g(&["expire", "--", k, x], &["EXPIRE", k, x], Exact),
+            1 => g(&["p-expire", "--", k, x], &["PEXPIRE", k, x], Exact),
+            2 => g(&["expire-at", "--", k, x], &["EXPIREAT", k, x], Exact),
+            _ => g(&["p-expire-at", "--", k, x], &["PEXPIREAT", k, x], Exact),
+        },
+        44 => {
+            // Not the largest EX/PX that Redis accepts: there `now + ttl`
+            // wraps negative inside Redis and the key vanishes on the spot,
+            // an overflow artefact klyv does not copy (it saturates).
+            let x = if x == "9223372036854775" { "100000" } else { x };
+            let ex = format!("--ex={x}");
+            g(&["set", &ex, "--", k, v], &["SET", k, v, "EX", x], Exact)
+        }
         _ => {
             // Expiry with deterministic outcomes only: far future or past.
             // (ttl/p-ttl values, s-pop and db-size are timing- or
