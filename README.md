@@ -15,6 +15,10 @@ Redis-compatible embedded key-value store backed by SQLite. No server, no daemon
 
 ## Installation
 
+Prebuilt binaries for Linux (x86_64 and ARM64, static), macOS (Apple silicon and Intel) and Windows are attached to each [GitHub release](https://github.com/vlasky/klyv/releases), with SHA-256 checksums. Unpack the archive and put `klyv` on your `PATH`.
+
+With a Rust toolchain:
+
 ```sh
 cargo install --path .
 ```
