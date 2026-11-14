@@ -2,10 +2,12 @@ mod cli;
 mod commands;
 mod db;
 mod reply;
+mod resp;
+mod server;
 mod shell;
 
 use clap::Parser;
-use cli::{Cli, dispatch};
+use cli::{Cli, TopCommand, dispatch};
 use db::open_db;
 use reply::{CmdError, render};
 use shell::{pipe, repl};
@@ -21,7 +23,13 @@ fn main() {
         }
     };
     match cli.command {
-        Some(command) => match dispatch(&mut conn, command) {
+        Some(TopCommand::Serve(args)) => {
+            // Opening above created or migrated the file; each client
+            // connection opens its own handle.
+            drop(conn);
+            std::process::exit(server::serve(&cli.db, args));
+        }
+        Some(TopCommand::Data(command)) => match dispatch(&mut conn, command) {
             Ok(reply) => {
                 let _ = std::io::stdout().write_all(&render(&reply, cli.format));
             }

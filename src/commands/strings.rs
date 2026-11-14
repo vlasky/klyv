@@ -21,11 +21,21 @@ fn put_string(conn: &Connection, key: Arg<'_>, value: Vec<u8>) -> rusqlite::Resu
     Ok(())
 }
 
+/// SET's existence condition (Redis `NX` / `XX`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetCond {
+    Always,
+    /// Only if the key does not exist (`NX`).
+    IfAbsent,
+    /// Only if the key already exists (`XX`).
+    IfExists,
+}
+
 pub(crate) fn cmd_set(
     conn: &Connection,
     key: Arg<'_>,
     value: Arg<'_>,
-    nx: bool,
+    cond: SetCond,
     ttl_ms: Option<i64>,
     keep_ttl: bool,
 ) -> CmdResult {
@@ -37,8 +47,10 @@ pub(crate) fn cmd_set(
     let now = now_ms();
     let existing = lookup(conn, key)?;
     let live = existing.as_ref().is_some_and(|r| r.is_live(now));
-    if nx && live {
-        return Ok(Reply::Nil);
+    match cond {
+        SetCond::IfAbsent if live => return Ok(Reply::Nil),
+        SetCond::IfExists if !live => return Ok(Reply::Nil),
+        _ => {}
     }
     // SET overwrites any existing key regardless of its type; the stale rows
     // of an expired key go too.
@@ -103,7 +115,8 @@ pub(crate) fn cmd_incrby(conn: &Connection, key: Arg<'_>, amount: i64) -> CmdRes
     ensure_type(conn, key, KIND, now)?;
     drop_if_expired(conn, key, now)?;
     let val = match get_string(conn, key)? {
-        Some(v) => parse_int(&v).ok_or_else(|| CmdError::new("ERR value is not an integer"))?,
+        Some(v) => parse_int(&v)
+            .ok_or_else(|| CmdError::new("ERR value is not an integer or out of range"))?,
         None => 0,
     };
     let new_val = val

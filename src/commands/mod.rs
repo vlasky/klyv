@@ -61,7 +61,7 @@ mod binary_tests {
     fn strings_round_trip_arbitrary_bytes() {
         let (_d, c) = db();
         let k = Arg(BIN_KEY);
-        assert!(cmd_set(&c, k, Arg(BIN_VAL), false, None, false).is_ok());
+        assert!(cmd_set(&c, k, Arg(BIN_VAL), SetCond::Always, None, false).is_ok());
         assert_eq!(bulk(cmd_get(&c, k)).as_deref(), Some(BIN_VAL));
         assert_eq!(int(cmd_strlen(&c, k)), BIN_VAL.len() as i64);
         assert_eq!(
@@ -82,7 +82,7 @@ mod binary_tests {
     fn append_across_the_utf8_boundary() {
         let (_d, c) = db();
         let k = Arg(b"k");
-        cmd_set(&c, k, Arg(b"caf"), false, None, false)
+        cmd_set(&c, k, Arg(b"caf"), SetCond::Always, None, false)
             .ok()
             .unwrap();
         // First byte of a two-byte sequence: now invalid UTF-8.
@@ -96,10 +96,10 @@ mod binary_tests {
     #[test]
     fn binary_and_text_keys_are_distinct_and_listed() {
         let (_d, c) = db();
-        cmd_set(&c, Arg(BIN_KEY), Arg(b"bin"), false, None, false)
+        cmd_set(&c, Arg(BIN_KEY), Arg(b"bin"), SetCond::Always, None, false)
             .ok()
             .unwrap();
-        cmd_set(&c, Arg(b"k"), Arg(b"text"), false, None, false)
+        cmd_set(&c, Arg(b"k"), Arg(b"text"), SetCond::Always, None, false)
             .ok()
             .unwrap();
         assert_eq!(bulk(cmd_get(&c, Arg(b"k"))).as_deref(), Some(&b"text"[..]));
@@ -209,7 +209,7 @@ mod binary_tests {
     fn embedded_nul_is_preserved() {
         let (_d, c) = db();
         let (k, prefix) = (Arg(b"a\0b"), Arg(b"a"));
-        cmd_set(&c, k, Arg(b"v\0w"), false, None, false)
+        cmd_set(&c, k, Arg(b"v\0w"), SetCond::Always, None, false)
             .ok()
             .unwrap();
         assert_eq!(bulk(cmd_get(&c, k)).as_deref(), Some(&b"v\0w"[..]));
@@ -228,9 +228,16 @@ mod binary_tests {
     #[test]
     fn utf8_arguments_are_stored_as_text() {
         let (_d, c) = db();
-        cmd_set(&c, Arg(b"s"), Arg("v\u{e9}".as_bytes()), false, None, false)
-            .ok()
-            .unwrap();
+        cmd_set(
+            &c,
+            Arg(b"s"),
+            Arg("v\u{e9}".as_bytes()),
+            SetCond::Always,
+            None,
+            false,
+        )
+        .ok()
+        .unwrap();
         cmd_rpush(&c, Arg(b"l"), &[Arg(b"a")]).ok().unwrap();
         cmd_sadd(&c, Arg(b"st"), &[Arg(b"m")]).ok().unwrap();
         cmd_hset(&c, Arg(b"h"), &[Arg(b"f"), Arg(b"v")])
