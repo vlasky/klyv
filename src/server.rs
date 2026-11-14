@@ -17,6 +17,7 @@ use crate::db::{Arg, open_db};
 use crate::reply::{CmdError, CmdResult, Empty, Reply};
 use crate::resp::{Proto, ReadError, encode, encode_error, read_command};
 use rusqlite::{Connection, TransactionBehavior};
+use std::cell::RefCell;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -42,12 +43,19 @@ pub(crate) struct ServeArgs {
     /// Permissions for the Unix socket, in octal (e.g. 700).
     #[arg(long, value_name = "MODE", requires = "unixsocket")]
     pub(crate) unixsocketperm: Option<String>,
+
+    /// Maximum simultaneous client connections; further ones are refused.
+    /// Each client uses a thread and four file descriptors, so the usable
+    /// maximum is also bounded by the process's open-file limit.
+    #[arg(long, value_name = "N", default_value_t = 10_000)]
+    pub(crate) maxclients: usize,
 }
 
 struct Shared {
     db: PathBuf,
     next_id: AtomicU64,
     clients: AtomicUsize,
+    max_clients: usize,
     tcp_port: u16,
 }
 
@@ -316,8 +324,13 @@ fn lookup(name: &[u8]) -> Option<Spec> {
         b"TYPE" => r(2, |c, a| cmd_type(c, a[0])),
         b"RENAME" => w(3, |c, a| cmd_rename(c, a[0], a[1])),
         b"DBSIZE" => r(1, |c, _| cmd_dbsize(c)),
-        // The ASYNC/SYNC modifier is accepted and ignored.
-        b"FLUSHALL" | b"FLUSHDB" => w(-1, |c, _| cmd_flushall(c)),
+        // The ASYNC/SYNC modifier is accepted and has no effect. Anything
+        // else must be refused: a mistyped argument must not flush.
+        b"FLUSHALL" | b"FLUSHDB" => w(-1, |c, a| match a {
+            [] => cmd_flushall(c),
+            [mode] if is(*mode, "ASYNC") || is(*mode, "SYNC") => cmd_flushall(c),
+            _ => Err(syntax_error()),
+        }),
         _ => return None,
     })
 }
@@ -441,7 +454,7 @@ fn info(conn: &Connection, shared: &Shared) -> CmdResult {
     if keys > 0 {
         text.push_str(&format!("db0:keys={keys},expires={expires},avg_ttl=0\r\n"));
     }
-    Ok(bulk(text))
+    Ok(Reply::Verbatim(text.into_bytes()))
 }
 
 enum Outcome {
@@ -557,16 +570,50 @@ fn execute(
     close
 }
 
+/// The read half of a connection, flushing pending replies before it blocks.
+///
+/// Replies to pipelined commands are batched in the writer's buffer, and
+/// must be sent before the server waits for more input: otherwise a client
+/// that has sent one whole command and part of the next would wait for a
+/// reply that is sitting unsent while the server waits for the rest. Sitting
+/// under the `BufReader`, this is consulted exactly when buffered input has
+/// run out, which is the only time the server can block.
+struct FlushBeforeRead<'a, R, W: Write> {
+    inner: R,
+    writer: &'a RefCell<BufWriter<W>>,
+}
+
+impl<R: Read, W: Write> Read for FlushBeforeRead<'_, R, W> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.writer.borrow_mut().flush()?;
+        self.inner.read(buf)
+    }
+}
+
 /// Serves one client until it disconnects, quits or breaks the protocol.
 fn serve_connection(reader: impl Read, writer: impl Write, shared: &Shared) {
-    let mut reader = BufReader::new(reader);
-    let mut writer = BufWriter::new(writer);
+    let writer = RefCell::new(BufWriter::new(writer));
+    let send = |bytes: &[u8]| writer.borrow_mut().write_all(bytes);
+    let fail = |msg: &str| {
+        let mut out = Vec::new();
+        encode_error(msg, &mut out);
+        let _ = send(&out);
+    };
+    let mut reader = BufReader::new(FlushBeforeRead {
+        inner: reader,
+        writer: &writer,
+    });
+    // Redis's reply to a client over the limit, sent before closing.
+    if shared.clients.load(Ordering::Relaxed) > shared.max_clients {
+        fail("ERR max number of clients reached");
+        let _ = writer.borrow_mut().flush();
+        return;
+    }
     let mut conn = match open_db(&shared.db) {
         Ok(conn) => conn,
         Err(e) => {
-            let mut out = Vec::new();
-            encode_error(&format!("ERR failed to open database: {e}"), &mut out);
-            let _ = writer.write_all(&out).and_then(|_| writer.flush());
+            fail(&format!("ERR failed to open database: {e}"));
+            let _ = writer.borrow_mut().flush();
             return;
         }
     };
@@ -581,35 +628,29 @@ fn serve_connection(reader: impl Read, writer: impl Write, shared: &Shared) {
             Ok(Some(raw)) => raw,
             Ok(None) | Err(ReadError::Closed) => break,
             Err(ReadError::Protocol(msg)) => {
-                out.clear();
-                encode_error(&format!("ERR {msg}"), &mut out);
-                let _ = writer.write_all(&out).and_then(|_| writer.flush());
+                fail(&format!("ERR {msg}"));
                 break;
             }
         };
         out.clear();
         let close = execute(&mut conn, &mut session, shared, &raw, &mut out);
-        if writer.write_all(&out).is_err() {
-            break;
-        }
-        // Pipelining: while more commands are already buffered, keep
-        // batching replies; flush once the client is waiting on us.
-        if (close || reader.buffer().is_empty()) && writer.flush().is_err() {
-            break;
-        }
-        if close {
+        if send(&out).is_err() || close {
             break;
         }
     }
+    let _ = writer.borrow_mut().flush();
 }
 
-fn spawn_connection<R, W>(reader: R, writer: W, shared: &Arc<Shared>)
+/// Runs a client on its own thread. The stream is shared by reference
+/// between the read and write halves rather than duplicated, which saves a
+/// file descriptor per client.
+fn spawn_connection<S>(stream: S, shared: &Arc<Shared>)
 where
-    R: Read + Send + 'static,
-    W: Write + Send + 'static,
+    S: Send + 'static,
+    for<'a> &'a S: Read + Write,
 {
     let shared = Arc::clone(shared);
-    // If the thread cannot be created (resource exhaustion) the streams are
+    // If the thread cannot be created (resource exhaustion) the stream is
     // dropped, which closes the connection.
     let _ = std::thread::Builder::new()
         .name("klyv-client".into())
@@ -624,17 +665,17 @@ where
             }
             shared.clients.fetch_add(1, Ordering::Relaxed);
             let _connected = Connected(&shared.clients);
-            serve_connection(reader, writer, &shared);
+            serve_connection(&stream, &stream, &shared);
         });
 }
 
 fn accept_tcp(listener: TcpListener, shared: Arc<Shared>) {
     for stream in listener.incoming() {
-        match stream.and_then(|s| Ok((s.try_clone()?, s))) {
-            Ok((reader, writer)) => {
+        match stream {
+            Ok(stream) => {
                 // Replies are small and latency-sensitive.
-                let _ = writer.set_nodelay(true);
-                spawn_connection::<TcpStream, TcpStream>(reader, writer, &shared);
+                let _ = stream.set_nodelay(true);
+                spawn_connection::<TcpStream>(stream, &shared);
             }
             // Typically out of file descriptors: back off instead of spinning.
             Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
@@ -650,35 +691,58 @@ mod unix {
 
     /// Binds the socket, replacing a stale socket file left by a server that
     /// did not shut down cleanly, but never one that is still being served
-    /// and never a file that is not a socket.
+    /// and never a file that is not a socket. Only "connection refused"
+    /// counts as stale: any other failure to connect (permissions, resource
+    /// limits) proves nothing, and the file is left alone.
     pub(super) fn bind(path: &Path, perm: Option<&str>) -> Result<UnixListener, String> {
+        let mode = match perm {
+            Some(perm) => Some(
+                u32::from_str_radix(perm, 8)
+                    .ok()
+                    .filter(|m| *m <= 0o777)
+                    .ok_or_else(|| {
+                        format!("invalid --unixsocketperm '{perm}' (octal, e.g. 700)")
+                    })?,
+            ),
+            None => None,
+        };
         if let Ok(meta) = std::fs::symlink_metadata(path) {
             if !meta.file_type().is_socket() {
                 return Err(format!("{} exists and is not a socket", path.display()));
             }
-            if UnixStream::connect(path).is_ok() {
-                return Err(format!("{} is already being served", path.display()));
+            match UnixStream::connect(path) {
+                Ok(_) => return Err(format!("{} is already being served", path.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "{} exists and could not be checked for a live server: {e}",
+                        path.display()
+                    ));
+                }
             }
-            std::fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
         }
         let listener = UnixListener::bind(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        if let Some(perm) = perm {
-            let mode = u32::from_str_radix(perm, 8)
-                .ok()
-                .filter(|m| *m <= 0o777)
-                .ok_or_else(|| format!("invalid --unixsocketperm '{perm}' (octal, e.g. 700)"))?;
+        if let Some(mode) = mode {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
                 .map_err(|e| format!("{}: {e}", path.display()))?;
         }
         Ok(listener)
     }
 
+    /// Identifies the socket file this process created, so that shutdown
+    /// removes it only if the path still refers to it.
+    pub(super) fn identity(path: &Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        Some((meta.dev(), meta.ino()))
+    }
+
     pub(super) fn accept(listener: UnixListener, shared: Arc<Shared>) {
         for stream in listener.incoming() {
-            match stream.and_then(|s| Ok((s.try_clone()?, s))) {
-                Ok((reader, writer)) => {
-                    spawn_connection::<UnixStream, UnixStream>(reader, writer, &shared)
-                }
+            match stream {
+                Ok(stream) => spawn_connection::<UnixStream>(stream, &shared),
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
             }
         }
@@ -727,6 +791,7 @@ fn start(db: &Path, args: ServeArgs) -> Result<Vec<std::thread::JoinHandle<()>>,
         db: db.to_path_buf(),
         next_id: AtomicU64::new(1),
         clients: AtomicUsize::new(0),
+        max_clients: args.maxclients,
         tcp_port: tcp
             .first()
             .and_then(|l| l.local_addr().ok())
@@ -735,9 +800,19 @@ fn start(db: &Path, args: ServeArgs) -> Result<Vec<std::thread::JoinHandle<()>>,
 
     // Remove the socket file on Ctrl-C / SIGTERM. Nothing else needs an
     // orderly shutdown: every command is its own committed transaction.
-    let socket_path = args.unixsocket.clone();
+    #[cfg(unix)]
+    let socket = args
+        .unixsocket
+        .clone()
+        .map(|path| (unix::identity(&path), path));
     ctrlc::set_handler(move || {
-        if let Some(path) = &socket_path {
+        // Only if the path is still the socket this process bound: another
+        // server may have replaced it since.
+        #[cfg(unix)]
+        if let Some((created, path)) = &socket
+            && created.is_some()
+            && unix::identity(path) == *created
+        {
             let _ = std::fs::remove_file(path);
         }
         std::process::exit(0);

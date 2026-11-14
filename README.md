@@ -93,6 +93,7 @@ Values with spaces use shell-style quoting in both modes. A failing line prints 
 klyv --db my.db serve                                  # 127.0.0.1:6379
 klyv --db my.db serve --bind 127.0.0.1:7000            # another port (repeatable)
 klyv --db my.db serve --unixsocket /run/klyv.sock --unixsocketperm 660   # Unix socket only
+klyv --db my.db serve --maxclients 200                 # cap connections (default 10000)
 
 redis-cli -p 7000 set greeting "hello world"
 redis-cli -p 7000 lrange tasks 0 -1
@@ -109,6 +110,7 @@ r.set("lock", "1", nx=True, ex=30)
 - **Connection commands** that clients send while connecting are answered: `PING`, `ECHO`, `QUIT`, `SELECT 0`, `HELLO`, `CLIENT SETNAME/GETNAME/ID/SETINFO`, `COMMAND`, `CONFIG GET`, `INFO`.
 - **Binary safe:** keys, fields and values may be any bytes.
 - **Same file, live:** the CLI can read and write the database while the server is running, and several servers can serve one file. Each command is one SQLite transaction either way.
+- **Connections:** one thread and four file descriptors per client, so the practical ceiling is the process's open-file limit (`ulimit -n`); clients beyond `--maxclients` are refused with Redis's error. There is no idle timeout.
 - **Shutdown:** stop it with Ctrl-C or `SIGTERM`. Every command is committed before its reply is sent, so there is nothing to flush.
 
 There is **no authentication and no TLS**. The default bind address is loopback only; klyv prints a warning if you bind anything else. Put it behind a Unix socket with restrictive permissions, or a trusted network, never the open internet.
