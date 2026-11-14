@@ -188,3 +188,72 @@ pub(crate) fn cmd_mget(conn: &Connection, keys: &[Arg<'_>]) -> CmdResult {
     }
     Ok(Reply::Lines(replies))
 }
+
+/// GETSET: store a new value and return the old one. Like SET it discards
+/// any TTL, but unlike SET it refuses a key of another type, since the old
+/// value has to be returned as a string.
+pub(crate) fn cmd_getset(conn: &Connection, key: Arg<'_>, value: Arg<'_>) -> CmdResult {
+    let old = if check_type(conn, key, KIND, now_ms())? {
+        get_string(conn, key)?
+    } else {
+        None
+    };
+    cmd_set(conn, key, value, SetCond::Always, None, false)?;
+    Ok(old.map_or(Reply::Nil, Reply::Bulk))
+}
+
+/// What GETEX does to the key's expiry.
+#[derive(Clone, Copy)]
+pub(crate) enum GetEx {
+    /// Leave it alone (plain GETEX is GET).
+    Keep,
+    /// Remove it (`PERSIST`).
+    Persist,
+    /// Expire at this Unix time in milliseconds (`EX`/`PX`/`EXAT`/`PXAT`,
+    /// already converted). A time in the past expires the key at once.
+    At(i64),
+}
+
+/// GETEX: return the value and change the expiry in one step.
+pub(crate) fn cmd_getex(conn: &Connection, key: Arg<'_>, expiry: GetEx) -> CmdResult {
+    if !check_type(conn, key, KIND, now_ms())? {
+        return Ok(Reply::Nil);
+    }
+    let value = get_string(conn, key)?;
+    let expires_at = match expiry {
+        GetEx::Keep => return Ok(value.map_or(Reply::Nil, Reply::Bulk)),
+        GetEx::Persist => None,
+        GetEx::At(ms) => Some(ms),
+    };
+    conn.execute(
+        "UPDATE keyspace SET expires_at = ?2 WHERE key = ?1",
+        params![key, expires_at],
+    )?;
+    Ok(value.map_or(Reply::Nil, Reply::Bulk))
+}
+
+/// The unit of a GETEX expiry argument.
+#[derive(Clone, Copy)]
+pub(crate) enum GetExUnit {
+    Seconds,
+    Millis,
+    UnixSeconds,
+    UnixMillis,
+}
+
+/// Converts a GETEX `EX`/`PX`/`EXAT`/`PXAT` argument to an absolute expiry.
+/// Like Redis, zero, negative and unrepresentable values are an error.
+pub(crate) fn getex_expiry(unit: GetExUnit, n: i64) -> Result<GetEx, CmdError> {
+    let invalid = || CmdError::new("ERR invalid expire time in 'getex' command");
+    if n <= 0 {
+        return Err(invalid());
+    }
+    let ms = match unit {
+        GetExUnit::Seconds | GetExUnit::UnixSeconds => n.checked_mul(1000).ok_or_else(invalid)?,
+        GetExUnit::Millis | GetExUnit::UnixMillis => n,
+    };
+    Ok(GetEx::At(match unit {
+        GetExUnit::Seconds | GetExUnit::Millis => now_ms().saturating_add(ms),
+        GetExUnit::UnixSeconds | GetExUnit::UnixMillis => ms,
+    }))
+}

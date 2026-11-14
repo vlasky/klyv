@@ -198,3 +198,114 @@ pub(crate) fn cmd_sdiff(conn: &Connection, keys: &[Arg<'_>]) -> CmdResult {
     params.extend(rest.iter().map(|k| k as &dyn rusqlite::ToSql));
     Ok(members(conn, &sql, &params)?)
 }
+
+fn out_of_range() -> CmdError {
+    CmdError::new("ERR value is out of range, must be positive")
+}
+
+/// SPOP with a count: remove and return up to `count` random members.
+pub(crate) fn cmd_spop_count(conn: &Connection, key: Arg<'_>, count: i64) -> CmdResult {
+    if count < 0 {
+        return Err(out_of_range());
+    }
+    let now = now_ms();
+    ensure_type(conn, key, KIND, now)?;
+    drop_if_expired(conn, key, now)?;
+    let picked: Vec<(i64, Vec<u8>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT rowid, member FROM set_members WHERE key = ?1 ORDER BY RANDOM() LIMIT ?2",
+        )?;
+        stmt.query_map(params![key, count], |row| {
+            Ok((row.get(0)?, bytes_col(row, 1)?))
+        })?
+        .collect::<Result<_, _>>()?
+    };
+    for (rowid, _) in &picked {
+        conn.execute("DELETE FROM set_members WHERE rowid = ?1", params![rowid])?;
+    }
+    shrink(conn, key, picked.len() as i64)?;
+    Ok(Reply::Array(
+        picked.into_iter().map(|(_, m)| m).collect(),
+        Empty::Set,
+    ))
+}
+
+/// SRANDMEMBER. Without a count: one random member, or nil. With a
+/// non-negative count: up to that many *distinct* members. With a negative
+/// count: exactly that many picks, repeats allowed (none if the set is
+/// missing). The counted forms reply with an array, not a set, because the
+/// result may contain repeats.
+pub(crate) fn cmd_srandmember(conn: &Connection, key: Arg<'_>, count: Option<i64>) -> CmdResult {
+    let live = check_type(conn, key, KIND, now_ms())?;
+    let distinct = |limit: i64| -> rusqlite::Result<Vec<Vec<u8>>> {
+        let mut stmt = conn
+            .prepare("SELECT member FROM set_members WHERE key = ?1 ORDER BY RANDOM() LIMIT ?2")?;
+        stmt.query_map(params![key, limit], |row| bytes_col(row, 0))?
+            .collect()
+    };
+    let Some(count) = count else {
+        let one = if live { distinct(1)?.pop() } else { None };
+        return Ok(one.map_or(Reply::Nil, Reply::Bulk));
+    };
+    if !live || count == 0 {
+        return Ok(Reply::Array(vec![], Empty::List));
+    }
+    if count > 0 {
+        return Ok(Reply::Array(distinct(count)?, Empty::List));
+    }
+    // Redis's own bound, which also keeps the negation below in range.
+    if count < -(i64::MAX / 2) {
+        return Err(CmdError::new("ERR value is out of range"));
+    }
+    let all = distinct(i64::MAX)?;
+    let picks: Vec<i64> = {
+        // SQLite is the only source of randomness in the binary; one query
+        // draws every index.
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1)
+             SELECT abs(random() % ?2) FROM n",
+        )?;
+        stmt.query_map(params![-count, all.len() as i64], |row| row.get(0))?
+            .collect::<Result<_, _>>()?
+    };
+    Ok(Reply::Array(
+        picks.into_iter().map(|i| all[i as usize].clone()).collect(),
+        Empty::List,
+    ))
+}
+
+/// SMOVE: move a member from one set to another. 1 if it was moved, 0 if
+/// the source does not hold it.
+pub(crate) fn cmd_smove(
+    conn: &Connection,
+    src: Arg<'_>,
+    dst: Arg<'_>,
+    member: Arg<'_>,
+) -> CmdResult {
+    let now = now_ms();
+    // A missing source is 0 before the destination is even looked at.
+    if !check_type(conn, src, KIND, now)? {
+        return Ok(Reply::Int(0));
+    }
+    ensure_type(conn, dst, KIND, now)?;
+    if src == dst {
+        return cmd_sismember(conn, src, member);
+    }
+    let removed = conn.execute(
+        "DELETE FROM set_members WHERE key = ?1 AND member = ?2",
+        params![src, member],
+    )?;
+    if removed == 0 {
+        return Ok(Reply::Int(0));
+    }
+    shrink(conn, src, 1)?;
+    drop_if_expired(conn, dst, now)?;
+    let added = conn.execute(
+        "INSERT OR IGNORE INTO set_members (key, member) VALUES (?1, ?2)",
+        params![dst, member],
+    )?;
+    // Zero only if the destination already held the member, in which case
+    // the destination exists and adding 0 to its length is harmless.
+    grow(conn, dst, KIND, added as i64)?;
+    Ok(Reply::Int(1))
+}

@@ -65,6 +65,12 @@ struct Session {
     name: Option<Vec<u8>>,
     /// RESP2 until the client asks for RESP3 with HELLO 3.
     proto: Proto,
+    /// `Some` between MULTI and EXEC/DISCARD: the commands queued so far.
+    multi: Option<Vec<Vec<Vec<u8>>>>,
+    /// A command was rejected while queueing, so EXEC must abort.
+    multi_error: bool,
+    /// Keys under WATCH, each with a fingerprint of its state when watched.
+    watched: Vec<(Vec<u8>, Option<u64>)>,
 }
 
 fn err(msg: impl Into<String>) -> CmdError {
@@ -140,16 +146,138 @@ fn linsert(c: &Connection, a: &[Arg<'_>]) -> CmdResult {
     cmd_linsert(c, a[0], place, a[2], a[3])
 }
 
-/// EXISTS key [key ...]: the number of the named keys that exist, counting
-/// a key once per mention as Redis does.
-fn exists(c: &Connection, a: &[Arg<'_>]) -> CmdResult {
-    let mut count = 0;
-    for &key in a {
-        if let Reply::Int(n) = cmd_exists(c, key)? {
-            count += n;
+/// The optional count of LPOP/RPOP/SPOP. Redis reports a count that is not
+/// a non-negative integer as out of range rather than as a bad integer.
+fn pop_count(a: &[Arg<'_>], name: &[u8]) -> Result<Option<i64>, CmdError> {
+    match a {
+        [_] => Ok(None),
+        [_, count] => crate::db::parse_int(count.as_bytes())
+            .filter(|n| *n >= 0)
+            .map(Some)
+            .ok_or_else(|| err("ERR value is out of range, must be positive")),
+        _ => Err(wrong_arity(name)),
+    }
+}
+
+/// The NX | XX | GT | LT options of EXPIRE and its relatives.
+fn expire_cond(opts: &[Arg<'_>]) -> Result<ExpireCond, CmdError> {
+    let mut cond = ExpireCond::default();
+    for &opt in opts {
+        if is(opt, "NX") {
+            cond.nx = true;
+        } else if is(opt, "XX") {
+            cond.xx = true;
+        } else if is(opt, "GT") {
+            cond.gt = true;
+        } else if is(opt, "LT") {
+            cond.lt = true;
+        } else {
+            return Err(err(format!(
+                "ERR Unsupported option {}",
+                String::from_utf8_lossy(opt.as_bytes())
+            )));
         }
     }
-    Ok(Reply::Int(count))
+    cond.validate()
+}
+
+/// GETEX key [EX s | PX ms | EXAT ts | PXAT ms | PERSIST]
+fn getex(c: &Connection, a: &[Arg<'_>]) -> CmdResult {
+    let expiry = match &a[1..] {
+        [] => GetEx::Keep,
+        [opt] if is(*opt, "PERSIST") => GetEx::Persist,
+        [opt, n] => {
+            let unit = if is(*opt, "EX") {
+                GetExUnit::Seconds
+            } else if is(*opt, "PX") {
+                GetExUnit::Millis
+            } else if is(*opt, "EXAT") {
+                GetExUnit::UnixSeconds
+            } else if is(*opt, "PXAT") {
+                GetExUnit::UnixMillis
+            } else {
+                return Err(syntax_error());
+            };
+            getex_expiry(unit, int(*n)?)?
+        }
+        _ => return Err(syntax_error()),
+    };
+    cmd_getex(c, a[0], expiry)
+}
+
+/// COPY source destination [DB index] [REPLACE]. There is one database, so
+/// only index 0 is accepted.
+fn copy(c: &Connection, a: &[Arg<'_>]) -> CmdResult {
+    let mut replace = false;
+    let mut opts = a[2..].iter().copied();
+    while let Some(opt) = opts.next() {
+        if is(opt, "REPLACE") {
+            replace = true;
+        } else if is(opt, "DB") {
+            if int(opts.next().ok_or_else(syntax_error)?)? != 0 {
+                return Err(err("ERR DB index is out of range"));
+            }
+        } else {
+            return Err(syntax_error());
+        }
+    }
+    cmd_copy(c, a[0], a[1], replace)
+}
+
+/// A SCAN cursor: an unsigned decimal. Anything else is Redis's "invalid
+/// cursor"; a value beyond any rowid simply finds nothing.
+fn cursor(a: Arg<'_>) -> Result<i64, CmdError> {
+    std::str::from_utf8(a.as_bytes())
+        .ok()
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+        .ok_or_else(|| err("ERR invalid cursor"))
+}
+
+/// The options of the SCAN family: MATCH pattern, COUNT n, and where the
+/// command has them, TYPE name (SCAN) and NOVALUES (HSCAN).
+struct ScanOpts<'a> {
+    pattern: Option<Arg<'a>>,
+    count: i64,
+    kind: Option<Arg<'a>>,
+    values: bool,
+}
+
+fn scan_opts<'a>(opts: &[Arg<'a>], scan: bool, hash: bool) -> Result<ScanOpts<'a>, CmdError> {
+    let mut parsed = ScanOpts {
+        pattern: None,
+        count: 10,
+        kind: None,
+        values: true,
+    };
+    let mut opts = opts.iter().copied();
+    while let Some(opt) = opts.next() {
+        if is(opt, "MATCH") {
+            parsed.pattern = Some(opts.next().ok_or_else(syntax_error)?);
+        } else if is(opt, "COUNT") {
+            parsed.count = int(opts.next().ok_or_else(syntax_error)?)?;
+            if parsed.count < 1 {
+                return Err(syntax_error());
+            }
+        } else if scan && is(opt, "TYPE") {
+            parsed.kind = Some(opts.next().ok_or_else(syntax_error)?);
+        } else if is(opt, "NOVALUES") {
+            if !hash {
+                return Err(err("ERR NOVALUES option can only be used in HSCAN"));
+            }
+            parsed.values = false;
+        } else {
+            return Err(syntax_error());
+        }
+    }
+    Ok(parsed)
+}
+
+fn scan_within(c: &Connection, kind: &'static str, a: &[Arg<'_>]) -> CmdResult {
+    let at = cursor(a[1])?;
+    let opts = scan_opts(&a[2..], false, kind == "hash")?;
+    cmd_scan_within(c, kind, a[0], at, opts.pattern, opts.count, opts.values)
 }
 
 type Handler = fn(&Connection, &[Arg<'_>]) -> CmdResult;
@@ -243,6 +371,15 @@ const DATA_COMMANDS: &[&str] = &[
     "DBSIZE",
     "FLUSHALL",
     "FLUSHDB",
+    "GETSET",
+    "GETEX",
+    "SRANDMEMBER",
+    "SMOVE",
+    "SSCAN",
+    "HMGET",
+    "HSCAN",
+    "COPY",
+    "SCAN",
 ];
 
 /// The data command table, keyed by upper-cased name.
@@ -257,6 +394,8 @@ fn lookup(name: &[u8]) -> Option<Spec> {
         b"PSETEX" => w(4, |c, a| set_with_ttl(c, a, 1, "psetex")),
         b"GET" => r(2, |c, a| cmd_get(c, a[0])),
         b"GETDEL" => w(2, |c, a| cmd_getdel(c, a[0])),
+        b"GETSET" => w(3, |c, a| cmd_getset(c, a[0], a[1])),
+        b"GETEX" => w(-2, getex),
         b"DEL" | b"UNLINK" => w(-2, cmd_del),
         b"INCR" => w(2, |c, a| cmd_incrby(c, a[0], 1)),
         b"DECR" => w(2, |c, a| cmd_incrby(c, a[0], -1)),
@@ -274,8 +413,14 @@ fn lookup(name: &[u8]) -> Option<Spec> {
 
         b"LPUSH" => w(-3, |c, a| cmd_lpush(c, a[0], &a[1..])),
         b"RPUSH" => w(-3, |c, a| cmd_rpush(c, a[0], &a[1..])),
-        b"LPOP" => w(2, |c, a| cmd_pop(c, a[0], "ASC")),
-        b"RPOP" => w(2, |c, a| cmd_pop(c, a[0], "DESC")),
+        b"LPOP" => w(-2, |c, a| match pop_count(a, b"LPOP")? {
+            None => cmd_pop(c, a[0], "ASC"),
+            Some(n) => cmd_pop_count(c, a[0], "ASC", n),
+        }),
+        b"RPOP" => w(-2, |c, a| match pop_count(a, b"RPOP")? {
+            None => cmd_pop(c, a[0], "DESC"),
+            Some(n) => cmd_pop_count(c, a[0], "DESC", n),
+        }),
         b"LRANGE" => r(4, |c, a| cmd_lrange(c, a[0], int(a[1])?, int(a[2])?)),
         b"LLEN" => r(2, |c, a| cmd_llen(c, a[0])),
         b"LREM" => w(4, |c, a| cmd_lrem(c, a[0], int(a[1])?, a[2])),
@@ -290,7 +435,17 @@ fn lookup(name: &[u8]) -> Option<Spec> {
         b"SMEMBERS" => r(2, |c, a| cmd_smembers(c, a[0])),
         b"SISMEMBER" => r(3, |c, a| cmd_sismember(c, a[0], a[1])),
         b"SCARD" => r(2, |c, a| cmd_scard(c, a[0])),
-        b"SPOP" => w(2, |c, a| cmd_spop(c, a[0])),
+        b"SPOP" => w(-2, |c, a| match pop_count(a, b"SPOP")? {
+            None => cmd_spop(c, a[0]),
+            Some(n) => cmd_spop_count(c, a[0], n),
+        }),
+        b"SRANDMEMBER" => r(-2, |c, a| match a {
+            [key] => cmd_srandmember(c, *key, None),
+            [key, count] => cmd_srandmember(c, *key, Some(int(*count)?)),
+            _ => Err(wrong_arity(b"SRANDMEMBER")),
+        }),
+        b"SMOVE" => w(4, |c, a| cmd_smove(c, a[0], a[1], a[2])),
+        b"SSCAN" => r(-3, |c, a| scan_within(c, "set", a)),
         b"SUNION" => r(-2, cmd_sunion),
         b"SINTER" => r(-2, cmd_sinter),
         b"SDIFF" => r(-2, cmd_sdiff),
@@ -308,11 +463,21 @@ fn lookup(name: &[u8]) -> Option<Spec> {
         b"HKEYS" => r(2, |c, a| cmd_hkeys(c, a[0])),
         b"HVALS" => r(2, |c, a| cmd_hvals(c, a[0])),
         b"HLEN" => r(2, |c, a| cmd_hlen(c, a[0])),
+        b"HMGET" => r(-3, |c, a| cmd_hmget(c, a[0], &a[1..])),
+        b"HSCAN" => r(-3, |c, a| scan_within(c, "hash", a)),
 
-        b"EXPIRE" => w(3, |c, a| cmd_expire(c, a[0], int(a[1])?)),
-        b"PEXPIRE" => w(3, |c, a| cmd_pexpire(c, a[0], int(a[1])?)),
-        b"EXPIREAT" => w(3, |c, a| cmd_expireat(c, a[0], int(a[1])?)),
-        b"PEXPIREAT" => w(3, |c, a| cmd_pexpireat(c, a[0], int(a[1])?)),
+        b"EXPIRE" => w(-3, |c, a| {
+            cmd_expire(c, a[0], int(a[1])?, expire_cond(&a[2..])?)
+        }),
+        b"PEXPIRE" => w(-3, |c, a| {
+            cmd_pexpire(c, a[0], int(a[1])?, expire_cond(&a[2..])?)
+        }),
+        b"EXPIREAT" => w(-3, |c, a| {
+            cmd_expireat(c, a[0], int(a[1])?, expire_cond(&a[2..])?)
+        }),
+        b"PEXPIREAT" => w(-3, |c, a| {
+            cmd_pexpireat(c, a[0], int(a[1])?, expire_cond(&a[2..])?)
+        }),
         b"TTL" => r(2, |c, a| cmd_ttl(c, a[0])),
         b"PTTL" => r(2, |c, a| cmd_pttl(c, a[0])),
         b"PERSIST" => w(2, |c, a| cmd_persist(c, a[0])),
@@ -320,7 +485,13 @@ fn lookup(name: &[u8]) -> Option<Spec> {
         b"PURGE" => w(1, |c, _| cmd_purge(c)),
 
         b"KEYS" => r(2, |c, a| cmd_keys(c, Some(a[0]))),
-        b"EXISTS" => r(-2, exists),
+        b"EXISTS" => r(-2, cmd_exists_many),
+        b"COPY" => w(-3, copy),
+        b"SCAN" => r(-2, |c, a| {
+            let at = cursor(a[0])?;
+            let opts = scan_opts(&a[1..], true, false)?;
+            cmd_scan(c, at, opts.pattern, opts.count, opts.kind)
+        }),
         b"TYPE" => r(2, |c, a| cmd_type(c, a[0])),
         b"RENAME" => w(3, |c, a| cmd_rename(c, a[0], a[1])),
         b"DBSIZE" => r(1, |c, _| cmd_dbsize(c)),
@@ -463,6 +634,21 @@ enum Outcome {
     Close(CmdResult),
 }
 
+/// Arity check for a connection command: `None` if `name` is not one.
+fn connection_arity(name: &[u8], argc: usize) -> Option<Result<(), CmdError>> {
+    let arity = match name {
+        b"ECHO" | b"SELECT" => 2,
+        b"CLIENT" | b"CONFIG" | b"AUTH" => -2,
+        b"PING" | b"QUIT" | b"HELLO" | b"COMMAND" | b"INFO" => -1,
+        _ => return None,
+    };
+    Some(if !arity_ok(arity, argc) || (name == b"PING" && argc > 2) {
+        Err(wrong_arity(name))
+    } else {
+        Ok(())
+    })
+}
+
 /// Commands about the connection rather than the data. `None` means the
 /// command is not one of these.
 fn connection_command(
@@ -472,18 +658,8 @@ fn connection_command(
     name: &[u8],
     args: &[Arg<'_>],
 ) -> Option<Outcome> {
-    let argc = args.len() + 1;
-    let arity = match name {
-        b"PING" | b"ECHO" | b"QUIT" | b"SELECT" | b"HELLO" | b"CLIENT" | b"COMMAND" | b"CONFIG"
-        | b"INFO" | b"AUTH" => match name {
-            b"ECHO" | b"SELECT" => 2,
-            b"CLIENT" | b"CONFIG" | b"AUTH" => -2,
-            _ => -1,
-        },
-        _ => return None,
-    };
-    if !arity_ok(arity, argc) || (name == b"PING" && argc > 2) {
-        return Some(Outcome::Reply(Err(wrong_arity(name))));
+    if let Err(e) = connection_arity(name, args.len() + 1)? {
+        return Some(Outcome::Reply(Err(e)));
     }
     let result = match name {
         b"PING" => Ok(match args.first() {
@@ -547,6 +723,181 @@ fn data_command(
     Ok(reply)
 }
 
+/// A fingerprint of a key's whole state (type, expiry and contents), or
+/// `None` if it does not exist. WATCH records one and EXEC compares.
+///
+/// Redis aborts a transaction if a watched key was *touched*; this aborts if
+/// it *differs*. The two disagree only when a key is changed and changed
+/// back in between, which no check-and-set logic can be hurt by, and
+/// comparing state works across processes: the CLI or another server
+/// writing to the same file is noticed too, with nothing extra stored.
+fn fingerprint(conn: &Connection, key: Arg<'_>, now: i64) -> rusqlite::Result<Option<u64>> {
+    use std::hash::{Hash, Hasher};
+    let Some(row) = crate::db::lookup(conn, key)?.filter(|r| r.is_live(now)) else {
+        return Ok(None);
+    };
+    // Canonical row orders, so equal contents always hash equally.
+    let sql = match row.kind {
+        "string" => "SELECT value FROM strings WHERE key = ?1",
+        "list" => "SELECT value FROM list_items WHERE key = ?1 ORDER BY idx, rowid",
+        "set" => "SELECT member FROM set_members WHERE key = ?1 ORDER BY member",
+        _ => "SELECT field, value FROM hash_fields WHERE key = ?1 ORDER BY field",
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    row.kind.hash(&mut hasher);
+    row.expires_at.hash(&mut hasher);
+    let mut stmt = conn.prepare(sql)?;
+    let columns = stmt.column_count();
+    let mut rows = stmt.query([key])?;
+    while let Some(r) = rows.next()? {
+        for i in 0..columns {
+            // Length-prefixed (slices hash their length), so ("ab", "c")
+            // and ("a", "bc") differ.
+            crate::db::bytes_col(r, i)?.hash(&mut hasher);
+        }
+    }
+    Ok(Some(hasher.finish()))
+}
+
+/// WATCH key [key ...]
+fn watch(conn: &mut Connection, session: &mut Session, keys: &[Arg<'_>]) -> CmdResult {
+    // One snapshot for all the keys.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let now = crate::db::now_ms();
+    for key in keys {
+        let state = fingerprint(&tx, *key, now)?;
+        session.watched.push((key.as_bytes().to_vec(), state));
+    }
+    tx.commit()?;
+    Ok(Reply::Simple("OK"))
+}
+
+/// Checks a command when it is queued inside MULTI, so that an unknown
+/// command or a wrong argument count is reported at once (and aborts the
+/// EXEC), as in Redis. Errors that depend on the data surface at EXEC.
+fn check_queueable(name: &[u8], raw: &[Vec<u8>]) -> Result<(), CmdError> {
+    if name == b"UNWATCH" {
+        return if raw.len() == 1 {
+            Ok(())
+        } else {
+            Err(wrong_arity(name))
+        };
+    }
+    if let Some(checked) = connection_arity(name, raw.len()) {
+        return checked;
+    }
+    let spec = lookup(name).ok_or_else(|| unknown_command(raw))?;
+    if !arity_ok(spec.arity, raw.len()) {
+        return Err(wrong_arity(name));
+    }
+    Ok(())
+}
+
+/// EXEC: run the queued commands as one atomic unit.
+///
+/// The whole queue runs inside a single SQLite write transaction, so no
+/// other connection or process sees it half done. Within it each command
+/// gets a savepoint: Redis does not roll a transaction back when one command
+/// fails, so a failing command is undone alone, its error takes its place in
+/// the reply, and the rest still run.
+fn exec(conn: &mut Connection, session: &mut Session, shared: &Shared) -> CmdResult {
+    let Some(queue) = session.multi.take() else {
+        return Err(err("ERR EXEC without MULTI"));
+    };
+    let watched = std::mem::take(&mut session.watched);
+    if std::mem::take(&mut session.multi_error) {
+        return Err(err(
+            "EXECABORT Transaction discarded because of previous errors.",
+        ));
+    }
+    let mut tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let now = crate::db::now_ms();
+    for (key, state) in &watched {
+        if fingerprint(&tx, Arg(key), now)? != *state {
+            return Ok(Reply::NullArray);
+        }
+    }
+    let mut replies = Vec::with_capacity(queue.len());
+    for raw in &queue {
+        let name = raw[0].to_ascii_uppercase();
+        let args: Vec<Arg<'_>> = raw[1..].iter().map(|a| Arg(a)).collect();
+        let result = if name == b"UNWATCH" {
+            Ok(Reply::Simple("OK"))
+        } else if let Some(outcome) = connection_command(&tx, session, shared, &name, &args) {
+            match outcome {
+                Outcome::Reply(result) | Outcome::Close(result) => result,
+            }
+        } else {
+            // Queueing verified that the command exists and its arity.
+            let spec = lookup(&name).ok_or_else(|| unknown_command(raw))?;
+            let savepoint = tx.savepoint()?;
+            match (spec.run)(&savepoint, &args) {
+                Ok(reply) => savepoint.commit().map(|()| reply).map_err(CmdError::from),
+                // Dropping the savepoint rolls back this command alone.
+                Err(e) => Err(e),
+            }
+        };
+        replies.push(result.unwrap_or_else(|CmdError(msg)| Reply::Error(msg)));
+    }
+    tx.commit()?;
+    Ok(Reply::Lines(replies))
+}
+
+/// MULTI, EXEC, DISCARD and WATCH, and the queueing of everything else while
+/// a MULTI is open. `None` means the command should run normally.
+fn transaction_command(
+    conn: &mut Connection,
+    session: &mut Session,
+    shared: &Shared,
+    name: &[u8],
+    raw: &[Vec<u8>],
+    args: &[Arg<'_>],
+) -> Option<CmdResult> {
+    // Arity first: `MULTI x` must not open a transaction on its way to
+    // being rejected.
+    if matches!(name, b"MULTI" | b"EXEC" | b"DISCARD") && !args.is_empty() {
+        return Some(Err(wrong_arity(name)));
+    }
+    Some(match name {
+        b"MULTI" if session.multi.is_some() => Err(err("ERR MULTI calls can not be nested")),
+        b"MULTI" => {
+            session.multi = Some(Vec::new());
+            session.multi_error = false;
+            Ok(Reply::Simple("OK"))
+        }
+        b"EXEC" => exec(conn, session, shared),
+        b"DISCARD" if session.multi.take().is_some() => {
+            session.multi_error = false;
+            session.watched.clear();
+            Ok(Reply::Simple("OK"))
+        }
+        b"DISCARD" => Err(err("ERR DISCARD without MULTI")),
+        b"WATCH" if session.multi.is_some() => Err(err("ERR WATCH inside MULTI is not allowed")),
+        b"WATCH" if args.is_empty() => Err(wrong_arity(name)),
+        b"WATCH" => watch(conn, session, args),
+        // QUIT ends the connection whether or not a MULTI is open.
+        b"QUIT" => return None,
+        _ => match &mut session.multi {
+            Some(queue) => match check_queueable(name, raw) {
+                Ok(()) => {
+                    queue.push(raw.to_vec());
+                    Ok(Reply::Simple("QUEUED"))
+                }
+                Err(e) => {
+                    session.multi_error = true;
+                    Err(e)
+                }
+            },
+            None if name == b"UNWATCH" && !args.is_empty() => Err(wrong_arity(name)),
+            None if name == b"UNWATCH" => {
+                session.watched.clear();
+                Ok(Reply::Simple("OK"))
+            }
+            None => return None,
+        },
+    })
+}
+
 /// Executes one client command and appends its encoded reply to `out`.
 /// Returns true if the connection should then be closed.
 fn execute(
@@ -558,11 +909,16 @@ fn execute(
 ) -> bool {
     let name = raw[0].to_ascii_uppercase();
     let args: Vec<Arg<'_>> = raw[1..].iter().map(|a| Arg(a)).collect();
-    let (result, close) = match connection_command(conn, session, shared, &name, &args) {
-        Some(Outcome::Reply(result)) => (result, false),
-        Some(Outcome::Close(result)) => (result, true),
-        None => (data_command(conn, &name, raw, &args), false),
-    };
+    let (result, close) =
+        if let Some(result) = transaction_command(conn, session, shared, &name, raw, &args) {
+            (result, false)
+        } else {
+            match connection_command(conn, session, shared, &name, &args) {
+                Some(Outcome::Reply(result)) => (result, false),
+                Some(Outcome::Close(result)) => (result, true),
+                None => (data_command(conn, &name, raw, &args), false),
+            }
+        };
     match result {
         Ok(reply) => encode(&reply, session.proto, out),
         Err(CmdError(msg)) => encode_error(&msg, out),
@@ -621,6 +977,9 @@ fn serve_connection(reader: impl Read, writer: impl Write, shared: &Shared, admi
         id: shared.next_id.fetch_add(1, Ordering::Relaxed),
         name: None,
         proto: Proto::Resp2,
+        multi: None,
+        multi_error: false,
+        watched: Vec::new(),
     };
     let mut out = Vec::new();
     loop {

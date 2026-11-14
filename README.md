@@ -106,7 +106,9 @@ r.set("lock", "1", nx=True, ex=30)
 ```
 
 - **Protocols:** RESP2 and RESP3 (negotiated with `HELLO`), pipelining, and inline commands.
-- **Commands:** everything the CLI offers, under its Redis name, plus a few aliases: `SET` (`NX`, `XX`, `EX`, `PX`, `KEEPTTL`), `SETNX`, `SETEX`, `PSETEX`, `GET`, `GETDEL`, `DEL`, `UNLINK`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `STRLEN`, `MSET`, `MGET`, `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LREM`, `LPOS`, `LINDEX`, `LSET`, `LTRIM`, `LINSERT`, `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SPOP`, `SUNION`, `SINTER`, `SDIFF`, `HSET`, `HMSET`, `HGET`, `HEXISTS`, `HINCRBY`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `KEYS`, `EXISTS` (multiple keys), `TYPE`, `RENAME`, `DBSIZE`, `FLUSHALL`, `FLUSHDB`. `PURGE` is klyv's own. Replies match Redis's types and error messages; this is checked against a real Redis server in the test suite.
+- **Commands:** everything the CLI offers, under its Redis name, plus a few aliases: `SET` (`NX`, `XX`, `EX`, `PX`, `KEEPTTL`), `SETNX`, `SETEX`, `PSETEX`, `GET`, `GETDEL`, `GETSET`, `GETEX`, `DEL`, `UNLINK`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `STRLEN`, `MSET`, `MGET`, `LPUSH`, `RPUSH`, `LPOP`/`RPOP` (with optional count), `LRANGE`, `LLEN`, `LREM`, `LPOS`, `LINDEX`, `LSET`, `LTRIM`, `LINSERT`, `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SPOP` (with optional count), `SRANDMEMBER`, `SMOVE`, `SUNION`, `SINTER`, `SDIFF`, `HSET`, `HMSET`, `HGET`, `HMGET`, `HEXISTS`, `HINCRBY`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT` (`NX`, `XX`, `GT`, `LT`), `TTL`, `PTTL`, `PERSIST`, `KEYS`, `SCAN`, `HSCAN`, `SSCAN`, `EXISTS` (multiple keys), `TYPE`, `RENAME`, `COPY`, `DBSIZE`, `FLUSHALL`, `FLUSHDB`. `PURGE` is klyv's own. Replies match Redis's types and error messages; this is checked against a real Redis server in the test suite.
+- **Transactions:** `MULTI`, `EXEC`, `DISCARD`, `WATCH` and `UNWATCH`. A transaction runs as one atomic unit that no other connection or process sees half done; as in Redis, a command that fails inside it reports its error in place and the others still apply. `WATCH` notices changes made by any client of the file, including the CLI.
+- **Iteration:** `SCAN`, `HSCAN` and `SSCAN` with `MATCH`, `COUNT`, `TYPE` and `NOVALUES`. A key that exists throughout an iteration is returned exactly once.
 - **Connection commands** that clients send while connecting are answered: `PING`, `ECHO`, `QUIT`, `SELECT 0`, `HELLO`, `CLIENT SETNAME/GETNAME/ID/SETINFO`, `COMMAND`, `CONFIG GET`, `INFO`.
 - **Binary safe:** keys, fields and values may be any bytes.
 - **Same file, live:** the CLI can read and write the database while the server is running, and several servers can serve one file. Each command is one SQLite transaction either way.
@@ -115,7 +117,7 @@ r.set("lock", "1", nx=True, ex=30)
 
 There is **no authentication and no TLS**. The default bind address is loopback only; klyv prints a warning if you bind anything else. Put it behind a Unix socket with restrictive permissions, or a trusted network, never the open internet.
 
-It is a durable store with Redis's interface, not a replacement for Redis's speed: every write is an SQLite commit. As a rough guide, a laptop serves about 100,000 `GET`s and 20,000 `SET`s per second across 20 connections. Not implemented: `SCAN`, `MULTI`/`EXEC`, pub/sub, sorted sets, streams, scripting, blocking commands, and count/option arguments beyond those listed.
+It is a durable store with Redis's interface, not a replacement for Redis's speed: every write is an SQLite commit. As a rough guide, a laptop serves about 100,000 `GET`s and 20,000 `SET`s per second across 20 connections. Not implemented: pub/sub, sorted sets, streams, scripting, blocking commands (`BLPOP`), and `INCRBYFLOAT`.
 
 ### Output formats
 
@@ -142,6 +144,8 @@ klyv --format json get missing
 | `set <key> <value> [--nx] [--ex <s> \| --px <ms> \| --keep-ttl]` | Store a value (only-if-missing, with TTL, or keeping the existing TTL) |
 | `get <key>` | Retrieve a value |
 | `get-del <key>` | Retrieve a value and delete the key atomically |
+| `get-set <key> <value>` | Store a new value and return the old one |
+| `get-ex <key> [--ex <s> \| --px <ms> \| --exat <ts> \| --pxat <ms-ts> \| --persist]` | Retrieve a value and set, change or remove its expiry |
 | `del <key> [key ...]` | Delete keys (any type) |
 | `incr <key>` | Increment by 1 |
 | `decr <key>` | Decrement by 1 |
@@ -158,8 +162,8 @@ klyv --format json get missing
 |---------|-------------|
 | `l-push <key> <val> [...]` | Push to head |
 | `r-push <key> <val> [...]` | Push to tail |
-| `l-pop <key>` | Pop from head |
-| `r-pop <key>` | Pop from tail |
+| `l-pop <key> [count]` | Pop from head (with a count: up to that many) |
+| `r-pop <key> [count]` | Pop from tail (with a count: up to that many) |
 | `l-range <key> <start> <stop>` | Slice (0-based, negatives supported) |
 | `l-len <key>` | List length |
 | `l-rem <key> <count> <value>` | Remove occurrences |
@@ -178,7 +182,10 @@ klyv --format json get missing
 | `s-members <key>` | List all members |
 | `s-is-member <key> <m>` | Test membership (1/0) |
 | `s-card <key>` | Count members |
-| `s-pop <key>` | Remove and return a random member |
+| `s-pop <key> [count]` | Remove and return a random member (or up to `count`) |
+| `s-rand-member <key> [count]` | Random member without removing it (`count` > 0: distinct; < 0: repeats allowed) |
+| `s-move <src> <dst> <m>` | Move a member between sets (1/0) |
+| `s-scan <key> [cursor] [--match <p>] [--count <n>]` | Iterate members a page at a time |
 | `s-union <k> [...]` | Union of sets |
 | `s-inter <k> [...]` | Intersection |
 | `s-diff <k> [...]` | Difference |
@@ -190,6 +197,8 @@ klyv --format json get missing
 | `h-set <key> <f v> [...]` | Set field-value pairs |
 | `h-get <key> <field>` | Get field value |
 | `h-exists <key> <field>` | Test field existence (1/0) |
+| `h-m-get <key> <f> [...]` | Get several fields' values |
+| `h-scan <key> [cursor] [--match <p>] [--count <n>] [--no-values]` | Iterate fields a page at a time |
 | `h-incr-by <key> <field> <n>` | Increment integer field by N |
 | `h-del <key> <f> [...]` | Delete fields |
 | `h-get-all <key>` | All fields and values |
@@ -201,7 +210,7 @@ klyv --format json get missing
 
 | Command | Description |
 |---------|-------------|
-| `expire <key> <seconds>` | Set TTL in seconds |
+| `expire <key> <seconds> [--nx \| --xx] [--gt \| --lt]` | Set TTL in seconds; the conditions also apply to the three commands below |
 | `p-expire <key> <ms>` | Set TTL in milliseconds |
 | `expire-at <key> <ts>` | Set expiry at Unix timestamp (seconds) |
 | `p-expire-at <key> <ms-ts>` | Set expiry at Unix timestamp (milliseconds) |
@@ -215,7 +224,9 @@ klyv --format json get missing
 | Command | Description |
 |---------|-------------|
 | `keys [pattern]` | List keys (Redis glob: `*`, `?`, `[abc]`, `[^a]`, `[a-z]`, `\` escapes; matched exactly as Redis does) |
-| `exists <key>` | Test existence (1/0) |
+| `exists <key> [key ...]` | Count how many of the keys exist |
+| `copy <src> <dst> [--replace]` | Copy a value and its TTL to another key (1/0) |
+| `scan [cursor] [--match <p>] [--count <n>] [--type <t>]` | Iterate keys a page at a time (cursor 0 starts; 0 returned means done) |
 | `type <key>` | string / list / set / hash / none |
 | `rename <key> <newkey>` | Rename key |
 | `db-size` | Live key count |
@@ -234,7 +245,7 @@ klyv --format json get missing
 
 1. Every write persists to disk immediately (no in-memory mode)
 2. Expired keys require explicit `purge` to reclaim space
-3. No pub/sub, transactions (MULTI/EXEC), or Lua scripting
+3. No pub/sub or Lua scripting; transactions (`MULTI`/`EXEC`/`WATCH`) are available through the server
 4. Four data types (strings, lists, sets, hashes); no sorted sets or streams
 5. The server has no authentication or TLS (see [Server mode](#server-mode))
 
