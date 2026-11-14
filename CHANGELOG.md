@@ -8,6 +8,9 @@
 - **`SCAN`, `HSCAN`, `SSCAN`** (CLI: `scan`, `h-scan`, `s-scan`) with `MATCH`, `COUNT`, `TYPE` and `NOVALUES`. A key that exists throughout an iteration is returned exactly once, whatever is created, deleted or rewritten meanwhile.
 - **Counts and options:** `LPOP`/`RPOP`/`SPOP` with a count, `SRANDMEMBER`, and the `NX`/`XX`/`GT`/`LT` conditions on `EXPIRE`, `PEXPIRE`, `EXPIREAT` and `PEXPIREAT` (CLI: `l-pop k 3`, `s-rand-member`, `expire k 60 --gt`).
 - **New commands:** `GETSET`, `GETEX`, `HMGET`, `SMOVE`, `COPY` (CLI: `get-set`, `get-ex`, `h-m-get`, `s-move`, `copy`), and `exists` now takes several keys in the CLI as it already did in the server.
+- **Password authentication for the server:** `--requirepass` or the `KLYV_REQUIREPASS` environment variable, behaving as Redis's `requirepass`. Clients authenticate with `AUTH` or `HELLO ... AUTH`; until they do, every other command is refused with `NOAUTH`. There is still no TLS.
+- **The server raises its open-file limit on start.** Each client needs four file descriptors, so the default limit on macOS (256) allowed only about 56 clients. If the system's hard limit is still too low for `--maxclients`, the client limit is reduced to fit, with a notice.
+- `HELLO ... SETNAME` now sets the connection name (it was accepted and ignored).
 - `INCRBYFLOAT` is deliberately not implemented: Redis formats its result from a C `long double`, which differs between platforms, so the replies cannot be matched reproducibly.
 
 ### Changed
