@@ -376,7 +376,10 @@ pub(crate) fn run(conn: &Connection, cmd: Command) -> CmdResult {
             keep_ttl,
         } => {
             let ttl_ms = match (ex, px) {
-                (Some(s), _) => Some(s.saturating_mul(1000)),
+                (Some(s), _) => Some(
+                    s.checked_mul(1000)
+                        .ok_or_else(|| CmdError::new("ERR invalid expire time in 'set' command"))?,
+                ),
                 (None, Some(ms)) => Some(ms),
                 (None, None) => None,
             };
