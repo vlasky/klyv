@@ -224,7 +224,7 @@ klyv --format json get missing
 ## Architecture
 
 - **SQLite WAL mode** for concurrent readers and safe writes; `busy_timeout` plus `BEGIN IMMEDIATE` transactions keep read-modify-write commands atomic across processes
-- **Fractional indexing** for O(1) list push (no reindexing)
+- **Fractional indexing** for list push without reindexing, and **stored lengths**, so `l-len`, `s-card`, `h-len` and pushes do not count rows; positional list reads walk from the nearer end
 - **Lazy expiry** — expired keys are hidden from reads, treated as absent on write, and stay on disk until `purge`
 - **Schema versioning** — the file records its schema version; a database written by klyv 0.2.0 is migrated in place on first open
 - **A key catalogue plus one payload table per data type**; a key holds one type at a time (mismatched commands fail with `WRONGTYPE`, Redis-style)
