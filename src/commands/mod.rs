@@ -71,9 +71,9 @@ mod binary_tests {
         let mut both = BIN_VAL.to_vec();
         both.extend_from_slice(BIN_VAL2);
         assert_eq!(bulk(cmd_get(&c, k)), Some(both));
-        assert_eq!(int(cmd_exists(&c, k)), 1);
+        assert_eq!(int(cmd_exists_many(&c, &[k])), 1);
         assert_eq!(int(cmd_del(&c, &[k])), 1);
-        assert_eq!(int(cmd_exists(&c, k)), 0);
+        assert_eq!(int(cmd_exists_many(&c, &[k])), 0);
     }
 
     // A value that stops or starts being valid UTF-8 changes storage class
@@ -131,13 +131,13 @@ mod binary_tests {
             .ok()
             .unwrap();
         assert!(cmd_rename(&c, k, k2).is_ok());
-        assert_eq!(int(cmd_exists(&c, k)), 0);
+        assert_eq!(int(cmd_exists_many(&c, &[k])), 0);
         assert_eq!(int(cmd_llen(&c, k2)), 2);
-        assert_eq!(int(cmd_expire(&c, k2, 100)), 1);
+        assert_eq!(int(cmd_expire(&c, k2, 100, ExpireCond::default())), 1);
         assert_eq!(int(cmd_ttl(&c, k2)), 100);
         assert_eq!(int(cmd_persist(&c, k2)), 1);
-        assert_eq!(int(cmd_pexpireat(&c, k2, 1)), 1);
-        assert_eq!(int(cmd_exists(&c, k2)), 0);
+        assert_eq!(int(cmd_pexpireat(&c, k2, 1, ExpireCond::default())), 1);
+        assert_eq!(int(cmd_exists_many(&c, &[k2])), 0);
         assert_eq!(int(cmd_purge(&c)), 1);
         assert_eq!(int(cmd_dbsize(&c)), 0);
     }

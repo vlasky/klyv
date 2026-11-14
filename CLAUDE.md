@@ -21,6 +21,9 @@ set <key> <value> [--nx] [--ex <s> | --px <ms> | --keep-ttl]
                               plain SET discards any TTL like Redis, --keep-ttl retains it)
 get <key>                     Retrieve a value (prints "(nil)" if missing)
 get-del <key>                 Retrieve a value and delete the key atomically
+get-set <key> <value>         Store a new value, return the old one (discards TTL)
+get-ex <key> [--ex <s> | --px <ms> | --exat <ts> | --pxat <ms-ts> | --persist]
+                              Retrieve a value and set, change or remove its expiry
 del <key> [key ...]           Delete keys (any type), returns number of keys deleted
 incr <key>                    Increment by 1 (inits to 0 if missing)
 decr <key>                    Decrement by 1
@@ -36,8 +39,8 @@ m-get <k1> [k2 ...]          Get multiple values
 ```
 l-push <key> <val> [val ...]  Push to head
 r-push <key> <val> [val ...]  Push to tail
-l-pop <key>                   Pop from head
-r-pop <key>                   Pop from tail
+l-pop <key> [count]           Pop from head (count: up to that many, as a list; nil if missing)
+r-pop <key> [count]           Pop from tail
 l-range <key> <start> <stop>  Slice (0-based, negatives from end, inclusive)
 l-len <key>                   List length
 l-rem <key> <count> <value>   Remove occurrences (0=all, +N=head, -N=tail)
@@ -56,7 +59,10 @@ s-rem <key> <m> [m ...]       Remove members
 s-members <key>               List all members
 s-is-member <key> <member>    Test membership (1/0)
 s-card <key>                  Count members
-s-pop <key>                   Remove and return a random member
+s-pop <key> [count]           Remove and return a random member (or up to count)
+s-rand-member <key> [count]   Random member, not removed (count > 0 distinct, < 0 with repeats)
+s-move <src> <dst> <member>   Move a member between sets (1/0)
+s-scan <key> [cursor] [--match <p>] [--count <n>]   Iterate members
 s-union <k1> [k2 ...]         Union of sets
 s-inter <k1> [k2 ...]         Intersection of sets
 s-diff <k1> [k2 ...]          Members in first set not in others
@@ -67,6 +73,8 @@ s-diff <k1> [k2 ...]          Members in first set not in others
 h-set <key> <f1> <v1> [f2 v2 ...]  Set field-value pairs
 h-get <key> <field>                 Get field value
 h-exists <key> <field>              Test field existence (1/0)
+h-m-get <key> <f1> [f2 ...]         Get several fields' values
+h-scan <key> [cursor] [--match <p>] [--count <n>] [--no-values]   Iterate fields
 h-incr-by <key> <field> <n>         Increment integer field by N
 h-del <key> <f1> [f2 ...]          Delete fields
 h-get-all <key>                     All fields and values
@@ -81,6 +89,7 @@ expire <key> <seconds>          Set TTL in seconds
 p-expire <key> <milliseconds>   Set TTL in milliseconds
 expire-at <key> <timestamp>     Set expiry at Unix timestamp (seconds)
 p-expire-at <key> <ms-ts>       Set expiry at Unix timestamp (milliseconds)
+                                (all four accept --nx | --xx | --gt | --lt conditions)
 ttl <key>                       Remaining seconds, rounded to nearest (-1=no expiry, -2=missing/expired)
 p-ttl <key>                     Remaining milliseconds (-1=no expiry, -2=missing/expired)
 persist <key>                   Remove expiry
@@ -93,7 +102,10 @@ Expired keys are hidden from reads (lazy expiry) but remain on disk until `purge
 ```
 keys [pattern]          List keys (Redis glob: * ? [abc] [^a] [a-z], \ escapes; case-sensitive;
                         a port of Redis's matcher, so malformed patterns behave identically)
-exists <key>            Test existence (1/0, respects expiry)
+exists <key> [key ...]  Count how many of the keys exist (respects expiry)
+copy <src> <dst> [--replace]   Copy a value and its TTL (1/0)
+scan [cursor] [--match <p>] [--count <n>] [--type <t>]
+                        Iterate keys a page at a time (0 starts; 0 returned = done)
 type <key>              string | list | set | hash | none
 rename <key> <newkey>   Rename (overwrites target, preserves TTL)
 db-size                 Live key count (expired keys excluded)
@@ -169,7 +181,9 @@ Things worth knowing before changing it:
 
 **Known limitations / what remains:**
 
-- Phase 2 — more of the Redis surface real applications use: `SCAN`/`HSCAN`/`SSCAN`, `MULTI`/`EXEC`, count arguments (`LPOP key n`, `SPOP key n`, `SRANDMEMBER`), `EXPIRE` `NX|XX|GT|LT`, `GETSET`/`GETEX`/`INCRBYFLOAT`/`HMGET`/`SMOVE`/`COPY`, sorted sets. Each needs a `cmd_*`, not just a table row.
+- Phase 2 is largely done: `SCAN`/`HSCAN`/`SSCAN`, `MULTI`/`EXEC`/`DISCARD`/`WATCH`, counted `LPOP`/`RPOP`/`SPOP`, `SRANDMEMBER`, `EXPIRE` `NX|XX|GT|LT`, `GETSET`, `GETEX`, `HMGET`, `SMOVE`, `COPY`. Still missing: sorted sets, blocking pops, `LMOVE`/`RPOPLPUSH`, `SETRANGE`/`GETRANGE`, `HSETNX`, `MSETNX`. `INCRBYFLOAT` is deliberately absent: Redis's output depends on the platform's `long double`, so it cannot be matched reproducibly.
+- **SCAN cursors are rowids.** The guarantee (a key present throughout is returned exactly once) rests on a catalogue row keeping its rowid while the key exists. Writes to an existing key must therefore update `keyspace` in place (`ON CONFLICT DO UPDATE`), never `INSERT OR REPLACE`, which assigns a new rowid. `HSCAN`/`SSCAN` select the key's rows ordered by rowid on each call, which is linear in the collection; an index on `(key)` alone would make that a seek if it ever matters.
+- **`EXEC` is one SQLite write transaction with a savepoint per queued command**, so it is atomic to every other reader while a failing command is undone alone (Redis semantics). **`WATCH` compares a fingerprint of the key's state** rather than tracking touches; see `fingerprint` in `server.rs` for why that is the right trade here (it sees writes from the CLI and other servers too).
 - Phase 3 — operations: `AUTH`/TLS, idle timeouts (`--maxclients` exists), raising the open-file limit at start (each client costs four descriptors: one socket and three SQLite files), cached prepared statements (`prepare_cached`; every command currently re-prepares its SQL), an optional faster sync mode.
 - Positional list access (`LINDEX`, `LSET`, `LRANGE`) walks from the nearer end, so the middle of a very long list is still linear, as in Redis. `LREM`, `LPOS` and `LINSERT` scan for a value and are linear too.
 - Expiry is still lazy only; a long-running server could purge in the background.

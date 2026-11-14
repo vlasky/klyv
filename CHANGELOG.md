@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- **Transactions in the server: `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`.** A transaction runs inside one SQLite write transaction, so no other connection or process sees it half done. As in Redis, a command that fails inside it reports its error in place and the others still apply (each runs under its own savepoint). `WATCH` makes `EXEC` conditional on the watched keys being unchanged, and notices changes from any client of the file, including the CLI. Client libraries that wrap pipelines in `MULTI`/`EXEC` by default (redis-py does) now work unmodified.
+- **`SCAN`, `HSCAN`, `SSCAN`** (CLI: `scan`, `h-scan`, `s-scan`) with `MATCH`, `COUNT`, `TYPE` and `NOVALUES`. A key that exists throughout an iteration is returned exactly once, whatever is created, deleted or rewritten meanwhile.
+- **Counts and options:** `LPOP`/`RPOP`/`SPOP` with a count, `SRANDMEMBER`, and the `NX`/`XX`/`GT`/`LT` conditions on `EXPIRE`, `PEXPIRE`, `EXPIREAT` and `PEXPIREAT` (CLI: `l-pop k 3`, `s-rand-member`, `expire k 60 --gt`).
+- **New commands:** `GETSET`, `GETEX`, `HMGET`, `SMOVE`, `COPY` (CLI: `get-set`, `get-ex`, `h-m-get`, `s-move`, `copy`), and `exists` now takes several keys in the CLI as it already did in the server.
+- `INCRBYFLOAT` is deliberately not implemented: Redis formats its result from a C `long double`, which differs between platforms, so the replies cannot be matched reproducibly.
+
 ### Changed
 
 - **Schema v3 (automatic in-place migration): lengths are stored, not counted.** The catalogue now records the element count of every list, set and hash. `l-len`, `s-card` and `h-len` are a single indexed read, and `l-push`/`r-push` no longer count the list to report its new length. Previously each of these scanned all of the key's rows. Files written by klyv 0.3.x and 0.4.0 (and 0.2.0) are migrated the first time they are opened; those older versions refuse a migrated file rather than write to it without keeping the counts.

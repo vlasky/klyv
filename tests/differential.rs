@@ -55,32 +55,43 @@ impl Drop for RedisGuard {
 }
 
 fn start_redis() -> RedisGuard {
-    let port = free_port();
-    let child = Command::new("redis-server")
-        .args([
-            "--port",
-            &port.to_string(),
-            "--bind",
-            "127.0.0.1",
-            "--save",
-            "",
-            "--appendonly",
-            "no",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn redis-server");
-    let guard = RedisGuard { child, port };
-    for _ in 0..100 {
-        let out = Command::new("redis-cli")
-            .args(["-p", &guard.port.to_string(), "PING"])
-            .output()
-            .expect("failed to run redis-cli");
-        if String::from_utf8_lossy(&out.stdout).trim() == "PONG" {
-            return guard;
+    // The port is chosen by binding and releasing it, so another process
+    // (these tests run in parallel) can take it first; redis-server then
+    // exits at once. Notice that and try another port rather than waiting.
+    for _attempt in 0..5 {
+        let port = free_port();
+        let child = Command::new("redis-server")
+            .args([
+                "--port",
+                &port.to_string(),
+                "--bind",
+                "127.0.0.1",
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn redis-server");
+        let mut guard = RedisGuard { child, port };
+        // Generous: a loaded machine can take seconds to start a server.
+        for _ in 0..600 {
+            if guard.child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            let out = Command::new("redis-cli")
+                .args(["-p", &guard.port.to_string(), "PING"])
+                .output()
+                .expect("failed to run redis-cli");
+            if String::from_utf8_lossy(&out.stdout).trim() == "PONG"
+                && guard.child.try_wait().ok().flatten().is_none()
+            {
+                return guard;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
     panic!("redis-server did not become ready");
 }
@@ -118,6 +129,13 @@ enum Cmp {
     PairSorted,
     /// Both sides must report an error with the same code (first token).
     Error,
+    /// Server mode only. A SCAN-family command whose `CURSOR` argument is a
+    /// placeholder: iterate to completion on both sides and compare the
+    /// items as a set. Cursors and page boundaries are each server's own
+    /// business; what must agree is what a full iteration yields.
+    ScanAll,
+    /// As `ScanAll`, for HSCAN with values: items are field/value pairs.
+    ScanAllPairs,
 }
 
 struct Step {
@@ -193,6 +211,7 @@ fn check_step(db: &str, port: u16, scenario: &str, i: usize, s: &Step) {
                 "pair mismatch\n{ctx}"
             );
         }
+        Cmp::ScanAll | Cmp::ScanAllPairs => unreachable!("scan steps are server-only"),
         Cmp::Error => {
             assert!(!k_ok, "klyv should have errored\n{ctx}");
             let k_code = first_token(&k_err);
@@ -721,6 +740,597 @@ fn scenarios() -> Vec<(&'static str, Vec<Step>)> {
             ],
         ),
         (
+            "counted-pops",
+            vec![
+                step(
+                    &["r-push", "l", "a", "b", "c", "d", "e"],
+                    &["RPUSH", "l", "a", "b", "c", "d", "e"],
+                    Exact,
+                ),
+                step(&["l-pop", "l", "2"], &["LPOP", "l", "2"], Exact),
+                step(&["l-pop", "l", "0"], &["LPOP", "l", "0"], Exact),
+                step(&["l-pop", "l", "-1"], &["LPOP", "l", "-1"], Error),
+                step(&[], &["LPOP", "l", "x"], Error),
+                step(&[], &["LPOP", "l", "1", "2"], Error),
+                step(&["r-pop", "l", "2"], &["RPOP", "l", "2"], Exact),
+                step(&["l-len", "l"], &["LLEN", "l"], Exact),
+                step(&["r-pop", "l", "10"], &["RPOP", "l", "10"], Exact),
+                step(&["exists", "l"], &["EXISTS", "l"], Exact),
+                step(&["l-pop", "nokey", "2"], &["LPOP", "nokey", "2"], Exact),
+                step(&["r-pop", "nokey", "0"], &["RPOP", "nokey", "0"], Exact),
+                step(&["set", "str", "v"], &["SET", "str", "v"], Exact),
+                step(&["l-pop", "str", "1"], &["LPOP", "str", "1"], Error),
+            ],
+        ),
+        (
+            // Random picks: only cases whose outcome is determined.
+            "spop-srandmember-counts",
+            vec![
+                step(
+                    &["s-add", "s", "a", "b", "c"],
+                    &["SADD", "s", "a", "b", "c"],
+                    Exact,
+                ),
+                step(&["s-pop", "s", "0"], &["SPOP", "s", "0"], Exact),
+                step(&["s-pop", "s", "-1"], &["SPOP", "s", "-1"], Error),
+                step(&[], &["SPOP", "s", "x"], Error),
+                step(
+                    &["s-rand-member", "s", "0"],
+                    &["SRANDMEMBER", "s", "0"],
+                    Exact,
+                ),
+                step(
+                    &["s-rand-member", "s", "10"],
+                    &["SRANDMEMBER", "s", "10"],
+                    Sorted,
+                ),
+                step(
+                    &["s-rand-member", "s", "3"],
+                    &["SRANDMEMBER", "s", "3"],
+                    Sorted,
+                ),
+                step(&["s-card", "s"], &["SCARD", "s"], Exact),
+                step(&["s-pop", "s", "10"], &["SPOP", "s", "10"], Sorted),
+                step(&["exists", "s"], &["EXISTS", "s"], Exact),
+                step(&["s-pop", "nokey", "2"], &["SPOP", "nokey", "2"], Exact),
+                step(
+                    &["s-rand-member", "nokey"],
+                    &["SRANDMEMBER", "nokey"],
+                    Exact,
+                ),
+                step(
+                    &["s-rand-member", "nokey", "3"],
+                    &["SRANDMEMBER", "nokey", "3"],
+                    Exact,
+                ),
+                step(
+                    &["s-rand-member", "nokey", "-3"],
+                    &["SRANDMEMBER", "nokey", "-3"],
+                    Exact,
+                ),
+                step(&["s-add", "one", "x"], &["SADD", "one", "x"], Exact),
+                step(&["s-rand-member", "one"], &["SRANDMEMBER", "one"], Exact),
+                step(
+                    &["s-rand-member", "one", "-3"],
+                    &["SRANDMEMBER", "one", "-3"],
+                    Exact,
+                ),
+                step(
+                    &["s-rand-member", "one", "5"],
+                    &["SRANDMEMBER", "one", "5"],
+                    Exact,
+                ),
+                step(&[], &["SRANDMEMBER", "one", "x"], Error),
+                step(&["set", "str", "v"], &["SET", "str", "v"], Exact),
+                step(
+                    &["s-rand-member", "str", "1"],
+                    &["SRANDMEMBER", "str", "1"],
+                    Error,
+                ),
+                step(&["s-pop", "str", "1"], &["SPOP", "str", "1"], Error),
+            ],
+        ),
+        (
+            "expire-options",
+            vec![
+                step(&["set", "k", "v"], &["SET", "k", "v"], Exact),
+                step(
+                    &["expire", "k", "100", "--nx"],
+                    &["EXPIRE", "k", "100", "NX"],
+                    Exact,
+                ),
+                step(
+                    &["expire", "k", "200", "--nx"],
+                    &["EXPIRE", "k", "200", "NX"],
+                    Exact,
+                ),
+                step(
+                    &["expire", "k", "200", "--xx"],
+                    &["EXPIRE", "k", "200", "XX"],
+                    Exact,
+                ),
+                step(
+                    &["expire", "k", "50", "--gt"],
+                    &["EXPIRE", "k", "50", "GT"],
+                    Exact,
+                ),
+                step(
+                    &["expire", "k", "500", "--gt"],
+                    &["EXPIRE", "k", "500", "GT"],
+                    Exact,
+                ),
+                step(
+                    &["expire", "k", "600", "--lt"],
+                    &["EXPIRE", "k", "600", "LT"],
+                    Exact,
+                ),
+                step(
+                    &["expire", "k", "100", "--lt"],
+                    &["EXPIRE", "k", "100", "LT"],
+                    Exact,
+                ),
+                step(
+                    &["expire", "k", "300", "--xx", "--gt"],
+                    &["EXPIRE", "k", "300", "XX", "GT"],
+                    Exact,
+                ),
+                step(
+                    &["p-expire", "k", "1", "--xx", "--gt"],
+                    &["PEXPIRE", "k", "1", "XX", "GT"],
+                    Exact,
+                ),
+                step(
+                    &["expire", "k", "100", "--nx", "--xx"],
+                    &["EXPIRE", "k", "100", "NX", "XX"],
+                    Error,
+                ),
+                step(
+                    &["expire", "k", "100", "--gt", "--lt"],
+                    &["EXPIRE", "k", "100", "GT", "LT"],
+                    Error,
+                ),
+                step(&[], &["EXPIRE", "k", "100", "BOGUS"], Error),
+                step(&[], &["EXPIRE", "k", "100", "nx", "gt"], Error),
+                step(&["persist", "k"], &["PERSIST", "k"], Exact),
+                // No expiry counts as "never": GT cannot beat it, LT always does.
+                step(
+                    &["expire", "k", "100", "--gt"],
+                    &["EXPIRE", "k", "100", "GT"],
+                    Exact,
+                ),
+                step(
+                    &["expire", "k", "100", "--xx"],
+                    &["EXPIRE", "k", "100", "XX"],
+                    Exact,
+                ),
+                step(
+                    &["p-expire-at", "k", "99999999999999", "--lt"],
+                    &["PEXPIREAT", "k", "99999999999999", "LT"],
+                    Exact,
+                ),
+                step(
+                    &["expire-at", "k", "9999999999", "--lt"],
+                    &["EXPIREAT", "k", "9999999999", "LT"],
+                    Exact,
+                ),
+                step(
+                    &["expire-at", "k", "9999999999", "--lt"],
+                    &["EXPIREAT", "k", "9999999999", "LT"],
+                    Exact,
+                ),
+                step(&["persist", "k"], &["PERSIST", "k"], Exact),
+                step(
+                    &["expire", "nokey", "100", "--nx"],
+                    &["EXPIRE", "nokey", "100", "NX"],
+                    Exact,
+                ),
+                step(
+                    &["p-expire", "k", "-1", "--lt"],
+                    &["PEXPIRE", "k", "-1", "LT"],
+                    Exact,
+                ),
+                step(&["exists", "k"], &["EXISTS", "k"], Exact),
+            ],
+        ),
+        (
+            "getset-getex",
+            vec![
+                step(&["set", "str", "v"], &["SET", "str", "v"], Exact),
+                step(
+                    &["expire", "str", "1000"],
+                    &["EXPIRE", "str", "1000"],
+                    Exact,
+                ),
+                step(&["get-set", "str", "new"], &["GETSET", "str", "new"], Exact),
+                // GETSET discards the TTL, like SET.
+                step(&["persist", "str"], &["PERSIST", "str"], Exact),
+                step(&["get-set", "fresh", "v"], &["GETSET", "fresh", "v"], Exact),
+                step(&["get", "fresh"], &["GET", "fresh"], Exact),
+                step(&["r-push", "l", "a"], &["RPUSH", "l", "a"], Exact),
+                step(&["get-set", "l", "v"], &["GETSET", "l", "v"], Error),
+                step(&["l-len", "l"], &["LLEN", "l"], Exact),
+                step(&["get-ex", "str"], &["GETEX", "str"], Exact),
+                step(
+                    &["get-ex", "str", "--ex", "100"],
+                    &["GETEX", "str", "EX", "100"],
+                    Exact,
+                ),
+                step(&["persist", "str"], &["PERSIST", "str"], Exact),
+                step(
+                    &["get-ex", "str", "--px", "100000"],
+                    &["GETEX", "str", "PX", "100000"],
+                    Exact,
+                ),
+                step(
+                    &["get-ex", "str", "--persist"],
+                    &["GETEX", "str", "PERSIST"],
+                    Exact,
+                ),
+                step(&["persist", "str"], &["PERSIST", "str"], Exact),
+                step(
+                    &["get-ex", "str", "--pxat", "99999999999999"],
+                    &["GETEX", "str", "PXAT", "99999999999999"],
+                    Exact,
+                ),
+                step(&["persist", "str"], &["PERSIST", "str"], Exact),
+                step(
+                    &["get-ex", "str", "--ex", "0"],
+                    &["GETEX", "str", "EX", "0"],
+                    Error,
+                ),
+                step(
+                    &["get-ex", "str", "--px", "-5"],
+                    &["GETEX", "str", "PX", "-5"],
+                    Error,
+                ),
+                step(
+                    &["get-ex", "str", "--ex", "9223372036854775807"],
+                    &["GETEX", "str", "EX", "9223372036854775807"],
+                    Error,
+                ),
+                step(&[], &["GETEX", "str", "EX", "10", "PX", "10"], Error),
+                step(&[], &["GETEX", "str", "BOGUS"], Error),
+                step(&[], &["GETEX", "str", "EX"], Error),
+                step(&[], &["GETEX", "str", "EX", "abc"], Error),
+                step(
+                    &["get-ex", "nokey", "--ex", "10"],
+                    &["GETEX", "nokey", "EX", "10"],
+                    Exact,
+                ),
+                step(
+                    &["get-ex", "l", "--ex", "10"],
+                    &["GETEX", "l", "EX", "10"],
+                    Error,
+                ),
+                // An expiry in the past removes the key, after returning it.
+                step(
+                    &["get-ex", "str", "--exat", "1"],
+                    &["GETEX", "str", "EXAT", "1"],
+                    Exact,
+                ),
+                step(&["exists", "str"], &["EXISTS", "str"], Exact),
+            ],
+        ),
+        (
+            "hmget",
+            vec![
+                step(
+                    &["h-set", "h", "f", "1", "g", "2"],
+                    &["HSET", "h", "f", "1", "g", "2"],
+                    Exact,
+                ),
+                step(
+                    &["h-m-get", "h", "f", "nope", "g", "f"],
+                    &["HMGET", "h", "f", "nope", "g", "f"],
+                    Exact,
+                ),
+                step(
+                    &["h-m-get", "nokey", "a", "b"],
+                    &["HMGET", "nokey", "a", "b"],
+                    Exact,
+                ),
+                step(&["set", "str", "v"], &["SET", "str", "v"], Exact),
+                step(&["h-m-get", "str", "a"], &["HMGET", "str", "a"], Error),
+                step(&[], &["HMGET", "h"], Error),
+            ],
+        ),
+        (
+            "smove",
+            vec![
+                step(&["s-add", "s", "a", "b"], &["SADD", "s", "a", "b"], Exact),
+                step(
+                    &["s-move", "s", "s2", "a"],
+                    &["SMOVE", "s", "s2", "a"],
+                    Exact,
+                ),
+                step(
+                    &["s-move", "s", "s2", "nope"],
+                    &["SMOVE", "s", "s2", "nope"],
+                    Exact,
+                ),
+                step(
+                    &["s-move", "nokey", "s2", "a"],
+                    &["SMOVE", "nokey", "s2", "a"],
+                    Exact,
+                ),
+                step(&["set", "str", "v"], &["SET", "str", "v"], Exact),
+                step(
+                    &["s-move", "s", "str", "b"],
+                    &["SMOVE", "s", "str", "b"],
+                    Error,
+                ),
+                step(
+                    &["s-move", "s", "str", "nope"],
+                    &["SMOVE", "s", "str", "nope"],
+                    Error,
+                ),
+                step(
+                    &["s-move", "str", "s", "a"],
+                    &["SMOVE", "str", "s", "a"],
+                    Error,
+                ),
+                // A missing source is 0 even when the destination is the wrong type.
+                step(
+                    &["s-move", "nokey", "str", "a"],
+                    &["SMOVE", "nokey", "str", "a"],
+                    Exact,
+                ),
+                step(&["s-move", "s", "s", "b"], &["SMOVE", "s", "s", "b"], Exact),
+                step(
+                    &["s-move", "s", "s", "zz"],
+                    &["SMOVE", "s", "s", "zz"],
+                    Exact,
+                ),
+                step(&["s-add", "s2", "b"], &["SADD", "s2", "b"], Exact),
+                // Already in the destination: still moved out of the source,
+                // which empties it and deletes the key.
+                step(
+                    &["s-move", "s", "s2", "b"],
+                    &["SMOVE", "s", "s2", "b"],
+                    Exact,
+                ),
+                step(&["exists", "s"], &["EXISTS", "s"], Exact),
+                step(&["s-members", "s2"], &["SMEMBERS", "s2"], Sorted),
+                step(&["s-card", "s2"], &["SCARD", "s2"], Exact),
+            ],
+        ),
+        (
+            "copy",
+            vec![
+                step(&["set", "c1", "v"], &["SET", "c1", "v"], Exact),
+                step(&["expire", "c1", "1000"], &["EXPIRE", "c1", "1000"], Exact),
+                step(&["copy", "c1", "c2"], &["COPY", "c1", "c2"], Exact),
+                step(&["copy", "c1", "c2"], &["COPY", "c1", "c2"], Exact),
+                step(
+                    &["copy", "c1", "c2", "--replace"],
+                    &["COPY", "c1", "c2", "REPLACE"],
+                    Exact,
+                ),
+                step(&["get", "c2"], &["GET", "c2"], Exact),
+                // The TTL was copied: there is one to remove.
+                step(&["persist", "c2"], &["PERSIST", "c2"], Exact),
+                step(&["persist", "c1"], &["PERSIST", "c1"], Exact),
+                step(&["copy", "nokey", "c3"], &["COPY", "nokey", "c3"], Exact),
+                step(&["copy", "c1", "c1"], &["COPY", "c1", "c1"], Error),
+                step(&[], &["COPY", "c1", "c2", "BOGUS"], Error),
+                step(&[], &["COPY", "c1", "c2", "DB"], Error),
+                step(&[], &["COPY", "c1", "c2", "DB", "x"], Error),
+                step(&[], &["COPY", "c1", "c9", "DB", "0"], Exact),
+                step(
+                    &["r-push", "l", "a", "b", "c"],
+                    &["RPUSH", "l", "a", "b", "c"],
+                    Exact,
+                ),
+                step(&["copy", "l", "l2"], &["COPY", "l", "l2"], Exact),
+                step(&["r-push", "l2", "d"], &["RPUSH", "l2", "d"], Exact),
+                step(
+                    &["l-range", "l2", "0", "-1"],
+                    &["LRANGE", "l2", "0", "-1"],
+                    Exact,
+                ),
+                step(&["l-len", "l"], &["LLEN", "l"], Exact),
+                step(&["s-add", "s", "a", "b"], &["SADD", "s", "a", "b"], Exact),
+                step(&["copy", "s", "s2"], &["COPY", "s", "s2"], Exact),
+                step(&["s-members", "s2"], &["SMEMBERS", "s2"], Sorted),
+                step(
+                    &["h-set", "h", "f", "v", "g", "w"],
+                    &["HSET", "h", "f", "v", "g", "w"],
+                    Exact,
+                ),
+                step(&["copy", "h", "h2"], &["COPY", "h", "h2"], Exact),
+                step(&["h-get-all", "h2"], &["HGETALL", "h2"], PairSorted),
+                step(&["h-len", "h2"], &["HLEN", "h2"], Exact),
+                // Replacing a key of another type.
+                step(
+                    &["copy", "l", "c1", "--replace"],
+                    &["COPY", "l", "c1", "REPLACE"],
+                    Exact,
+                ),
+                step(&["type", "c1"], &["TYPE", "c1"], Exact),
+                step(&["l-len", "c1"], &["LLEN", "c1"], Exact),
+                step(
+                    &["copy", "c2", "h2", "--replace"],
+                    &["COPY", "c2", "h2", "REPLACE"],
+                    Exact,
+                ),
+                step(&["type", "h2"], &["TYPE", "h2"], Exact),
+                step(
+                    &["exists", "c1", "c2", "c1", "nokey", "l2"],
+                    &["EXISTS", "c1", "c2", "c1", "nokey", "l2"],
+                    Exact,
+                ),
+            ],
+        ),
+        (
+            "scan",
+            vec![
+                step(
+                    &[
+                        "m-set", "k1", "v", "k2", "v", "k3", "v", "k4", "v", "k5", "v", "k6", "v",
+                        "k7", "v", "k8", "v", "k9", "v", "k10", "v", "k11", "v", "k12", "v", "k13",
+                        "v",
+                    ],
+                    &[
+                        "MSET", "k1", "v", "k2", "v", "k3", "v", "k4", "v", "k5", "v", "k6", "v",
+                        "k7", "v", "k8", "v", "k9", "v", "k10", "v", "k11", "v", "k12", "v", "k13",
+                        "v",
+                    ],
+                    Exact,
+                ),
+                step(&["r-push", "list", "a"], &["RPUSH", "list", "a"], Exact),
+                step(
+                    &[
+                        "h-set", "h", "f1", "1", "f2", "2", "f3", "3", "g1", "4", "g2", "5", "g3",
+                        "6", "g4", "7",
+                    ],
+                    &[
+                        "HSET", "h", "f1", "1", "f2", "2", "f3", "3", "g1", "4", "g2", "5", "g3",
+                        "6", "g4", "7",
+                    ],
+                    Exact,
+                ),
+                step(
+                    &["s-add", "s", "m1", "m2", "m3", "n1", "n2", "n3", "n4"],
+                    &["SADD", "s", "m1", "m2", "m3", "n1", "n2", "n3", "n4"],
+                    Exact,
+                ),
+                step(&["set", "gone", "v"], &["SET", "gone", "v"], Exact),
+                step(
+                    &["p-expire-at", "gone", "1"],
+                    &["PEXPIREAT", "gone", "1"],
+                    Exact,
+                ),
+                step(&["del", "k5", "k6"], &["DEL", "k5", "k6"], Exact),
+                step(&[], &["SCAN", "CURSOR"], ScanAll),
+                step(&[], &["SCAN", "CURSOR", "COUNT", "1"], ScanAll),
+                step(
+                    &[],
+                    &["SCAN", "CURSOR", "COUNT", "3", "MATCH", "k1*"],
+                    ScanAll,
+                ),
+                step(
+                    &[],
+                    &["SCAN", "CURSOR", "MATCH", "nothing*", "COUNT", "2"],
+                    ScanAll,
+                ),
+                step(
+                    &[],
+                    &["SCAN", "CURSOR", "COUNT", "1000", "TYPE", "string"],
+                    ScanAll,
+                ),
+                step(
+                    &[],
+                    &["SCAN", "CURSOR", "TYPE", "list", "COUNT", "4"],
+                    ScanAll,
+                ),
+                step(&[], &["SCAN", "CURSOR", "TYPE", "bogus"], ScanAll),
+                step(&[], &["HSCAN", "h", "CURSOR"], ScanAllPairs),
+                step(&[], &["HSCAN", "h", "CURSOR", "COUNT", "2"], ScanAllPairs),
+                step(
+                    &[],
+                    &["HSCAN", "h", "CURSOR", "COUNT", "2", "MATCH", "g*"],
+                    ScanAllPairs,
+                ),
+                step(
+                    &[],
+                    &["HSCAN", "h", "CURSOR", "NOVALUES", "COUNT", "3"],
+                    ScanAll,
+                ),
+                step(&[], &["SSCAN", "s", "CURSOR"], ScanAll),
+                step(
+                    &[],
+                    &["SSCAN", "s", "CURSOR", "COUNT", "2", "MATCH", "n*"],
+                    ScanAll,
+                ),
+                step(&[], &["HSCAN", "nokey", "0"], Exact),
+                step(&[], &["SSCAN", "nokey", "0"], Exact),
+                step(&[], &["SSCAN", "gone", "0"], Exact),
+                step(&[], &["SCAN", "x"], Error),
+                step(&[], &["SCAN", "-1"], Error),
+                step(&[], &["SCAN", "0", "COUNT", "0"], Error),
+                step(&[], &["SCAN", "0", "COUNT", "x"], Error),
+                step(&[], &["SCAN", "0", "BOGUS"], Error),
+                step(&[], &["SCAN", "0", "MATCH"], Error),
+                step(&[], &["SCAN", "0", "NOVALUES"], Error),
+                step(&[], &["SCAN"], Error),
+                step(&[], &["HSCAN", "h", "x"], Error),
+                step(&[], &["HSCAN", "h", "0", "TYPE", "hash"], Error),
+                step(&[], &["HSCAN", "k1", "0"], Error),
+                step(&[], &["SSCAN", "h", "0"], Error),
+                step(&[], &["SSCAN", "s", "0", "NOVALUES"], Error),
+            ],
+        ),
+        (
+            "server:multi",
+            vec![
+                step(&[], &["MULTI"], Exact),
+                step(&[], &["MULTI"], Error),
+                step(&[], &["SET", "m", "1"], Exact),
+                step(&[], &["INCR", "m"], Exact),
+                step(&[], &["GET"], Error),
+                step(&[], &["NOSUCH", "a"], Error),
+                // A command rejected while queueing aborts the whole EXEC.
+                step(&[], &["EXEC"], Error),
+                step(&[], &["EXISTS", "m"], Exact),
+                step(&[], &["MULTI"], Exact),
+                step(&[], &["SET", "m", "5"], Exact),
+                step(&[], &["INCR", "m"], Exact),
+                // Fails when run: reported in place, the rest still apply.
+                step(&[], &["LPUSH", "m", "x"], Exact),
+                step(&[], &["PING"], Exact),
+                step(&[], &["RPUSH", "l", "a", "b"], Exact),
+                step(&[], &["LRANGE", "l", "0", "-1"], Exact),
+                step(&[], &["HSET", "h", "f", "v"], Exact),
+                step(&[], &["HGETALL", "h"], Exact),
+                step(&[], &["SADD", "s", "x"], Exact),
+                step(&[], &["SMEMBERS", "s"], Exact),
+                step(&[], &["GET", "nokey"], Exact),
+                step(&[], &["LPOP", "nokey", "2"], Exact),
+                step(&[], &["EXEC"], Exact),
+                step(&[], &["GET", "m"], Exact),
+                step(&[], &["EXEC"], Error),
+                step(&[], &["DISCARD"], Error),
+                step(&[], &["MULTI"], Exact),
+                step(&[], &["SET", "m", "9"], Exact),
+                step(&[], &["DISCARD"], Exact),
+                step(&[], &["GET", "m"], Exact),
+                step(&[], &["MULTI"], Exact),
+                step(&[], &["EXEC"], Exact),
+                step(&[], &["MULTI", "x"], Error),
+                step(&[], &["WATCH"], Error),
+                step(&[], &["WATCH", "m", "nokey"], Exact),
+                step(&[], &["MULTI"], Exact),
+                step(&[], &["WATCH", "m"], Error),
+                step(&[], &["INCR", "m"], Exact),
+                step(&[], &["UNWATCH"], Exact),
+                step(&[], &["EXEC"], Exact),
+                // Unchanged watched keys do not block the transaction.
+                step(&[], &["WATCH", "m"], Exact),
+                step(&[], &["GET", "m"], Exact),
+                step(&[], &["MULTI"], Exact),
+                step(&[], &["INCR", "m"], Exact),
+                step(&[], &["EXEC"], Exact),
+                // A watched key changed (by this connection, before MULTI).
+                step(&[], &["WATCH", "m", "l"], Exact),
+                step(&[], &["RPUSH", "l", "c"], Exact),
+                step(&[], &["MULTI"], Exact),
+                step(&[], &["INCR", "m"], Exact),
+                step(&[], &["EXEC"], Exact),
+                step(&[], &["GET", "m"], Exact),
+                // The aborted EXEC cleared the watch.
+                step(&[], &["MULTI"], Exact),
+                step(&[], &["INCR", "m"], Exact),
+                step(&[], &["EXEC"], Exact),
+                step(&[], &["WATCH", "m"], Exact),
+                step(&[], &["SET", "m", "100"], Exact),
+                step(&[], &["UNWATCH"], Exact),
+                step(&[], &["MULTI"], Exact),
+                step(&[], &["INCR", "m"], Exact),
+                step(&[], &["EXEC"], Exact),
+                step(&[], &["UNWATCH", "x"], Error),
+            ],
+        ),
+        (
             // SPOP picks at random, so only its deterministic cases can be
             // compared: a single-member set, and a missing key.
             "spop",
@@ -836,7 +1446,17 @@ fn differential_vs_real_redis() {
         let db = db.to_str().unwrap();
         run_redis(redis.port, &["FLUSHALL"]);
 
+        // Scenarios named "server:..." hold state on one connection (MULTI)
+        // and cannot be driven one process per step. Within other scenarios
+        // a step with no klyv arguments is server-only and must be a read,
+        // so skipping it leaves both sides in step.
+        if name.starts_with("server:") {
+            continue;
+        }
         for (j, s) in steps.iter().enumerate() {
+            if s.klyv.is_empty() {
+                continue;
+            }
             check_step(db, redis.port, name, j, s);
             assert_len_invariant(std::path::Path::new(db), &|| {
                 format!("scenario '{name}' after step {j}: {:?}", s.klyv)
@@ -955,7 +1575,7 @@ fn random_step(rng: &mut Rng) -> Gen {
     // 42 and 46..=53 share one arm: its ten commands were each drawn about
     // once in 460 steps, too rarely for a run of the default length to hit,
     // say, an HDEL that actually deletes a field.
-    match rng.below(54) {
+    match rng.below(64) {
         0..=2 => g(&["set", "--", k, v], &["SET", k, v], Exact),
         3 => g(&["set", "--nx", "--", k, v], &["SET", k, v, "NX"], Exact),
         4 => g(
@@ -1026,6 +1646,61 @@ fn random_step(rng: &mut Rng) -> Gen {
             2 => g(&["expire-at", "--", k, x], &["EXPIREAT", k, x], Exact),
             _ => g(&["p-expire-at", "--", k, x], &["PEXPIREAT", k, x], Exact),
         },
+        54 => g(&["l-pop", "--", k, c], &["LPOP", k, c], Exact),
+        55 => g(&["r-pop", "--", k, c], &["RPOP", k, c], Exact),
+        56 => g(
+            &["exists", "--", k, k2, k3, k],
+            &["EXISTS", k, k2, k3, k],
+            Exact,
+        ),
+        57 => g(&["h-m-get", "--", k, f, f2], &["HMGET", k, f, f2], Exact),
+        58 => g(&["s-move", "--", k, k2, v], &["SMOVE", k, k2, v], Exact),
+        59 => {
+            if rng.chance(2) {
+                g(
+                    &["copy", "--replace", "--", k, k2],
+                    &["COPY", k, k2, "REPLACE"],
+                    Exact,
+                )
+            } else {
+                g(&["copy", "--", k, k2], &["COPY", k, k2], Exact)
+            }
+        }
+        60 => g(&["get-set", "--", k, v], &["GETSET", k, v], Exact),
+        61 => match rng.below(3) {
+            0 => g(
+                &["get-ex", "--persist", "--", k],
+                &["GETEX", k, "PERSIST"],
+                Exact,
+            ),
+            1 => g(
+                &["get-ex", "--ex=100000", "--", k],
+                &["GETEX", k, "EX", "100000"],
+                Exact,
+            ),
+            _ => g(
+                &["get-ex", "--pxat=1", "--", k],
+                &["GETEX", k, "PXAT", "1"],
+                Exact,
+            ),
+        },
+        62 | 63 => {
+            // Far-future or past targets with a condition: the outcome
+            // depends only on whether the key has an expiry and which side
+            // of it the target falls, never on timing.
+            let (flag, opt) = *rng.pick(&[
+                ("--nx", "NX"),
+                ("--xx", "XX"),
+                ("--gt", "GT"),
+                ("--lt", "LT"),
+            ]);
+            let at = *rng.pick(&["1", "8888888888888", "9999999999999"]);
+            g(
+                &["p-expire-at", flag, "--", k, at],
+                &["PEXPIREAT", k, at, opt],
+                Exact,
+            )
+        }
         44 => {
             // Not the largest EX/PX that Redis accepts: there `now + ttl`
             // wraps negative inside Redis and the key vanishes on the spot,
@@ -1133,7 +1808,9 @@ fn check_generated(db: &str, port: u16, g: &Gen, ctx: &dyn Fn() -> String) {
             "pair mismatch\n{}",
             detail()
         ),
-        Cmp::Error => unreachable!("generated steps never pre-declare an error"),
+        Cmp::Error | Cmp::ScanAll | Cmp::ScanAllPairs => {
+            unreachable!("generated steps never pre-declare an error or a scan")
+        }
     }
 }
 
@@ -1342,6 +2019,41 @@ impl WireClient {
     }
 }
 
+/// Runs a SCAN-family command to completion, substituting the cursor for the
+/// `CURSOR` placeholder, and returns everything it yielded, sorted. Also
+/// checks the shape of every page and that the iteration terminates.
+fn scan_all(client: &mut WireClient, template: &[&str], pairs: bool) -> Wire {
+    let mut cursor = String::from("0");
+    let mut items = Vec::new();
+    for _ in 0..10_000 {
+        let args: Vec<&str> = template
+            .iter()
+            .map(|a| if *a == "CURSOR" { cursor.as_str() } else { a })
+            .collect();
+        let Wire::Array(page) = client.cmd(&args) else {
+            panic!("{args:?}: a scan page must be an array");
+        };
+        let [Wire::Bulk(next), Wire::Array(found)] = page.as_slice() else {
+            panic!("{args:?}: a scan page must be [cursor, items], got {page:?}");
+        };
+        items.extend(found.iter().cloned());
+        cursor = String::from_utf8(next.clone()).unwrap();
+        if cursor == "0" {
+            if pairs {
+                let mut pairs: Vec<Vec<Wire>> = items.chunks(2).map(<[Wire]>::to_vec).collect();
+                pairs.sort();
+                pairs.dedup();
+                return Wire::Array(pairs.into_iter().flatten().collect());
+            }
+            items.sort();
+            // A full iteration may repeat an item; it may not omit one.
+            items.dedup();
+            return Wire::Array(items);
+        }
+    }
+    panic!("{template:?}: scan did not terminate");
+}
+
 /// Puts an unordered reply into a canonical order, keeping its type.
 fn canonical(reply: Wire, cmp: Cmp) -> Wire {
     match (cmp, reply) {
@@ -1383,8 +2095,19 @@ fn server_scenarios(resp3: bool) {
         r.cmd(&["FLUSHALL"]);
         k.cmd(&["FLUSHALL"]);
         for (j, s) in steps.iter().enumerate() {
-            let k_out = canonical(k.cmd(s.redis), s.cmp);
-            let r_out = canonical(r.cmd(s.redis), s.cmp);
+            let (k_out, r_out) = match s.cmp {
+                Cmp::ScanAll | Cmp::ScanAllPairs => {
+                    let pairs = matches!(s.cmp, Cmp::ScanAllPairs);
+                    (
+                        scan_all(&mut k, s.redis, pairs),
+                        scan_all(&mut r, s.redis, pairs),
+                    )
+                }
+                _ => (
+                    canonical(k.cmd(s.redis), s.cmp),
+                    canonical(r.cmd(s.redis), s.cmp),
+                ),
+            };
             assert_eq!(
                 k_out, r_out,
                 "scenario '{name}' step {j} (resp3={resp3}): {:?}\n  left: klyv server, right: redis",

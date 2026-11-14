@@ -3082,3 +3082,151 @@ fn test_list_positions_from_either_end_match_a_model() {
     assert_eq!(out, expected);
     assert_len_invariant(&db);
 }
+
+// === Phase 2 commands from the CLI ===
+
+#[test]
+fn test_cli_scan_iterates_everything() {
+    let db = fresh_db();
+    let mut script = String::new();
+    for i in 0..23 {
+        script.push_str(&format!("set key:{i} v\n"));
+    }
+    script.push_str("r-push list a\nh-set h f1 1 f2 2 f3 3\ns-add s m1 m2 m3\n");
+    assert!(klyv_pipe(&db, &[], &script).2);
+
+    // JSON gives [cursor, [items]].
+    let page = |args: &[&str]| -> (String, Vec<String>) {
+        let (out, err, ok) = klyv_fmt(&db, "json", args);
+        assert!(ok, "{args:?}: {err}");
+        let out = out.trim();
+        let (cursor, items) = out
+            .strip_prefix("[\"")
+            .and_then(|s| s.split_once("\",["))
+            .unwrap_or_else(|| panic!("unexpected scan output {out:?}"));
+        let items = items.trim_end_matches("]]");
+        let items = if items.is_empty() {
+            vec![]
+        } else {
+            items
+                .split(',')
+                .map(|s| s.trim_matches('"').to_string())
+                .collect()
+        };
+        (cursor.to_string(), items)
+    };
+    let mut cursor = String::from("0");
+    let mut keys = Vec::new();
+    loop {
+        let (next, items) = page(&["scan", &cursor, "--count", "5"]);
+        assert!(items.len() <= 5);
+        keys.extend(items);
+        if next == "0" {
+            break;
+        }
+        cursor = next;
+    }
+    keys.sort();
+    keys.dedup();
+    assert_eq!(keys.len(), 26);
+
+    assert_eq!(
+        page(&["scan", "--match", "key:1?", "--count", "100"])
+            .1
+            .len(),
+        10
+    );
+    assert_eq!(
+        page(&["scan", "--type", "list", "--count", "100"]).1,
+        ["list"]
+    );
+    assert_eq!(page(&["h-scan", "h", "--no-values"]).1, ["f1", "f2", "f3"]);
+    assert_eq!(page(&["h-scan", "h", "--match", "f2"]).1, ["f2", "2"]);
+    assert_eq!(page(&["s-scan", "s"]).1.len(), 3);
+
+    // Human output: the cursor on its own line, then the items.
+    let (out, _, _) = klyv(&db, &["scan", "--type", "hash", "--count", "100"]);
+    assert_eq!(out, "0\n1) \"h\"\n");
+    let (_, err, ok) = klyv(&db, &["scan", "--count", "0"]);
+    assert!(!ok);
+    assert_eq!(err.trim(), "ERR syntax error");
+}
+
+#[test]
+fn test_cli_counted_pops_and_random_members() {
+    let db = fresh_db();
+    klyv(&db, &["r-push", "l", "a", "b", "c", "d"]);
+    assert_eq!(klyv(&db, &["l-pop", "l", "2"]).0, "1) \"a\"\n2) \"b\"\n");
+    assert_eq!(
+        klyv_fmt(&db, "json", &["r-pop", "l", "5"]).0.trim(),
+        r#"["d","c"]"#
+    );
+    // A missing key is nil, not an empty list.
+    assert_eq!(klyv(&db, &["l-pop", "l", "2"]).0, "(nil)\n");
+    assert_eq!(klyv_fmt(&db, "json", &["l-pop", "l", "2"]).0.trim(), "null");
+    let (_, err, ok) = klyv(&db, &["l-pop", "l", "-1"]);
+    assert!(!ok);
+    assert_eq!(err.trim(), "ERR value is out of range, must be positive");
+
+    klyv(&db, &["s-add", "s", "a", "b", "c"]);
+    let (out, _, _) = klyv_fmt(&db, "json", &["s-rand-member", "s", "-7"]);
+    assert_eq!(
+        out.matches('"').count(),
+        14,
+        "seven picks with repeats: {out}"
+    );
+    let (out, _, _) = klyv_fmt(&db, "raw", &["s-rand-member", "s", "2"]);
+    let picked: Vec<&str> = out.lines().collect();
+    assert_eq!(picked.len(), 2);
+    assert_ne!(
+        picked[0], picked[1],
+        "a positive count gives distinct members"
+    );
+    assert_eq!(klyv(&db, &["s-card", "s"]).0.trim(), "(integer) 3");
+    let (out, _, _) = klyv_fmt(&db, "raw", &["s-pop", "s", "2"]);
+    assert_eq!(out.lines().count(), 2);
+    assert_eq!(klyv(&db, &["s-card", "s"]).0.trim(), "(integer) 1");
+    assert_eq!(klyv(&db, &["s-pop", "nokey", "3"]).0.trim(), "(empty set)");
+    assert_len_invariant(&db);
+}
+
+#[test]
+fn test_cli_option_conflicts_and_multi_key_exists() {
+    let db = fresh_db();
+    klyv(&db, &["m-set", "a", "1", "b", "2"]);
+    assert_eq!(
+        klyv(&db, &["exists", "a", "b", "a", "nope"]).0.trim(),
+        "(integer) 3"
+    );
+
+    // get-ex takes at most one expiry option.
+    let (_, err, ok) = klyv(&db, &["get-ex", "a", "--ex", "10", "--persist"]);
+    assert!(!ok);
+    assert!(err.contains("cannot be used with"), "{err}");
+    // expire's conditions report Redis's own error when they contradict.
+    let (_, err, ok) = klyv(&db, &["expire", "a", "10", "--nx", "--gt"]);
+    assert!(!ok);
+    assert_eq!(
+        err.trim(),
+        "ERR NX and XX, GT or LT options at the same time are not compatible"
+    );
+    assert_eq!(klyv(&db, &["ttl", "a"]).0.trim(), "(integer) -1");
+    assert_eq!(
+        klyv(&db, &["expire", "a", "1000", "--nx"]).0.trim(),
+        "(integer) 1"
+    );
+    assert_eq!(
+        klyv(&db, &["expire", "a", "5", "--gt"]).0.trim(),
+        "(integer) 0"
+    );
+    assert_eq!(
+        klyv(&db, &["h-m-get", "a", "f"]).1.trim().split(' ').next(),
+        Some("WRONGTYPE")
+    );
+    assert_eq!(klyv(&db, &["copy", "a", "b"]).0.trim(), "(integer) 0");
+    assert_eq!(
+        klyv(&db, &["copy", "a", "b", "--replace"]).0.trim(),
+        "(integer) 1"
+    );
+    assert_eq!(klyv(&db, &["get-set", "b", "new"]).0.trim(), "1");
+}
