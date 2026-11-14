@@ -247,7 +247,7 @@ fn static_kind(kind: &str) -> rusqlite::Result<&'static str> {
 }
 
 /// The catalogue row for a key, expired or not.
-pub(crate) fn lookup(conn: &Connection, key: &str) -> rusqlite::Result<Option<KeyRow>> {
+pub(crate) fn lookup(conn: &Connection, key: Arg<'_>) -> rusqlite::Result<Option<KeyRow>> {
     conn.query_row(
         "SELECT type, expires_at FROM keyspace WHERE key = ?1",
         params![key],
@@ -265,7 +265,7 @@ pub(crate) fn lookup(conn: &Connection, key: &str) -> rusqlite::Result<Option<Ke
 /// The key's type if it exists and has not expired.
 pub(crate) fn key_type(
     conn: &Connection,
-    key: &str,
+    key: Arg<'_>,
     now: i64,
 ) -> rusqlite::Result<Option<&'static str>> {
     Ok(lookup(conn, key)?
@@ -278,7 +278,7 @@ pub(crate) fn key_type(
 /// Redis WRONGTYPE error if it holds another type.
 pub(crate) fn check_type(
     conn: &Connection,
-    key: &str,
+    key: Arg<'_>,
     want: &str,
     now: i64,
 ) -> Result<bool, CmdError> {
@@ -293,7 +293,7 @@ pub(crate) fn check_type(
 
 pub(crate) fn ensure_type(
     conn: &Connection,
-    key: &str,
+    key: Arg<'_>,
     want: &str,
     now: i64,
 ) -> Result<(), CmdError> {
@@ -301,7 +301,7 @@ pub(crate) fn ensure_type(
 }
 
 /// Deletes a key's payload rows (not its catalogue row).
-pub(crate) fn clear_data(conn: &Connection, key: &str, kind: &str) -> rusqlite::Result<()> {
+pub(crate) fn clear_data(conn: &Connection, key: Arg<'_>, kind: &str) -> rusqlite::Result<()> {
     conn.execute(
         &format!("DELETE FROM {} WHERE key = ?1", data_table(kind)),
         params![key],
@@ -311,7 +311,7 @@ pub(crate) fn clear_data(conn: &Connection, key: &str, kind: &str) -> rusqlite::
 
 /// Physically removes a key: payload rows and catalogue row. Returns the
 /// catalogue row that was removed, if any (expired or not).
-pub(crate) fn remove_key(conn: &Connection, key: &str) -> rusqlite::Result<Option<KeyRow>> {
+pub(crate) fn remove_key(conn: &Connection, key: Arg<'_>) -> rusqlite::Result<Option<KeyRow>> {
     let row = lookup(conn, key)?;
     if let Some(r) = &row {
         clear_data(conn, key, r.kind)?;
@@ -322,7 +322,7 @@ pub(crate) fn remove_key(conn: &Connection, key: &str) -> rusqlite::Result<Optio
 
 /// Writes call this before touching a key so a lazily expired key is treated
 /// as absent and its stale rows reclaimed.
-pub(crate) fn drop_if_expired(conn: &Connection, key: &str, now: i64) -> rusqlite::Result<()> {
+pub(crate) fn drop_if_expired(conn: &Connection, key: Arg<'_>, now: i64) -> rusqlite::Result<()> {
     if let Some(r) = lookup(conn, key)?
         && !r.is_live(now)
     {
@@ -334,7 +334,7 @@ pub(crate) fn drop_if_expired(conn: &Connection, key: &str, now: i64) -> rusqlit
 /// Registers a key as `kind` with no expiry if it has no catalogue row yet.
 /// Callers have already type-checked and dropped any expired row, so an
 /// existing row is necessarily the same type and is left untouched.
-pub(crate) fn claim(conn: &Connection, key: &str, kind: &str) -> rusqlite::Result<()> {
+pub(crate) fn claim(conn: &Connection, key: Arg<'_>, kind: &str) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO keyspace (key, type, expires_at) VALUES (?1, ?2, NULL)",
         params![key, kind],
@@ -345,7 +345,11 @@ pub(crate) fn claim(conn: &Connection, key: &str, kind: &str) -> rusqlite::Resul
 /// Removing the last element of a list/set/hash deletes the key: the
 /// catalogue row (and with it any TTL) must go too, or a later SET of the
 /// same name would inherit a stale expiry.
-pub(crate) fn release_if_empty(conn: &Connection, key: &str, kind: &str) -> rusqlite::Result<()> {
+pub(crate) fn release_if_empty(
+    conn: &Connection,
+    key: Arg<'_>,
+    kind: &str,
+) -> rusqlite::Result<()> {
     let has_rows = conn
         .query_row(
             &format!("SELECT 1 FROM {} WHERE key = ?1 LIMIT 1", data_table(kind)),
@@ -367,6 +371,43 @@ pub(crate) fn bytes_col(row: &Row, idx: usize) -> rusqlite::Result<Vec<u8>> {
     v.as_bytes()
         .map(<[u8]>::to_vec)
         .map_err(|_| rusqlite::Error::InvalidColumnType(idx, "value".into(), v.data_type()))
+}
+
+/// A key, field or value argument: arbitrary bytes, as a RESP client may send
+/// them. The CLI only ever produces UTF-8.
+///
+/// It is a newtype rather than a bare `&[u8]` because of how it must bind:
+/// valid UTF-8 as TEXT, anything else as BLOB (the same rule as
+/// `bind_value`). rusqlite binds a bare byte slice as BLOB always, and SQLite
+/// never considers a BLOB equal to a TEXT of the same bytes, so a slice bound
+/// directly would silently miss every key written as text. Passing `Arg`
+/// everywhere makes that mistake unrepresentable.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) struct Arg<'a>(pub(crate) &'a [u8]);
+
+impl<'a> Arg<'a> {
+    pub(crate) fn as_bytes(self) -> &'a [u8] {
+        self.0
+    }
+}
+
+impl<'a> From<&'a str> for Arg<'a> {
+    fn from(s: &'a str) -> Self {
+        Arg(s.as_bytes())
+    }
+}
+
+impl rusqlite::ToSql for Arg<'_> {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        use rusqlite::types::{ToSqlOutput, ValueRef};
+        Ok(ToSqlOutput::Borrowed(
+            if std::str::from_utf8(self.0).is_ok() {
+                ValueRef::Text(self.0)
+            } else {
+                ValueRef::Blob(self.0)
+            },
+        ))
+    }
 }
 
 /// Storage class for a value: valid UTF-8 is stored as TEXT, anything else

@@ -10,7 +10,10 @@ fn empty() -> Reply {
 }
 
 // Returns (element count, min idx, max idx) for a list in one query.
-fn list_bounds(conn: &Connection, key: &str) -> rusqlite::Result<(i64, Option<f64>, Option<f64>)> {
+fn list_bounds(
+    conn: &Connection,
+    key: Arg<'_>,
+) -> rusqlite::Result<(i64, Option<f64>, Option<f64>)> {
     conn.query_row(
         "SELECT COUNT(*), MIN(idx), MAX(idx) FROM list_items WHERE key = ?1",
         params![key],
@@ -18,7 +21,7 @@ fn list_bounds(conn: &Connection, key: &str) -> rusqlite::Result<(i64, Option<f6
     )
 }
 
-fn push(conn: &Connection, key: &str, values: &[String], head: bool) -> CmdResult {
+fn push(conn: &Connection, key: Arg<'_>, values: &[Arg<'_>], head: bool) -> CmdResult {
     if values.is_empty() {
         let name = if head { "lpush" } else { "rpush" };
         return Err(CmdError::new(format!(
@@ -45,15 +48,15 @@ fn push(conn: &Connection, key: &str, values: &[String], head: bool) -> CmdResul
     Ok(Reply::Int(count + values.len() as i64))
 }
 
-pub(crate) fn cmd_lpush(conn: &Connection, key: &str, values: &[String]) -> CmdResult {
+pub(crate) fn cmd_lpush(conn: &Connection, key: Arg<'_>, values: &[Arg<'_>]) -> CmdResult {
     push(conn, key, values, true)
 }
 
-pub(crate) fn cmd_rpush(conn: &Connection, key: &str, values: &[String]) -> CmdResult {
+pub(crate) fn cmd_rpush(conn: &Connection, key: Arg<'_>, values: &[Arg<'_>]) -> CmdResult {
     push(conn, key, values, false)
 }
 
-pub(crate) fn cmd_pop(conn: &Connection, key: &str, order: &str) -> CmdResult {
+pub(crate) fn cmd_pop(conn: &Connection, key: Arg<'_>, order: &str) -> CmdResult {
     let now = now_ms();
     ensure_type(conn, key, KIND, now)?;
     drop_if_expired(conn, key, now)?;
@@ -93,7 +96,7 @@ fn normalize_range(start: i64, stop: i64, len: i64) -> (i64, i64) {
     (s, e)
 }
 
-pub(crate) fn cmd_lrange(conn: &Connection, key: &str, start: i64, stop: i64) -> CmdResult {
+pub(crate) fn cmd_lrange(conn: &Connection, key: Arg<'_>, start: i64, stop: i64) -> CmdResult {
     if !check_type(conn, key, KIND, now_ms())? {
         return Ok(empty());
     }
@@ -115,7 +118,7 @@ pub(crate) fn cmd_lrange(conn: &Connection, key: &str, start: i64, stop: i64) ->
     Ok(Reply::Array(rows, Empty::List))
 }
 
-pub(crate) fn cmd_llen(conn: &Connection, key: &str) -> CmdResult {
+pub(crate) fn cmd_llen(conn: &Connection, key: Arg<'_>) -> CmdResult {
     if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Int(0));
     }
@@ -123,7 +126,7 @@ pub(crate) fn cmd_llen(conn: &Connection, key: &str) -> CmdResult {
     Ok(Reply::Int(len))
 }
 
-pub(crate) fn cmd_lrem(conn: &Connection, key: &str, count: i64, value: &str) -> CmdResult {
+pub(crate) fn cmd_lrem(conn: &Connection, key: Arg<'_>, count: i64, value: Arg<'_>) -> CmdResult {
     let (order, limit) = match count.cmp(&0) {
         std::cmp::Ordering::Greater => ("ASC", count.unsigned_abs() as usize),
         std::cmp::Ordering::Less => ("DESC", count.unsigned_abs() as usize),
@@ -150,7 +153,7 @@ pub(crate) fn cmd_lrem(conn: &Connection, key: &str, count: i64, value: &str) ->
     Ok(Reply::Int(removed))
 }
 
-pub(crate) fn cmd_lpos(conn: &Connection, key: &str, value: &str) -> CmdResult {
+pub(crate) fn cmd_lpos(conn: &Connection, key: Arg<'_>, value: Arg<'_>) -> CmdResult {
     if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Nil);
     }
@@ -173,7 +176,7 @@ fn normalize_index(index: i64, len: i64) -> Option<i64> {
     (0..len).contains(&i).then_some(i)
 }
 
-pub(crate) fn cmd_lindex(conn: &Connection, key: &str, index: i64) -> CmdResult {
+pub(crate) fn cmd_lindex(conn: &Connection, key: Arg<'_>, index: i64) -> CmdResult {
     if !check_type(conn, key, KIND, now_ms())? {
         return Ok(Reply::Nil);
     }
@@ -191,7 +194,7 @@ pub(crate) fn cmd_lindex(conn: &Connection, key: &str, index: i64) -> CmdResult 
     Ok(value.map_or(Reply::Nil, Reply::Bulk))
 }
 
-pub(crate) fn cmd_lset(conn: &Connection, key: &str, index: i64, value: &str) -> CmdResult {
+pub(crate) fn cmd_lset(conn: &Connection, key: Arg<'_>, index: i64, value: Arg<'_>) -> CmdResult {
     let now = now_ms();
     ensure_type(conn, key, KIND, now)?;
     drop_if_expired(conn, key, now)?;
@@ -212,7 +215,7 @@ pub(crate) fn cmd_lset(conn: &Connection, key: &str, index: i64, value: &str) ->
     Ok(Reply::Simple("OK"))
 }
 
-pub(crate) fn cmd_ltrim(conn: &Connection, key: &str, start: i64, stop: i64) -> CmdResult {
+pub(crate) fn cmd_ltrim(conn: &Connection, key: Arg<'_>, start: i64, stop: i64) -> CmdResult {
     let now = now_ms();
     ensure_type(conn, key, KIND, now)?;
     drop_if_expired(conn, key, now)?;
@@ -244,7 +247,7 @@ pub(crate) fn cmd_ltrim(conn: &Connection, key: &str, start: i64, stop: i64) -> 
 
 // Rewrites a list's fractional indexes as sequential integers. Called when
 // repeated LINSERTs into the same gap exhaust f64 midpoint precision.
-fn renumber_list(conn: &Connection, key: &str) -> rusqlite::Result<()> {
+fn renumber_list(conn: &Connection, key: Arg<'_>) -> rusqlite::Result<()> {
     let rowids: Vec<i64> = {
         let mut stmt =
             conn.prepare("SELECT rowid FROM list_items WHERE key = ?1 ORDER BY idx ASC")?;
@@ -262,10 +265,10 @@ fn renumber_list(conn: &Connection, key: &str) -> rusqlite::Result<()> {
 
 pub(crate) fn cmd_linsert(
     conn: &Connection,
-    key: &str,
+    key: Arg<'_>,
     place: InsertWhere,
-    pivot: &str,
-    value: &str,
+    pivot: Arg<'_>,
+    value: Arg<'_>,
 ) -> CmdResult {
     let now = now_ms();
     ensure_type(conn, key, KIND, now)?;

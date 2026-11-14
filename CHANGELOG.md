@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Internal: every command function takes its keys, fields and values as bytes rather than strings, bound to SQLite as TEXT when valid UTF-8 and BLOB otherwise. With byte-valued replies (0.3.0) the core is now binary-safe end to end, the prerequisite for the RESP server. No behaviour change from the CLI, which can only pass UTF-8.
+
 ## 0.3.1 (2026-11-14)
 
 ### Fixed
