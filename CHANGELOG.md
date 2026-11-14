@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Schema v3 (automatic in-place migration): lengths are stored, not counted.** The catalogue now records the element count of every list, set and hash. `l-len`, `s-card` and `h-len` are a single indexed read, and `l-push`/`r-push` no longer count the list to report its new length. Previously each of these scanned all of the key's rows. Files written by klyv 0.3.x and 0.4.0 (and 0.2.0) are migrated the first time they are opened; those older versions refuse a migrated file rather than write to it without keeping the counts.
+- **`l-index`, `l-set` and `l-range` walk from the nearer end** of the list, so reading near the tail of a long list is as cheap as reading near the head.
+
+Measured through `klyv serve` on a 20,000-element list with 20 connections:
+
+| Operation | Before | After |
+|-----------|--------|-------|
+| `LPUSH` while the list grows to 20,000 | about 1,200/s | about 15,000/s |
+| `LLEN` | 5,100/s | 99,000/s |
+| `LINDEX key -5` | 3,100/s | 100,000/s |
+| `LRANGE key -10 -1` | 3,600/s | 86,000/s |
+
+- Tests: the stored length is compared with the real row count for every key after each step of the differential scenarios and throughout the random sequences; rarely drawn commands are sampled more often; a deterministic `SPOP` scenario was added.
+
 ## 0.4.0 (2026-11-14)
 
 ### Added

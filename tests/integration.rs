@@ -2552,7 +2552,8 @@ fn test_migrates_v1_database_in_place() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
+    assert_len_invariant(&db);
     let has_expiry: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'expiry'",
@@ -2847,4 +2848,237 @@ fn test_incr_rejects_non_canonical_integers() {
     klyv(&db, &["set", "n", "-"]);
     klyv(&db, &["append", "n", "7"]);
     assert_eq!(klyv(&db, &["incr", "n"]).0.trim(), "(integer) -6");
+}
+
+// === SCHEMA V3: element counts in the catalogue ===
+
+/// The schema-v3 invariant: `keyspace.len` equals the number of payload rows
+/// for every list, set and hash, is NULL for every string, and no key is
+/// catalogued with nothing in it.
+fn assert_len_invariant(db: &str) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT key, type, len, CASE type
+                 WHEN 'list' THEN (SELECT COUNT(*) FROM list_items  WHERE key = k.key)
+                 WHEN 'set'  THEN (SELECT COUNT(*) FROM set_members WHERE key = k.key)
+                 WHEN 'hash' THEN (SELECT COUNT(*) FROM hash_fields WHERE key = k.key)
+                 WHEN 'string' THEN (SELECT COUNT(*) FROM strings   WHERE key = k.key)
+             END FROM keyspace k",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })
+        .unwrap();
+    for row in rows {
+        let (key, kind, len, actual) = row.unwrap();
+        assert!(
+            actual > 0,
+            "{kind} key {key:?} is catalogued but has no rows"
+        );
+        if kind == "string" {
+            assert_eq!(len, None, "string key {key:?} has a len");
+        } else {
+            assert_eq!(
+                len,
+                Some(actual),
+                "{kind} key {key:?}: stored len vs actual rows"
+            );
+        }
+    }
+}
+
+fn int_of(db: &str, args: &[&str]) -> i64 {
+    let (out, err, ok) = klyv(db, args);
+    assert!(ok, "{args:?} failed: {err}");
+    out.trim()
+        .strip_prefix("(integer) ")
+        .unwrap_or_else(|| panic!("{args:?} gave {out:?}"))
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn test_migrates_v2_database_in_place() {
+    let db = fresh_db();
+    {
+        // A schema-v2 database as klyv 0.3.x / 0.4.0 wrote it: a catalogue
+        // without `len`, the downgrade-guard view, user_version 2.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE keyspace (key TEXT PRIMARY KEY, type TEXT NOT NULL, expires_at INTEGER);
+             CREATE INDEX idx_keyspace_expires ON keyspace(expires_at) WHERE expires_at IS NOT NULL;
+             CREATE TABLE strings (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+             CREATE TABLE list_items (key TEXT NOT NULL, idx REAL NOT NULL, value BLOB NOT NULL);
+             CREATE INDEX idx_list_key_idx ON list_items(key, idx);
+             CREATE TABLE set_members (key TEXT NOT NULL, member BLOB NOT NULL, UNIQUE(key, member));
+             CREATE TABLE hash_fields (key TEXT NOT NULL, field TEXT NOT NULL, value BLOB NOT NULL, UNIQUE(key, field));
+             CREATE VIEW expiry AS SELECT key, expires_at / 1000 AS expires_at FROM keyspace WHERE expires_at IS NOT NULL;
+             INSERT INTO keyspace VALUES ('s', 'string', NULL), ('l', 'list', 99999999999999),
+                                         ('st', 'set', NULL), ('h', 'hash', NULL), ('gone', 'list', 1);
+             INSERT INTO strings VALUES ('s', 'hello');
+             INSERT INTO list_items VALUES ('l', 0.0, 'a'), ('l', 1.0, 'b'), ('l', 2.0, 'c'), ('gone', 0.0, 'x');
+             INSERT INTO set_members VALUES ('st', 'm'), ('st', 'n');
+             INSERT INTO hash_fields VALUES ('h', 'f', 'v');
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    }
+
+    assert_eq!(int_of(&db, &["l-len", "l"]), 3);
+    assert_eq!(int_of(&db, &["s-card", "st"]), 2);
+    assert_eq!(int_of(&db, &["h-len", "h"]), 1);
+    assert_eq!(int_of(&db, &["l-len", "gone"]), 0);
+    assert_eq!(klyv(&db, &["get", "s"]).0.trim(), "hello");
+    // The TTL survived, and new writes count from the migrated length.
+    assert!(ttl_of(&db, "p-ttl", "l") > 1_000_000_000);
+    assert_eq!(int_of(&db, &["r-push", "l", "d"]), 4);
+    assert_eq!(int_of(&db, &["s-add", "st", "n", "o"]), 1);
+    assert_eq!(int_of(&db, &["s-card", "st"]), 3);
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 3);
+    drop(conn);
+    assert_len_invariant(&db);
+    assert_v1_binary_cannot_open(&db);
+}
+
+// Every command that adds or removes elements, plus the ways a key can
+// change type or disappear, leaves the stored lengths true.
+#[test]
+fn test_len_invariant_across_every_mutation() {
+    let db = fresh_db();
+    let steps: &[&[&str]] = &[
+        &["r-push", "l", "a", "b", "c", "b", "d"],
+        &["l-push", "l", "z"],
+        &["l-pop", "l"],
+        &["r-pop", "l"],
+        &["l-rem", "l", "0", "b"],
+        &["l-rem", "l", "5", "nope"],
+        &["l-insert", "l", "before", "c", "x"],
+        &["l-insert", "l", "after", "nope", "x"],
+        &["l-set", "l", "0", "A"],
+        &["r-push", "l", "1", "2", "3", "4", "5"],
+        &["l-trim", "l", "1", "-2"],
+        &["l-trim", "l", "0", "100"],
+        &["s-add", "s", "a", "b", "c"],
+        &["s-add", "s", "a", "d"],
+        &["s-add", "s", "a"],
+        &["s-rem", "s", "a", "nope"],
+        &["s-rem", "s", "nope"],
+        &["s-pop", "s"],
+        &["h-set", "h", "f", "1", "g", "2"],
+        &["h-set", "h", "f", "9", "new", "3"],
+        &["h-incr-by", "h", "g", "5"],
+        &["h-incr-by", "h", "fresh", "5"],
+        &["h-incr-by", "h2", "n", "1"],
+        &["h-del", "h", "f", "nope"],
+        &["h-del", "h", "nope"],
+        &["rename", "l", "l2"],
+        &["rename", "s", "h2"],
+        &["set", "h", "now-a-string"],
+        &["m-set", "l2", "also-a-string", "fresh", "v"],
+        &["append", "fresh", "more"],
+        &["incr", "counter"],
+        &["r-push", "t", "a", "b"],
+        &["l-trim", "t", "5", "9"],
+        &["r-push", "e", "a"],
+        &["p-expire-at", "e", "1"],
+        &["r-push", "e", "b", "c"],
+        &["s-add", "e2", "a", "b"],
+        &["p-expire-at", "e2", "1"],
+        &["h-set", "e2", "f", "v"],
+        &["r-push", "last", "only"],
+        &["l-pop", "last"],
+        &["s-add", "last", "only"],
+        &["s-rem", "last", "only"],
+        &["h-set", "last", "only", "1"],
+        &["h-del", "last", "only"],
+    ];
+    for step in steps {
+        klyv(&db, step);
+        assert_len_invariant(&db);
+    }
+    // And the lengths reported are the ones the invariant just vouched for.
+    assert_eq!(int_of(&db, &["l-len", "e"]), 2);
+    assert_eq!(int_of(&db, &["h-len", "e2"]), 1);
+    assert_eq!(int_of(&db, &["s-card", "h2"]), 2);
+    assert_eq!(klyv(&db, &["type", "h"]).0.trim(), "string");
+    assert_eq!(klyv(&db, &["exists", "last"]).0.trim(), "(integer) 0");
+    assert_eq!(klyv(&db, &["exists", "t"]).0.trim(), "(integer) 0");
+}
+
+// Positional reads walk from whichever end is nearer. Check every position
+// and a spread of ranges on a list long enough to exercise both directions,
+// against a plain Vec.
+#[test]
+fn test_list_positions_from_either_end_match_a_model() {
+    let db = fresh_db();
+    let n = 41i64;
+    let mut model: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
+    let mut script = String::from("r-push big");
+    for v in &model {
+        script.push(' ');
+        script.push_str(v);
+    }
+    script.push('\n');
+    // Overwrite a few positions from both ends.
+    for i in [0i64, 1, 19, 20, 21, 39, 40, -1, -2, -41] {
+        let pos = if i < 0 { n + i } else { i } as usize;
+        model[pos] = format!("w{i}");
+        script.push_str(&format!("l-set big {i} w{i}\n"));
+    }
+    let mut expected = String::from("41\n");
+    expected.push_str(&"OK\n".repeat(10));
+    for i in -n..n {
+        let pos = if i < 0 { n + i } else { i } as usize;
+        script.push_str(&format!("l-index big {i}\n"));
+        expected.push_str(&model[pos]);
+        expected.push('\n');
+    }
+    for (start, stop) in [
+        (0, -1),
+        (0, 0),
+        (40, 40),
+        (-1, -1),
+        (35, 39),
+        (1, 3),
+        (10, 30),
+        (30, 39),
+        (-5, -2),
+        (38, 100),
+        (-100, 2),
+        (20, 20),
+        (21, 21),
+        (5, 4),
+    ] {
+        script.push_str(&format!("l-range big {start} {stop}\n"));
+        let lo = (if start < 0 {
+            (n + start).max(0)
+        } else {
+            start.min(n)
+        }) as usize;
+        let hi = if stop < 0 { n + stop } else { stop.min(n - 1) };
+        if hi >= lo as i64 {
+            for v in &model[lo..=hi as usize] {
+                expected.push_str(v);
+                expected.push('\n');
+            }
+        }
+    }
+    let (out, err, ok) = klyv_pipe(&db, &["--format", "raw"], &script);
+    assert!(ok, "{err}");
+    assert_eq!(out, expected);
+    assert_len_invariant(&db);
 }
