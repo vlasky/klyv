@@ -12,7 +12,6 @@
 //! unbounded memory from a length header alone.
 
 use crate::reply::{Empty, Reply};
-use crate::shell::split_line;
 use std::io::{self, BufRead, Read};
 
 /// Redis's `proto-max-bulk-len` default: 512 MB per argument.
@@ -21,6 +20,11 @@ const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
 const MAX_ARGS: usize = 1024 * 1024;
 /// Redis's cap on an inline command or a header line.
 const MAX_LINE: usize = 64 * 1024;
+/// Cap on the total size of one command's arguments, Redis's
+/// `client-query-buffer-limit` default (1 GB). Without it a client could
+/// send a million arguments of a megabyte each, all within the per-argument
+/// limit, and have the server buffer the lot before dispatching anything.
+const MAX_COMMAND_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug)]
 pub(crate) enum ReadError {
@@ -70,19 +74,77 @@ fn parse_len(bytes: &[u8]) -> Option<i64> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
-/// Splits an inline command into arguments. Valid UTF-8 goes through the
-/// shell tokenizer (quotes and backslash escapes); anything else is split on
-/// ASCII whitespace.
-fn split_inline(line: &[u8]) -> Result<Vec<Vec<u8>>, ReadError> {
-    match std::str::from_utf8(line) {
-        Ok(s) => split_line(s)
-            .map(|words| words.into_iter().map(String::into_bytes).collect())
-            .ok_or_else(|| protocol("unbalanced quotes in request")),
-        Err(_) => Ok(line
-            .split(|b| b.is_ascii_whitespace())
-            .filter(|w| !w.is_empty())
-            .map(<[u8]>::to_vec)
-            .collect()),
+fn hex_value(b: u8) -> Option<u8> {
+    (b as char).to_digit(16).map(|d| d as u8)
+}
+
+/// Splits an inline command into arguments, following Redis's
+/// `sdssplitargs`: words separated by whitespace; in double quotes `\xHH`
+/// is a byte and `\n \r \t \b \a` are control characters (any other escaped
+/// character is itself); in single quotes only `\'` is an escape; a closing
+/// quote must be followed by whitespace or the end of the line. Operates on
+/// bytes, so arguments need not be UTF-8. `None` means unbalanced quotes.
+fn split_inline(line: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let at = |i: usize| line.get(i).copied();
+    let is_space = |b: u8| b.is_ascii_whitespace() || b == 0;
+    let mut args = Vec::new();
+    let mut i = 0;
+    loop {
+        while at(i).is_some_and(is_space) {
+            i += 1;
+        }
+        let Some(first) = at(i) else {
+            return Some(args);
+        };
+        let mut cur = Vec::new();
+        if first == b'"' || first == b'\'' {
+            i += 1;
+            loop {
+                let c = at(i)?;
+                if first == b'"' && c == b'\\' {
+                    match (
+                        at(i + 1)?,
+                        at(i + 2).and_then(hex_value),
+                        at(i + 3).and_then(hex_value),
+                    ) {
+                        (b'x', Some(hi), Some(lo)) => {
+                            cur.push(hi * 16 + lo);
+                            i += 4;
+                        }
+                        (e, _, _) => {
+                            cur.push(match e {
+                                b'n' => b'\n',
+                                b'r' => b'\r',
+                                b't' => b'\t',
+                                b'b' => 0x08,
+                                b'a' => 0x07,
+                                other => other,
+                            });
+                            i += 2;
+                        }
+                    }
+                } else if first == b'\'' && c == b'\\' && at(i + 1) == Some(b'\'') {
+                    cur.push(b'\'');
+                    i += 2;
+                } else if c == first {
+                    // The closing quote must end the word.
+                    if at(i + 1).is_some_and(|n| !is_space(n)) {
+                        return None;
+                    }
+                    i += 1;
+                    break;
+                } else {
+                    cur.push(c);
+                    i += 1;
+                }
+            }
+        } else {
+            while let Some(c) = at(i).filter(|c| !is_space(*c)) {
+                cur.push(c);
+                i += 1;
+            }
+        }
+        args.push(cur);
     }
 }
 
@@ -90,12 +152,22 @@ fn split_inline(line: &[u8]) -> Result<Vec<Vec<u8>>, ReadError> {
 /// closed the connection between commands). Empty commands (a blank line,
 /// `*0`, `*-1`) are skipped, as in Redis.
 pub(crate) fn read_command<R: BufRead>(r: &mut R) -> Result<Option<Vec<Vec<u8>>>, ReadError> {
+    read_command_capped(r, MAX_COMMAND_BYTES)
+}
+
+/// `read_command` with the total-size cap as a parameter, so the cap can be
+/// tested without sending a gigabyte.
+fn read_command_capped<R: BufRead>(
+    r: &mut R,
+    max_bytes: usize,
+) -> Result<Option<Vec<Vec<u8>>>, ReadError> {
     loop {
         let Some(line) = read_line(r, "too big inline request")? else {
             return Ok(None);
         };
         if line.first() != Some(&b'*') {
-            let args = split_inline(&line)?;
+            let args =
+                split_inline(&line).ok_or_else(|| protocol("unbalanced quotes in request"))?;
             if args.is_empty() {
                 continue;
             }
@@ -109,6 +181,7 @@ pub(crate) fn read_command<R: BufRead>(r: &mut R) -> Result<Option<Vec<Vec<u8>>>
         }
         // Grows as arguments actually arrive rather than trusting the header.
         let mut args = Vec::with_capacity((count as usize).min(64));
+        let mut total = 0usize;
         for _ in 0..count {
             let header = read_line(r, "too big bulk count string")?.ok_or(ReadError::Closed)?;
             if header.first() != Some(&b'$') {
@@ -118,6 +191,12 @@ pub(crate) fn read_command<R: BufRead>(r: &mut R) -> Result<Option<Vec<Vec<u8>>>
             let len = parse_len(&header[1..])
                 .filter(|n| (0..=MAX_BULK_LEN as i64).contains(n))
                 .ok_or_else(|| protocol("invalid bulk length"))? as usize;
+            total += len;
+            if total > max_bytes {
+                // Redis drops such a client without a reply; an explicit
+                // error is kinder and just as final.
+                return Err(protocol("command exceeds the 1 GB limit"));
+            }
             // `take` + `read_to_end` allocates as data arrives, so a huge
             // declared length costs nothing until the bytes are really sent.
             let mut arg = Vec::with_capacity(len.min(64 * 1024));
@@ -164,6 +243,13 @@ pub(crate) fn encode(reply: &Reply, proto: Proto, out: &mut Vec<u8>) {
         }
         Reply::Int(n) => out.extend_from_slice(format!(":{n}\r\n").as_bytes()),
         Reply::Bulk(v) => push_bulk(out, v),
+        Reply::Verbatim(v) if v3 => {
+            push_header(out, '=', v.len() + 4);
+            out.extend_from_slice(b"txt:");
+            out.extend_from_slice(v);
+            out.extend_from_slice(b"\r\n");
+        }
+        Reply::Verbatim(v) => push_bulk(out, v),
         Reply::Nil if v3 => out.extend_from_slice(b"_\r\n"),
         Reply::Nil => out.extend_from_slice(b"$-1\r\n"),
         Reply::Array(items, kind) => {
@@ -264,6 +350,48 @@ mod tests {
             protocol_error(b"SET k \"open\r\n"),
             "Protocol error: unbalanced quotes in request"
         );
+    }
+
+    // Each expectation was checked against a live Redis server.
+    #[test]
+    fn inline_escapes_follow_redis() {
+        let split = |line: &[u8]| split_inline(line).map(|v| v.concat());
+        assert_eq!(split(br#""\x41\x4a""#).unwrap(), b"AJ");
+        assert_eq!(split(br#""a\nb\tc\\d\"e""#).unwrap(), b"a\nb\tc\\d\"e");
+        assert_eq!(split(br#""\xZZ""#).unwrap(), b"xZZ");
+        assert_eq!(split(br#"'it\'s \x41'"#).unwrap(), br"it's \x41");
+        assert_eq!(split(br"a\x41").unwrap(), br"a\x41");
+        assert_eq!(split(b"\xff\xfe").unwrap(), b"\xff\xfe");
+        assert_eq!(split(br#""a"b"#), None);
+        assert_eq!(split(br#"'a'b"#), None);
+        assert_eq!(split(br#""open"#), None);
+        assert_eq!(split(br#""trailing\"#), None);
+        assert_eq!(
+            split_inline(b"  SET  k\t\"\" ''  ").unwrap(),
+            [&b"SET"[..], b"k", b"", b""]
+        );
+    }
+
+    #[test]
+    fn verbatim_text_is_bulk_in_resp2_and_marked_in_resp3() {
+        let info = Reply::Verbatim(b"a:1\r\n".to_vec());
+        assert_eq!(enc(&info), b"$5\r\na:1\r\n\r\n");
+        assert_eq!(enc3(&info), b"=9\r\ntxt:a:1\r\n\r\n");
+    }
+
+    // The cap counts declared lengths, so the command is refused at the
+    // header that crosses it, before that argument is read.
+    #[test]
+    fn total_command_size_is_capped() {
+        let input = b"*3\r\n$4\r\naaaa\r\n$4\r\nbbbb\r\n$4\r\ncccc\r\n";
+        let read = |cap| read_command_capped(&mut io::BufReader::new(&input[..]), cap);
+        assert_eq!(read(12).unwrap().unwrap().len(), 3);
+        match read(11) {
+            Err(ReadError::Protocol(msg)) => {
+                assert_eq!(msg, "Protocol error: command exceeds the 1 GB limit")
+            }
+            other => panic!("expected the size cap, got {other:?}"),
+        }
     }
 
     #[test]

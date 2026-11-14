@@ -168,7 +168,7 @@ Things worth knowing before changing it:
 **Known limitations / what remains:**
 
 - Phase 2 — more of the Redis surface real applications use: `SCAN`/`HSCAN`/`SSCAN`, `MULTI`/`EXEC`, count arguments (`LPOP key n`, `SPOP key n`, `SRANDMEMBER`), `EXPIRE` `NX|XX|GT|LT`, `GETSET`/`GETEX`/`INCRBYFLOAT`/`HMGET`/`SMOVE`/`COPY`, sorted sets. Each needs a `cmd_*`, not just a table row.
-- Phase 3 — operations: `AUTH`/TLS, max connections and idle timeouts, cached prepared statements (`prepare_cached`; every command currently re-prepares its SQL), an optional faster sync mode.
+- Phase 3 — operations: `AUTH`/TLS, idle timeouts (`--maxclients` exists), raising the open-file limit at start (each client costs four descriptors: one socket and three SQLite files), cached prepared statements (`prepare_cached`; every command currently re-prepares its SQL), an optional faster sync mode.
 - `LPUSH`/`RPUSH`/`LLEN` are O(n) in list length because the length is a `COUNT(*)`; pushing onto a 20,000-element list runs at about 1,500/s against 20,000/s for `SET`. Fixing it means a length column in `keyspace` (schema v3).
 - Expiry is still lazy only; a long-running server could purge in the background.
 - Real pub/sub is now feasible (a shared subscriber registry behind a `Mutex`), per the note above.
