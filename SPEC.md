@@ -8,7 +8,7 @@ A Redis-compatible embedded key-value store backed by SQLite. This document spec
 
 ## Overview
 
-klyv stores data in a single SQLite database file. It supports four Redis data types (strings, lists, sets, hashes) with Redis-compatible command semantics. It is a CLI tool — no server, no daemon, no protocol. Just a file.
+klyv stores data in a single SQLite database file. It supports four Redis data types (strings, lists, sets, hashes) with Redis-compatible command semantics. It is first a CLI tool: no server, daemon or protocol is needed, just a file. An optional [server mode](#server-mode) exposes the same commands over the Redis wire protocol.
 
 ## Storage Format
 
@@ -203,7 +203,7 @@ Delete one or more keys from ALL tables (strings, lists, sets, hashes). The whol
 
 Increment the integer value at key by 1. If the key does not exist (or has lazily expired), it is initialized to 0 before incrementing.
 
-**Error:** If the value is not a valid integer, print `ERR value is not an integer` to stderr and exit with code 1. If the result would overflow `i64`, print `ERR increment or decrement would overflow` to stderr and exit with code 1. In both cases the stored value is left unchanged.
+**Error:** If the value is not a valid integer, print `ERR value is not an integer or out of range` to stderr and exit with code 1. "Valid" means Redis's canonical form: an optional `-`, no `+`, no leading zeros, no surrounding whitespace, within a signed 64-bit range. `042`, `+5`, `-0` and ` 5` are *not* integers (a general-purpose integer parser is usually too lenient here). The same rule applies to hash fields under `HINCRBY`. If the result would overflow `i64`, print `ERR increment or decrement would overflow` to stderr and exit with code 1. In both cases the stored value is left unchanged.
 
 **Output:** `(integer) N` where N is the new value.
 
@@ -614,7 +614,7 @@ All output follows Redis CLI conventions:
 | Nil | `(nil)` | `(nil)` |
 | List/set items | `N) "value"` | `1) "foo"` |
 | Empty collection | `(empty list)`, `(empty set)`, `(empty hash)` | |
-| Error | `ERR message` to stderr | `ERR value is not an integer` |
+| Error | `ERR message` to stderr | `ERR value is not an integer or out of range` |
 
 Exit code is 0 on success, 1 on error.
 
@@ -640,7 +640,31 @@ SQLite in WAL mode supports multiple concurrent readers and a single writer. kly
 
 On open, `PRAGMA busy_timeout=5000` is set so a writer waits (up to 5s) for a competing lock instead of failing immediately with `SQLITE_BUSY`. Every command runs inside a single transaction. Mutating commands (`SET`/`MSET`, `GETDEL`, `DEL`, `INCR`/`INCRBY`/`DECR`/`DECRBY`, `APPEND`, `LPUSH`/`RPUSH`, `LPOP`/`RPOP`, `LREM`, `LSET`/`LTRIM`/`LINSERT`, `SADD`/`SREM`/`SPOP`, `HSET`/`HINCRBY`/`HDEL`, `RENAME`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`, `PERSIST`, `PURGE`, `FLUSHALL`) use `BEGIN IMMEDIATE` so the write lock is taken up front and the whole operation is atomic against other processes; on any error the transaction rolls back, leaving the data unchanged. Read-only commands use a deferred transaction, so a command that issues several queries (expiry check plus data reads, or scans across the per-type tables) sees one consistent snapshot rather than racing a concurrent writer between statements. The type-safety check (below) runs inside the write transaction so it cannot race a concurrent writer. For the TTL mutators, the existence/expiry check and the expiry write are serialized together, so a concurrent writer cannot leave an orphan TTL on a key that was deleted between the check and the write.
 
-For CLI usage (one command per invocation), this is sufficient. A long-running server mode (future) would hold a single connection and serialize commands.
+For CLI usage (one command per invocation), this is sufficient. Server mode uses the same scheme: one SQLite connection per client connection, one transaction per command, with SQLite serialising writers. No in-process locking is added, which is why the CLI and any number of servers can share a file.
+
+## Server Mode
+
+`klyv --db <PATH> serve [--bind ADDR:PORT]... [--unixsocket PATH [--unixsocketperm MODE]]` serves the database over the Redis wire protocol. With no option it listens on `127.0.0.1:6379`; with only `--unixsocket` it opens no TCP listener. It announces each listener on stdout as `listening on tcp://ADDR:PORT` or `listening on unix://PATH` (so a supervisor can discover an ephemeral port requested with `:0`). Server mode is optional for ports.
+
+**Transport.** One thread and one SQLite connection per client. A stale Unix socket file (nothing listening) is replaced on start; a socket that is being served, or a path that is not a socket, is refused. The socket file is removed on `SIGINT`/`SIGTERM`. There is no authentication or TLS; binding a non-loopback address prints a warning.
+
+**Protocol.** RESP2 by default; `HELLO 3` switches the connection to RESP3 and `HELLO 2` back. A rejected `HELLO` leaves the protocol unchanged. Commands arrive as arrays of bulk strings or as inline commands (a line of words, with shell-style quoting). Pipelined commands are answered in order, and replies are flushed once no further command is already buffered. Protocol violations get Redis's own diagnostics (`ERR Protocol error: invalid multibulk length`, `... invalid bulk length`, `... expected '$', got 'x'`, `... unbalanced quotes in request`, `... too big inline request`) and the connection is closed. Limits match Redis: 512 MB per argument, 1,048,576 arguments per command, 64 KB per inline command or header line.
+
+**Reply encoding.** Status replies are simple strings, counts are integers, values are bulk strings. The three places RESP3 differs:
+
+| Reply | RESP2 | RESP3 |
+|-------|-------|-------|
+| nil (`GET` miss, `LPOP` on empty, failed `SET NX`, `MGET` gaps) | `$-1` | `_` |
+| set (`SMEMBERS`, `SUNION`, `SINTER`, `SDIFF`) | array | set `~` |
+| hash (`HGETALL`), and the `HELLO` / `CONFIG GET` maps | flat array of pairs | map `%` |
+
+`HKEYS`, `HVALS`, `KEYS`, `LRANGE` and `MGET` are arrays in both. Errors are `-` lines whose text matches Redis in full (`WRONGTYPE ...`, `ERR wrong number of arguments for 'get' command`, `ERR unknown command 'foo', with args beginning with: 'a' 'b' `, `ERR syntax error`, `ERR value is not an integer or out of range`).
+
+**Commands.** Names are case-insensitive. Each maps to the CLI command of the same meaning and runs in one transaction: `SET` (`NX`, `XX`, `EX`, `PX`, `KEEPTTL`), `SETNX`, `SETEX`, `PSETEX`, `GET`, `GETDEL`, `DEL`, `UNLINK`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `STRLEN`, `MSET`, `MGET`, `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LREM`, `LPOS`, `LINDEX`, `LSET`, `LTRIM`, `LINSERT`, `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `SPOP`, `SUNION`, `SINTER`, `SDIFF`, `HSET`, `HMSET`, `HGET`, `HEXISTS`, `HINCRBY`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `KEYS`, `EXISTS` (multiple keys), `TYPE`, `RENAME`, `DBSIZE`, `FLUSHALL`, `FLUSHDB`, and klyv's own `PURGE`. Arity is checked as in Redis; optional arguments that klyv does not implement (for example a count on `LPOP`/`SPOP`, or `NX`/`GT` on `EXPIRE`) are arity or syntax errors rather than being ignored. Integer arguments use the strict syntax described under `INCR`. `FLUSHALL`/`FLUSHDB` accept and ignore `ASYNC`/`SYNC`.
+
+**Connection commands.** `PING [message]`, `ECHO`, `QUIT`, `SELECT` (only index 0 exists; others give `ERR DB index is out of range`), `HELLO [2|3 [AUTH ...] [SETNAME name]]`, `CLIENT SETNAME|GETNAME|ID|SETINFO`, `COMMAND` (an empty array; `COMMAND COUNT` an integer), `CONFIG GET` (always empty), `INFO` (a short `# Server` / `# Clients` / `# Keyspace` report), and `AUTH`, which fails with Redis's "called without any password configured" error. The reported `redis_version` is `6.2.0`.
+
+**Verification.** The reference test suite sends every scenario and long random command sequences to both this server and a real Redis over raw sockets, in RESP2 and RESP3, and requires the parsed replies to be identical including their wire types.
 
 ## Compatibility Notes
 
@@ -648,9 +672,11 @@ For CLI usage (one command per invocation), this is sufficient. A long-running s
 
 1. **Persistence is default** — every command writes to disk immediately (via SQLite WAL). There is no in-memory-only mode.
 2. **Lazy expiry only** — expired keys are hidden from reads but not deleted until `PURGE` is called. Redis uses both lazy expiry and an active background sweep.
-3. **No pub/sub** — no server means no subscribers.
-4. **No transactions (MULTI/EXEC)** — each CLI invocation is implicitly atomic. (Future: a batch/pipe mode could wrap multiple commands in a SQLite transaction.)
+3. **No pub/sub.**
+4. **No transactions (MULTI/EXEC)** — each command is implicitly atomic, in the CLI and over the wire.
 5. **No Lua scripting.**
+6. **One oversized TTL is not copied.** `SET k v PX 9223372036854775807` replies OK in Redis but the key vanishes at once (its `now + ttl` wraps); klyv keeps the key.
+7. **Server mode has no authentication or TLS**, and implements only the commands listed under [Server Mode](#server-mode).
 
 ### Implementation Requirements for Ports
 

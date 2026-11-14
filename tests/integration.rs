@@ -2826,3 +2826,24 @@ fn test_keys_malformed_patterns_follow_redis() {
     assert_eq!(keys("*").trim(), r#"["","a","a-c","b"]"#);
     assert_eq!(keys("**").trim(), r#"["a","a-c","b"]"#);
 }
+
+// Redis only treats a stored value as an integer if it is in canonical form.
+// APPEND can build values that a lenient parser would accept.
+#[test]
+fn test_incr_rejects_non_canonical_integers() {
+    let db = fresh_db();
+    for (start, suffix) in [("0", "42"), ("+", "5"), ("-", "0"), ("4", " ")] {
+        klyv(&db, &["set", "n", start]);
+        klyv(&db, &["append", "n", suffix]);
+        let (_, err, ok) = klyv(&db, &["incr", "n"]);
+        assert!(!ok, "incr on {start}{suffix:?} should fail");
+        assert_eq!(err.trim(), "ERR value is not an integer or out of range");
+        klyv(&db, &["h-set", "h", "f", &format!("{start}{suffix}")]);
+        let (_, err, ok) = klyv(&db, &["h-incr-by", "h", "f", "1"]);
+        assert!(!ok, "h-incr-by on {start}{suffix:?} should fail");
+        assert_eq!(err.trim(), "ERR hash value is not an integer");
+    }
+    klyv(&db, &["set", "n", "-"]);
+    klyv(&db, &["append", "n", "7"]);
+    assert_eq!(klyv(&db, &["incr", "n"]).0.trim(), "(integer) -6");
+}

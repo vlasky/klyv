@@ -3,7 +3,9 @@
 
 use crate::cli::OutputFormat;
 
-/// Which placeholder an empty array renders as in human output.
+/// What kind of collection an `Array` reply is. Human output uses it to pick
+/// the empty placeholder; JSON renders `Hash` as an object; RESP3 encodes
+/// `Set` as a set and `Hash` (alternating field, value) as a map.
 #[derive(Clone, Copy)]
 pub(crate) enum Empty {
     List,
@@ -26,8 +28,12 @@ pub(crate) enum Reply {
     /// Items printed as a numbered, quoted list; the Empty kind picks the
     /// "(empty list)"/"(empty set)"/"(empty hash)" placeholder.
     Array(Vec<Vec<u8>>, Empty),
-    /// One reply per line without numbering (MGET).
+    /// One reply per line without numbering (MGET); on the wire, a general
+    /// array whose elements may be of any type.
     Lines(Vec<Reply>),
+    /// Key/value pairs of arbitrary replies: a RESP3 map, flattened to an
+    /// array in RESP2. Only the server produces it (HELLO, CONFIG GET).
+    Map(Vec<(Reply, Reply)>),
 }
 
 /// Command failure: the message is printed to stderr and the process exits 1.
@@ -83,6 +89,12 @@ pub(crate) fn render_human(reply: &Reply, out: &mut Vec<u8>) {
                 render_human(r, out);
             }
         }
+        Reply::Map(pairs) => {
+            for (k, v) in pairs {
+                render_human(k, out);
+                render_human(v, out);
+            }
+        }
     }
 }
 
@@ -111,6 +123,12 @@ pub(crate) fn render_raw(reply: &Reply, out: &mut Vec<u8>) {
         Reply::Lines(replies) => {
             for r in replies {
                 render_raw(r, out);
+            }
+        }
+        Reply::Map(pairs) => {
+            for (k, v) in pairs {
+                render_raw(k, out);
+                render_raw(v, out);
             }
         }
     }
@@ -173,6 +191,18 @@ pub(crate) fn render_json(reply: &Reply, out: &mut Vec<u8>) {
                     out.push(b',');
                 }
                 render_json(r, out);
+            }
+            out.push(b']');
+        }
+        Reply::Map(pairs) => {
+            out.push(b'[');
+            for (i, (k, v)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                render_json(k, out);
+                out.push(b',');
+                render_json(v, out);
             }
             out.push(b']');
         }
