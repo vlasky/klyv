@@ -79,58 +79,63 @@ fn hex_value(b: u8) -> Option<u8> {
 }
 
 /// Splits an inline command into arguments, following Redis's
-/// `sdssplitargs`: words separated by whitespace; in double quotes `\xHH`
-/// is a byte and `\n \r \t \b \a` are control characters (any other escaped
-/// character is itself); in single quotes only `\'` is an escape; a closing
-/// quote must be followed by whitespace or the end of the line. Operates on
-/// bytes, so arguments need not be UTF-8. `None` means unbalanced quotes.
+/// `sdssplitargs`: words are separated by whitespace; a quote may open
+/// anywhere in a word (`ab"c d"` is `abc d`) and its closing quote ends the
+/// word, so it must be followed by whitespace or the end of the line; in
+/// double quotes `\xHH` is a byte and `\n \r \t \b \a` are control
+/// characters (any other escaped character is itself); in single quotes only
+/// `\'` is an escape. Operates on bytes, so arguments need not be UTF-8.
+/// `None` means unbalanced quotes.
+///
+/// One input is not copied: Redis never answers an inline command containing
+/// a NUL byte. Here NUL is an ordinary byte.
 fn split_inline(line: &[u8]) -> Option<Vec<Vec<u8>>> {
     let at = |i: usize| line.get(i).copied();
-    let is_space = |b: u8| b.is_ascii_whitespace() || b == 0;
+    // C's isspace: what separates words. Only the first four end a word
+    // already begun; form feed and vertical tab inside a word are data.
+    let is_space = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+    let ends_word = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r');
     let mut args = Vec::new();
     let mut i = 0;
     loop {
         while at(i).is_some_and(is_space) {
             i += 1;
         }
-        let Some(first) = at(i) else {
+        if at(i).is_none() {
             return Some(args);
-        };
+        }
         let mut cur = Vec::new();
-        if first == b'"' || first == b'\'' {
+        while let Some(c) = at(i).filter(|c| !ends_word(*c)) {
+            if c != b'"' && c != b'\'' {
+                cur.push(c);
+                i += 1;
+                continue;
+            }
+            let quote = c;
             i += 1;
             loop {
                 let c = at(i)?;
-                if first == b'"' && c == b'\\' {
-                    match (
-                        at(i + 1)?,
-                        at(i + 2).and_then(hex_value),
-                        at(i + 3).and_then(hex_value),
-                    ) {
-                        (b'x', Some(hi), Some(lo)) => {
-                            cur.push(hi * 16 + lo);
-                            i += 4;
-                        }
-                        (e, _, _) => {
-                            cur.push(match e {
-                                b'n' => b'\n',
-                                b'r' => b'\r',
-                                b't' => b'\t',
-                                b'b' => 0x08,
-                                b'a' => 0x07,
-                                other => other,
-                            });
-                            i += 2;
-                        }
+                if quote == b'"' && c == b'\\' {
+                    let escaped = at(i + 1)?;
+                    let hex = (at(i + 2).and_then(hex_value), at(i + 3).and_then(hex_value));
+                    if let (b'x', (Some(hi), Some(lo))) = (escaped, hex) {
+                        cur.push(hi * 16 + lo);
+                        i += 4;
+                    } else {
+                        cur.push(match escaped {
+                            b'n' => b'\n',
+                            b'r' => b'\r',
+                            b't' => b'\t',
+                            b'b' => 0x08,
+                            b'a' => 0x07,
+                            other => other,
+                        });
+                        i += 2;
                     }
-                } else if first == b'\'' && c == b'\\' && at(i + 1) == Some(b'\'') {
+                } else if quote == b'\'' && c == b'\\' && at(i + 1) == Some(b'\'') {
                     cur.push(b'\'');
                     i += 2;
-                } else if c == first {
-                    // The closing quote must end the word.
-                    if at(i + 1).is_some_and(|n| !is_space(n)) {
-                        return None;
-                    }
+                } else if c == quote {
                     i += 1;
                     break;
                 } else {
@@ -138,11 +143,11 @@ fn split_inline(line: &[u8]) -> Option<Vec<Vec<u8>>> {
                     i += 1;
                 }
             }
-        } else {
-            while let Some(c) = at(i).filter(|c| !is_space(*c)) {
-                cur.push(c);
-                i += 1;
+            // The closing quote ends the word.
+            if at(i).is_some_and(|n| !is_space(n)) {
+                return None;
             }
+            break;
         }
         args.push(cur);
     }
@@ -365,6 +370,17 @@ mod tests {
         assert_eq!(split(br#""a"b"#), None);
         assert_eq!(split(br#"'a'b"#), None);
         assert_eq!(split(br#""open"#), None);
+        // A quote may open mid-word; its closing quote ends the word.
+        assert_eq!(split(br#"ab"cd""#).unwrap(), b"abcd");
+        assert_eq!(split(br#"ab'c d'"#).unwrap(), b"abc d");
+        assert_eq!(split(br#"ab"c d"e"#), None);
+        assert_eq!(split(br#"a"b"#), None);
+        assert_eq!(split(br#"a'b"#), None);
+        assert_eq!(split(br#"""x"#), None);
+        // Form feed and vertical tab separate words but are data within one.
+        assert_eq!(split(b"a\x0cb").unwrap(), b"a\x0cb");
+        assert_eq!(split(b"a\x0bb").unwrap(), b"a\x0bb");
+        assert_eq!(split_inline(b"\x0c\x0b a").unwrap(), [&b"a"[..]]);
         assert_eq!(split(br#""trailing\"#), None);
         assert_eq!(
             split_inline(b"  SET  k\t\"\" ''  ").unwrap(),
