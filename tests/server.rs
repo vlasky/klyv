@@ -433,6 +433,12 @@ fn errors_match_redis_and_leave_the_connection_usable() {
     assert_eq!(c.cmd(&["GET", "s"]), bulk("text"));
 }
 
+/// TTL assertions use wide windows: an exact value depends on how long the
+/// machine takes between two commands.
+fn ttl_between(c: &mut Client<TcpStream>, key: &str, low: i64, high: i64) -> bool {
+    matches!(c.cmd(&["TTL", key]), Value::Int(n) if (low..=high).contains(&n))
+}
+
 #[test]
 fn set_options() {
     let server = start();
@@ -441,13 +447,13 @@ fn set_options() {
     assert_eq!(c.cmd(&["SET", "k", "1", "nx"]), ok());
     assert_eq!(c.cmd(&["SET", "k", "2", "NX"]), Value::Nil);
     assert_eq!(c.cmd(&["SET", "k", "3", "XX", "EX", "100"]), ok());
-    assert_eq!(c.cmd(&["TTL", "k"]), Value::Int(100));
+    assert!(ttl_between(&mut c, "k", 40, 100));
     assert_eq!(c.cmd(&["SET", "k", "4", "KEEPTTL"]), ok());
-    assert_eq!(c.cmd(&["TTL", "k"]), Value::Int(100));
+    assert!(ttl_between(&mut c, "k", 40, 100));
     assert_eq!(c.cmd(&["SET", "k", "5"]), ok());
     assert_eq!(c.cmd(&["TTL", "k"]), Value::Int(-1));
     assert_eq!(c.cmd(&["SET", "k", "6", "PX", "100000"]), ok());
-    assert!(matches!(c.cmd(&["PTTL", "k"]), Value::Int(n) if (99_000..=100_000).contains(&n)));
+    assert!(matches!(c.cmd(&["PTTL", "k"]), Value::Int(n) if (40_000..=100_000).contains(&n)));
     for bad in [
         &["SET", "k", "v", "NX", "XX"][..],
         &["SET", "k", "v", "EX"],
@@ -479,7 +485,7 @@ fn set_options() {
     assert_eq!(c.cmd(&["SETNX", "k", "x"]), Value::Int(0));
     assert_eq!(c.cmd(&["SETNX", "fresh", "x"]), Value::Int(1));
     assert_eq!(c.cmd(&["SETEX", "e", "50", "v"]), ok());
-    assert_eq!(c.cmd(&["TTL", "e"]), Value::Int(50));
+    assert!(ttl_between(&mut c, "e", 20, 50));
     assert_eq!(c.cmd(&["PSETEX", "e", "50000", "v"]), ok());
     assert_eq!(
         c.error(&["SETEX", "e", "0", "v"]),

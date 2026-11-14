@@ -65,10 +65,15 @@ fn remaining_ms(conn: &Connection, key: Arg<'_>) -> Result<Result<i64, i64>, Cmd
     })
 }
 
+/// Redis rounds the remaining milliseconds to the nearest second, so a key
+/// given 100 s reports 100 an instant later, not 99.
+fn ms_to_ttl_seconds(ms: i64) -> i64 {
+    (ms + 500) / 1000
+}
+
 pub(crate) fn cmd_ttl(conn: &Connection, key: Arg<'_>) -> CmdResult {
-    // Redis rounds the millisecond remainder to the nearest second.
     Ok(Reply::Int(match remaining_ms(conn, key)? {
-        Ok(ms) => (ms + 500) / 1000,
+        Ok(ms) => ms_to_ttl_seconds(ms),
         Err(code) => code,
     }))
 }
@@ -106,4 +111,22 @@ pub(crate) fn cmd_purge(conn: &Connection) -> CmdResult {
         remove_key(conn, Arg(key))?;
     }
     Ok(Reply::Int(expired.len() as i64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ms_to_ttl_seconds;
+
+    // Tested here as a pure function: asserting an exact TTL across two
+    // commands depends on how much time passes between them.
+    #[test]
+    fn ttl_rounds_to_the_nearest_second() {
+        assert_eq!(ms_to_ttl_seconds(99_950), 100);
+        assert_eq!(ms_to_ttl_seconds(99_500), 100);
+        assert_eq!(ms_to_ttl_seconds(99_499), 99);
+        assert_eq!(ms_to_ttl_seconds(1_500), 2);
+        assert_eq!(ms_to_ttl_seconds(1_499), 1);
+        assert_eq!(ms_to_ttl_seconds(499), 0);
+        assert_eq!(ms_to_ttl_seconds(1), 0);
+    }
 }
